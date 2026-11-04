@@ -10,7 +10,7 @@ import {
   claimDownloadTask, deferDownloadTask, finishDownloadTask, heartbeatDownloadTask, updateDownloadTaskProgress,
   type DownloadTaskLease,
 } from '../src/lib/download-task-queue';
-import { findArtifactBinding, findArtifactIdentityOwner, reserveArtifactPath } from '../src/lib/artifact-registry';
+import { findArtifactBinding, findArtifactIdentityOwner, findRelocatableArtifact, reserveArtifactPath } from '../src/lib/artifact-registry';
 import type { ArtifactRegistrationResult, TaskRow, WorkerStorage } from '../src/lib/download-worker';
 
 export type DownloadSql = ReturnType<typeof neon>;
@@ -42,8 +42,15 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
     findArtifactBinding: input => findArtifactBinding(sql, input),
     // prepub1102：发布前预检（WorkerOptions.prePublishCheck 开时才被调用）。
     findArtifactIdentityOwner: input => findArtifactIdentityOwner(sql, input),
+    // relocate1105：旧落位在已满旧仓时登记搬迁（WorkerOptions.relocateArtifacts 开时才被调用）。
+    findRelocatableArtifact: input => findRelocatableArtifact(sql, input),
 
     async registerArtifact(lease, input) {
+      // relocate1105：搬迁时行须仍在 from（或本语句已搬到 to 的同版重试 = already），且 to 仍可写；缺省全为 NULL = 不动落位。
+      const fromRepo = input.relocate?.from.repositoryId ?? null;
+      const fromBranch = input.relocate?.from.branch ?? null;
+      const toRepo = input.relocate?.to.repositoryId ?? null;
+      const toBranch = input.relocate?.to.branch ?? null;
       const rows = await sql`
         WITH lease_guard AS MATERIALIZED (
           SELECT id, book_id, artifact_id FROM download_tasks
@@ -61,9 +68,15 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
               AND a.chapters_done IS NOT DISTINCT FROM ${input.chaptersDone}
               AND a.chars IS NOT DISTINCT FROM ${input.charsTotal}
               AND a.snapshot_path IS NOT DISTINCT FROM ${input.snapshotPath}
-              AND a.source_revision IS NOT DISTINCT FROM ${input.sourceRevision}) AS is_same
+              AND a.source_revision IS NOT DISTINCT FROM ${input.sourceRevision}
+              AND (${toRepo}::int IS NULL OR (a.repository_id = ${toRepo}::int AND a.branch = ${toBranch}::text))) AS is_same
           FROM book_artifacts a JOIN lease_guard t ON a.labeled_book_id = t.book_id
           WHERE a.id = ${input.artifactId} AND (t.artifact_id IS NULL OR t.artifact_id = a.id)
+            AND (${fromRepo}::int IS NULL OR (
+              ((a.repository_id = ${fromRepo}::int AND a.branch = ${fromBranch}::text)
+                OR (a.repository_id = ${toRepo}::int AND a.branch = ${toBranch}::text))
+              AND EXISTS (SELECT 1 FROM storage_repositories r WHERE r.id = ${toRepo}::int AND r.branch = ${toBranch}::text
+                AND r.enabled AND r.is_private AND NOT r.read_only AND r.sealed_at IS NULL)))
           FOR UPDATE OF a
         ), attached AS (
           UPDATE download_tasks t SET artifact_id = g.id
@@ -74,7 +87,8 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
             version = ${input.version}, blob_sha = ${input.blobSha}, bytes = ${input.bytes},
             chapters_total = ${input.chaptersTotal}, chapters_done = ${input.chaptersDone},
             chars = ${input.charsTotal}, snapshot_path = ${input.snapshotPath},
-            source_revision = ${input.sourceRevision}, published_at = now()
+            source_revision = ${input.sourceRevision}, published_at = now(),
+            repository_id = COALESCE(${toRepo}::int, a.repository_id), branch = COALESCE(${toBranch}::text, a.branch)
           FROM artifact_guard g
           WHERE a.id = g.id AND NOT g.is_same AND EXISTS (SELECT 1 FROM attached t WHERE t.id = g.task_id)
           RETURNING a.id

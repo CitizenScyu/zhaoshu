@@ -258,4 +258,79 @@ describe('capacity986 download-worker 切仓决策消费点（合成端口）', 
     }));
     expect(rebuilt).toHaveLength(0);
   });
+
+  // relocate1105：旧 artifact 落位所在仓已满 ⇒ 决策换仓；开关开时不再 reserve（四字段不等必撞
+  // ARTIFACT_IDENTITY_CONFLICT），改为登记时把同一行从旧仓搬到新仓。
+  describe('relocate1105 旧落位在已满旧仓', () => {
+    const { canonicalPath } = snapshotPaths(task.title, task.author);
+    const setup = (relocateArtifacts: boolean, existing: { published: boolean; chaptersDone: number; chars: number }) => {
+      const full = candidate({ id: 1, registered: TARGET_BYTES, githubSize: COMPRESSED_TARGET });
+      const fresh = candidate({ id: 2 });
+      const { seam: rolloverSeam, rebuilt, rebuildTargets } = makeSeam([[full, fresh]]);
+      const fx = fixture(rolloverSeam);
+      fx.storage.findArtifactBinding.mockResolvedValue({ repositoryId: 1, branch: 'main', canonicalPath });
+      const findRelocatableArtifact = vi.fn<NonNullable<WorkerStorage['findRelocatableArtifact']>>().mockResolvedValue({
+        artifactId: 55, repositoryId: 1, branch: 'main', canonicalPath, ...existing,
+      });
+      Object.assign(fx.storage, { findRelocatableArtifact });
+      if (relocateArtifacts) fx.options.relocateArtifacts = true;
+      return { ...fx, findRelocatableArtifact, rebuilt, rebuildTargets };
+    };
+
+    it('g. 开：不 reserve，发布走新仓闭包，登记带 relocate from 旧仓 to 新仓，落 done', async () => {
+      const { storage, assembly, run, findRelocatableArtifact, rebuilt, rebuildTargets } = setup(true,
+        { published: true, chaptersDone: 1, chars: 4 });
+      const result = await run();
+      expect(result.terminal).toBe('done');
+      expect(findRelocatableArtifact).toHaveBeenCalledWith({
+        identityKey: artifactIdentityKey(task.title, task.author), labeledBookId: task.book_id,
+      });
+      expect(storage.reserveArtifactPath).not.toHaveBeenCalled();
+      expect(rebuildTargets).toEqual([NEXT]);
+      expect(rebuilt[0].calls.some(call => call.op === 'put')).toBe(true);
+      expect(assembly.calls).toHaveLength(0);
+      expect(storage.registerArtifact).toHaveBeenCalledWith(lease, expect.objectContaining({
+        artifactId: 55,
+        relocate: { from: { repositoryId: 1, branch: 'main' }, to: { repositoryId: 2, branch: 'main' } },
+      }));
+    });
+
+    it('h. 开：旧落位已发布且新版更差 ⇒ superseded_by_incomplete，不发布、不登记、不搬迁', async () => {
+      const { storage, run, rebuilt } = setup(true, { published: true, chaptersDone: 50, chars: 100_000 });
+      const result = await run();
+      expect(result.terminal).toBe('superseded_by_incomplete');
+      expect(storage.reserveArtifactPath).not.toHaveBeenCalled();
+      expect(storage.registerArtifact).not.toHaveBeenCalled();
+      expect(rebuilt.every(github => github.calls.length === 0)).toBe(true);
+      expect(storage.finish).toHaveBeenCalledWith(lease, expect.objectContaining({ status: 'superseded_by_incomplete' }));
+    });
+
+    it('i. 开：旧落位未发布（仅声明）⇒ 不比更差，直接搬迁', async () => {
+      const { storage, run } = setup(true, { published: false, chaptersDone: 50, chars: 100_000 });
+      const result = await run();
+      expect(result.terminal).toBe('done');
+      expect(storage.registerArtifact).toHaveBeenCalledWith(lease, expect.objectContaining({
+        relocate: { from: { repositoryId: 1, branch: 'main' }, to: { repositoryId: 2, branch: 'main' } },
+      }));
+    });
+
+    it('j. 开：旧行路径口径不同 ⇒ 不搬迁，照旧 reserve（由既有冲突路径收口）', async () => {
+      const { storage, run, findRelocatableArtifact } = setup(true, { published: true, chaptersDone: 1, chars: 4 });
+      findRelocatableArtifact.mockResolvedValue({
+        artifactId: 55, repositoryId: 1, branch: 'main', canonicalPath: 'other/path.txt',
+        published: true, chaptersDone: 1, chars: 4,
+      });
+      await run();
+      expect(storage.reserveArtifactPath).toHaveBeenCalledWith(expect.objectContaining({ repositoryId: 2 }));
+      expect(storage.registerArtifact).not.toHaveBeenCalledWith(lease, expect.objectContaining({ relocate: expect.anything() }));
+    });
+
+    it('k. 关：与引入前逐字一致（不查可搬迁行，reserve 落新仓，登记不带 relocate）', async () => {
+      const { storage, run, findRelocatableArtifact } = setup(false, { published: true, chaptersDone: 1, chars: 4 });
+      await run();
+      expect(findRelocatableArtifact).not.toHaveBeenCalled();
+      expect(storage.reserveArtifactPath).toHaveBeenCalledWith(expect.objectContaining({ repositoryId: 2, branch: 'main' }));
+      expect(storage.registerArtifact).not.toHaveBeenCalledWith(lease, expect.objectContaining({ relocate: expect.anything() }));
+    });
+  });
 });

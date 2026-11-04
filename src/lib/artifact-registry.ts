@@ -63,6 +63,48 @@ export async function findArtifactBinding(
   return { repositoryId, branch: row.branch, canonicalPath: row.canonical_path };
 }
 
+/** relocate1105：既有落位的搬迁依据（主键 + 当前落位 + 已发布版的章/字，供「更差不晋升」比对）。 */
+export interface RelocatableArtifact extends ArtifactBindingRow {
+  artifactId: number;
+  published: boolean;
+  chaptersDone: number;
+  chars: number;
+}
+
+/**
+ * relocate1105：与 findArtifactBinding 同口径（identity_key + 本书库记录）的只读查询，多带主键与已发布统计。
+ * 旧行钉在已满的旧仓时，发布改写到决策仓、登记时原子搬迁该行（见 registerArtifact 的 relocate），
+ * 不再撞 identity 唯一约束终态 failed。
+ */
+export async function findRelocatableArtifact(
+  sql: ReturnType<typeof neon>,
+  input: FindArtifactBindingInput,
+): Promise<RelocatableArtifact | null> {
+  if (!input.identityKey || input.identityKey.includes('\0')
+    || !Number.isSafeInteger(input.labeledBookId) || input.labeledBookId <= 0) throw new Error('INVALID_ARTIFACT_INPUT');
+  const rows = await sql`
+    SELECT id, repository_id, branch, canonical_path, quality_status, chapters_done, chars FROM book_artifacts
+    WHERE identity_key = ${input.identityKey} AND labeled_book_id = ${input.labeledBookId}
+    LIMIT 1` as {
+      id: number | string; repository_id: number | string; branch: string; canonical_path: string;
+      quality_status: string; chapters_done: number | string; chars: number | string;
+    }[];
+  const row = rows[0];
+  if (!row) return null;
+  const artifactId = Number(row.id);
+  const repositoryId = Number(row.repository_id);
+  const chaptersDone = Number(row.chapters_done);
+  const chars = Number(row.chars);
+  if (!Number.isSafeInteger(artifactId) || artifactId <= 0 || !Number.isSafeInteger(repositoryId) || repositoryId <= 0
+    || !row.branch || !row.canonical_path || !Number.isSafeInteger(chaptersDone) || !Number.isSafeInteger(chars)) {
+    throw new Error('INVALID_ARTIFACT_BINDING_ROW');
+  }
+  return {
+    artifactId, repositoryId, branch: row.branch, canonicalPath: row.canonical_path,
+    published: row.quality_status === 'published', chaptersDone, chars,
+  };
+}
+
 /** 按 identity_key 查既有落位的全字段（不限 labeled_book_id）：发布预检判「注定冲突」用。 */
 export interface ArtifactIdentityOwner {
   labeledBookId: number;

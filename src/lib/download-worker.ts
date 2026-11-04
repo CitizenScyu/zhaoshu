@@ -19,10 +19,10 @@ import {
   sourceRetryDelayMs, type SourceRetryClass,
 } from './download-task-policy';
 import {
-  gitBlobSha, isRetryablePublicationError, LeaseLostError, publishBookVersion, PublicationStageError, snapshotPaths,
+  gitBlobSha, isRetryablePublicationError, LeaseLostError, manifestIsWorse, publishBookVersion, PublicationStageError, snapshotPaths,
   type GitHubContents, type PublishOutcome,
 } from './download-publisher';
-import { artifactIdentityKey, type ArtifactIdentityOwner } from './artifact-registry';
+import { artifactIdentityKey, type ArtifactIdentityOwner, type RelocatableArtifact } from './artifact-registry';
 import type { TxtChapter } from './txt-chapters';
 // capacity986：发布期切仓决策（985 已交付模块，纯决策 + 端口注入，无 DB/网络副作用）。
 import { decideRepositoryForPublication, type RolloverEvidencePort } from '../../runtime-download/repository-rollover-wiring';
@@ -97,11 +97,15 @@ export interface WorkerStorage {
   findArtifactBinding(input: { identityKey: string; labeledBookId: number }): Promise<{ repositoryId: number; branch: string; canonicalPath: string } | null>;
   /** prepub1102：按 identity_key 查既有落位全字段（不限书库记录）。可选；缺省时预检不生效。 */
   findArtifactIdentityOwner?(input: { identityKey: string }): Promise<ArtifactIdentityOwner | null>;
+  /** relocate1105：既有落位的主键与已发布统计（与 findArtifactBinding 同口径）。可选；缺省时搬迁不生效。 */
+  findRelocatableArtifact?(input: { identityKey: string; labeledBookId: number }): Promise<RelocatableArtifact | null>;
   /** DB 阶段收口：登记已发布产物并把任务指向 artifact_id。 */
   registerArtifact(lease: DownloadTaskLease, input: {
     artifactId: number; version: string; blobSha: string; bytes: number;
     chaptersTotal: number; chaptersDone: number; charsTotal: number; sourceRevision: string;
     snapshotPath: string;
+    /** relocate1105：同一语句内把行从 from 搬到 to（仍须 to 可写）；缺省 = 不动落位。 */
+    relocate?: { from: { repositoryId: number; branch: string }; to: { repositoryId: number; branch: string } };
   }): Promise<ArtifactRegistrationResult>;
 }
 
@@ -230,6 +234,15 @@ export interface WorkerOptions {
    * 缺省关 = 与引入前逐字一致；storage 未实现 findArtifactIdentityOwner 时同样不生效。
    */
   prePublishCheck?: boolean;
+  /**
+   * relocate1105：同书既有落位钉在已满旧仓（切仓决策换到别的仓）时，发布写到决策仓，登记时同一语句把
+   * book_artifacts 行搬过去（读端按行定位，旧仓文件留作孤儿）。改前 reserveArtifactPath 必撞
+   * ARTIFACT_IDENTITY_CONFLICT：2026-11-04~05 换源重下（多为 qq 试读本）5 本下完整本后全在发布阶段终态 failed，
+   * 当时另有 633 个 pending 任务的书落位在压缩 size 已超 1GiB 的仓 1/2。旧行已发布时先按其章/字做「更差不晋升」
+   * （决策仓里没有旧 manifest，发布器自身的比对看不到）。需 rollover 与 storage.findRelocatableArtifact。
+   * 缺省关 = 与引入前逐字一致。
+   */
+  relocateArtifacts?: boolean;
 }
 
 /** 切仓决策注入缝：端口（候选仓证据 + 显式时钟）与闭包重建工厂均由调用方（entry/测试）注入。 */
@@ -529,6 +542,7 @@ export async function runDownloadTask(
     let publishGithub = github;
     let publishRepositoryId = repositoryId;
     let publishBranch = branch;
+    let relocation: RelocatableArtifact | null = null;
     if (options.rollover) {
       // 既有 artifact 落位优先（covgap41 §4.8 阻断修复）：identity_key 唯一约束已把同书落位
       // 钉在旧行（切仓前的仓）；缺省 current 会在切仓后让成功下载撞 identity 冲突终态 failed。
@@ -553,8 +567,29 @@ export async function runDownloadTask(
         publishBranch = plan.target.branch;
       }
       // 正常 stay：闭包与元组维持装配期原引用，零重建零行为变化。
+      // relocate1105：旧行所在仓不合格（已满）⇒ 决策换了仓；同路径的旧行改为登记时搬迁，不再 reserve 撞冲突。
+      if (options.relocateArtifacts && existingBinding && storage.findRelocatableArtifact
+        && (publishRepositoryId !== existingBinding.repositoryId || publishBranch !== existingBinding.branch)) {
+        const found = await storage.findRelocatableArtifact({ identityKey, labeledBookId: task.book_id });
+        if (found && found.canonicalPath === canonicalPath
+          && found.repositoryId === existingBinding.repositoryId && found.branch === existingBinding.branch) {
+          relocation = found;
+        }
+      }
     }
-    const artifactId = await storage.reserveArtifactPath({
+    if (relocation?.published
+      && manifestIsWorse({ version: '', blob_sha: '', chapters: relocation.chaptersDone, chars: relocation.chars }, outcome)) {
+      await heartbeat.stop();
+      throwIfAbortedUnlessBudget(signal);
+      const written = await storage.finish(lease, {
+        status: 'superseded_by_incomplete',
+        error: cleanPgText(`更差版本不晋升：新版 ${outcome.chaptersDone} 章 / ${outcome.charsTotal} 字，`
+          + `已发布版 ${relocation.chaptersDone} 章 / ${relocation.chars} 字（落位在旧仓，本次未发布、未搬迁）`),
+      });
+      if (!written) throw new TaskLeaseLostError();
+      return { processed: true, terminal: 'superseded_by_incomplete' };
+    }
+    const artifactId = relocation ? relocation.artifactId : await storage.reserveArtifactPath({
       labeledBookId: task.book_id,
       identityKey,
       repositoryId: publishRepositoryId, branch: publishBranch, canonicalPath,
@@ -615,6 +650,12 @@ export async function runDownloadTask(
       artifactId, version: release.version, blobSha: release.blobSha, bytes: release.bytes,
       chaptersTotal: outcome.chaptersTotal, chaptersDone: outcome.chaptersDone,
       charsTotal: outcome.charsTotal, sourceRevision: '', snapshotPath: release.snapshotPath,
+      ...(relocation ? {
+        relocate: {
+          from: { repositoryId: relocation.repositoryId, branch: relocation.branch },
+          to: { repositoryId: publishRepositoryId, branch: publishBranch },
+        },
+      } : {}),
     });
     if (registered === 'lost') throw new TaskLeaseLostError();
     if (registered === 'mismatch') throw new Error('ARTIFACT_REGISTRATION_MISMATCH');

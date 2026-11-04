@@ -435,6 +435,8 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     ...(env.DOWNLOAD_HOST_WAIT_PROGRESS === '1' ? { hostWaitProgress: true } : {}),
     // prepub1102：抓取前预检 identity 落位冲突（见 WorkerOptions.prePublishCheck）。缺省关。
     ...(env.DOWNLOAD_PREPUBLISH_CHECK === '1' ? { prePublishCheck: true } : {}),
+    // relocate1105：旧落位在已满旧仓时发布到决策仓并登记搬迁（见 WorkerOptions.relocateArtifacts）。缺省关。
+    ...(env.DOWNLOAD_ARTIFACT_RELOCATE === '1' ? { relocateArtifacts: true } : {}),
     // 数据库配额（Neon 402）长退避：默认 30 分钟，env DB_QUOTA_BACKOFF_MS 覆盖；恢复后在 cron_health 补记。
     quotaBackoffMs: dbQuotaBackoffMs(env),
     recordQuotaSeen: quotaSql ? (seenAt => recordDbQuotaSeen(quotaSql, seenAt)) : undefined,

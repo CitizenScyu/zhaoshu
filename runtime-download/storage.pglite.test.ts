@@ -187,6 +187,53 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     await expect(storage.registerArtifact(lease, { ...input, bytes: -1 })).rejects.toThrow();
     expect(await snapshot()).toEqual(before);
   });
+
+  // relocate1105：落位行在旧仓 ⇒ 登记时同一行搬到新仓；同版重试 already；目标不可写或 from 不符 ⇒ mismatch 且两表不变。
+  describe('relocate1105 登记时搬迁落位', () => {
+    const relocate = { from: { repositoryId: 1, branch: 'main' }, to: { repositoryId: 2, branch: 'main' } };
+    const where = async (artifactId: number) => (await pg.query(
+      'SELECT repository_id, branch, canonical_path, quality_status FROM book_artifacts WHERE id = $1', [artifactId])).rows[0];
+    beforeEach(async () => {
+      await pg.query("INSERT INTO storage_repositories(id, owner, repo, branch, enabled) VALUES (2, 'fixture', 'private-2', 'main', true)");
+    });
+
+    it('findRelocatableArtifact 取回主键/落位/发布状态；搬迁登记 registered，重试 already', async () => {
+      const { id, storage, lease, artifactId, input } = await registration();
+      const identityKey = artifactIdentityKey('测试书', '佚名');
+      expect(await storage.findRelocatableArtifact!({ identityKey, labeledBookId: 1 })).toMatchObject({
+        artifactId, repositoryId: 1, branch: 'main', published: false,
+      });
+      expect(await storage.registerArtifact(lease, { ...input, relocate })).toBe('registered');
+      expect(await where(artifactId)).toMatchObject({ repository_id: 2, branch: 'main', quality_status: 'published' });
+      expect((await state(id)).artifact_id).toBe(artifactId);
+      expect(await storage.findRelocatableArtifact!({ identityKey, labeledBookId: 1 })).toMatchObject({
+        artifactId, repositoryId: 2, published: true, chaptersDone: 3, chars: 5678,
+      });
+      const before = await snapshot();
+      expect(await storage.registerArtifact(lease, { ...input, relocate })).toBe('already');
+      expect(await snapshot()).toEqual(before);
+    });
+
+    it('不带 relocate 的登记不动落位（缺省与引入前一致）', async () => {
+      const { storage, lease, artifactId, input } = await registration();
+      expect(await storage.registerArtifact(lease, input)).toBe('registered');
+      expect(await where(artifactId)).toMatchObject({ repository_id: 1 });
+    });
+
+    it.each(['sealed', 'read-only', 'disabled', 'missing-target', 'wrong-from'])
+      ('目标仓不可写或 from 不符（%s）⇒ mismatch，两表不变', async (kind) => {
+        const { storage, lease, input } = await registration();
+        let request = relocate;
+        if (kind === 'sealed') await pg.query('UPDATE storage_repositories SET sealed_at = now() WHERE id = 2');
+        if (kind === 'read-only') await pg.query('UPDATE storage_repositories SET read_only = true WHERE id = 2');
+        if (kind === 'disabled') await pg.query('UPDATE storage_repositories SET enabled = false WHERE id = 2');
+        if (kind === 'missing-target') request = { ...relocate, to: { repositoryId: 3, branch: 'main' } };
+        if (kind === 'wrong-from') request = { ...relocate, from: { repositoryId: 1, branch: 'dev' } };
+        const before = await snapshot();
+        expect(await storage.registerArtifact(lease, { ...input, relocate: request })).toBe('mismatch');
+        expect(await snapshot()).toEqual(before);
+      });
+  });
 });
 
 describe('登记返回证据的假SQL映射（不证明数据库原子性）', () => {

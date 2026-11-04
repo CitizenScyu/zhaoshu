@@ -132,7 +132,15 @@ completed-task reading remain unchanged.
    are idempotent. A different identity at the same repository/branch/path returns
    `ARTIFACT_PATH_COLLISION`; a relocation of an existing identity returns
    `ARTIFACT_IDENTITY_CONFLICT`. An ineligible repository returns
-   `REPOSITORY_NOT_WRITABLE`. No claim is automatically deleted or reassigned.
+   `REPOSITORY_NOT_WRITABLE`. No claim is automatically deleted or reassigned by
+   `reserveArtifactPath`.
+   Exception (relocate1105, `DOWNLOAD_ARTIFACT_RELOCATE=1`, default off): when the
+   existing claim sits in a repository that rollover no longer accepts (full), the
+   worker skips the reserve and the final registration statement moves the same row
+   to the new repository/branch (same path), guarded by the row still being at the
+   old location and the target being enabled/private/writable/unsealed. A published
+   row is only moved when the new version is not worse; the old repository's files
+   are left in place as orphans.
 3. T3 must provide its single-writer/lease checks, capacity reservation accounting,
    snapshot validation and publication protocol. After successful publication,
    update the artifact's complete metadata and published status, and attach its ID
