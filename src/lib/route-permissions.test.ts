@@ -29,6 +29,8 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   // 下载源重定位（W 线 56520f7）：与 download 同权限档，POST 受 guardPermissionWrite('download') 保护。
   'download/relocate': { POST: 'download' },
   'admin/download-stats': { GET: 'owner' },
+  // requeue1104：终态未完成书的有界重排，owner 专用写入口。
+  'admin/download-requeue': { POST: 'owner' },
   export: { GET: 'find' },
   feedback: { GET: 'find', POST: 'find' }, find: { POST: 'find' },
   // zhuigeng42：追更轮，只由 phoenix 侧 systemd timer 以 CRON_SECRET 调用（见 followup/route.test.ts）。

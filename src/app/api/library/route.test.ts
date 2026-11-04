@@ -101,7 +101,19 @@ describe('GET /api/library', () => {
     await GET(memberRequest());
     expect(listQuery()?.text).toContain('NULL::integer AS shared_read_task_id');
     expect(listQuery()?.text).toContain('NULL::integer AS my_download_task_id');
-    expect(listQuery()?.text).not.toContain('download_tasks');
+    // 可用性筛选（usable1104）只做 EXISTS，不取任务 id；定位子查询的别名 dt 不出现。
+    expect(listQuery()?.text).not.toContain('dt.');
+  });
+
+  it('usable1104：列表、计数与两个 facet 都只算有 done 任务的书', async () => {
+    await GET(ownerRequest());
+    const usable = "EXISTS (SELECT 1 FROM download_tasks ud";
+    const texts = batchTexts(db.transaction.mock.calls[0] as unknown[]);
+    expect(texts).toHaveLength(4);
+    for (const text of texts) {
+      expect(text).toContain(usable);
+      expect(text).toContain("ud.status = 'done'");
+    }
   });
 
   it('有 read 权限才返回共享完成文件定位（与本人任务分开）', async () => {
@@ -185,7 +197,7 @@ describe('GET /api/library', () => {
       expect.stringContaining('SELECT id, title'),
       expect.stringContaining('count(*)::int AS total'),
       expect.stringContaining('GROUP BY 1 ORDER BY n DESC LIMIT 20'),
-      expect.stringContaining("WHERE finish_status <> '' GROUP BY finish_status"),
+      expect.stringContaining("AND finish_status <> '' GROUP BY finish_status"),
     ]);
   });
 

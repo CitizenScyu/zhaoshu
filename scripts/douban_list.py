@@ -2199,7 +2199,12 @@ def _known_author_alternates(title: str, author: str, candidates: list) -> list[
 # yunqi.qq.com 实抓（lbladdiag-41-report §2）：目录大部分章标题带「APP免费」、正文是约 100 字截断预览，
 # 打标只能用免费的前几十章；chuangshi.qq.com 同为腾讯系付费源。不拉黑（有时是唯一来源），
 # 只在同一身份档内排到最后：主候选优先取别的源，备选里也排在末位。
-DEPRIORITIZED_SOURCE_HOSTS = frozenset({'yunqi.qq.com', 'chuangshi.qq.com'})
+# paywall1104：与下载侧 src/lib/source-host-health.ts 的 PAYWALL_HOSTS 对齐（测试钉死两边一致）。
+# 生产 6373 条打标里 book.qq.com 2502 条——它此前不在降权集合里，常被选成主源；下载机全局
+# 排除这四个 host、全池又没有免费镜像，这些书打完标永远下载不到全本。
+PAYWALL_HOSTS = frozenset({'book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com'})
+DEPRIORITIZED_SOURCE_HOSTS = PAYWALL_HOSTS
+PAYWALL_SKIP_ENV = 'LABELER_PAYWALL_SKIP'
 
 
 def _is_deprioritized(entry) -> bool:
@@ -2217,6 +2222,16 @@ def _is_deprioritized(entry) -> bool:
 def _deprioritize_sources(items: list) -> list:
     """稳定排序：降权 host 的条目挪到末尾，其余顺序不变。"""
     return sorted(items, key=_is_deprioritized)
+
+
+def paywall_skip_enabled() -> bool:
+    """付费墙只源不打标开关（默认开）。LABELER_PAYWALL_SKIP=0/false/no/off 关闭。"""
+    return os.environ.get(PAYWALL_SKIP_ENV, '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def is_paywall_only(hit: dict) -> bool:
+    """引擎命中的主源与全部备选都是付费墙 host ⇒ 下载机拿不到全本（paywall1104）。"""
+    return all(_is_deprioritized(e) for e in [hit, *(hit.get('alternates') or [])])
 
 
 def _with_alternates(hit: dict | None, pool: list[dict]) -> dict | None:
@@ -2311,6 +2326,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     book15_hits = 0
     engine_hits = 0
     resolved_done = 0                       # resolvedone1104：引擎命中后判已打标/本轮重复
+    paywall_only = 0                        # paywall1104：引擎命中只有付费墙源，不打标
+    paywall_skip = paywall_skip_enabled()
     queued_index: dict[str, set[str]] = {}  # 本轮已入队引擎条目（同 done_index 口径）
     bare_region_rejected = 0
     engine_stats: dict = {}
@@ -2425,6 +2442,18 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                 if not book15_skipped:
                     time.sleep(SEARCH_DELAY)
                 continue
+            # paywall1104：书库只列能下到全本的书。主源 + 备选全是付费墙 host 时下载机全局排除、
+            # 全池无免费镜像，打了标也永远进不了书库——不打标，省下模型调用。记进引擎 miss 记忆，
+            # TTL 过后再搜一次（源池新增免费站时能自然捡回）。
+            if paywall_skip and is_paywall_only(engine_hit):
+                paywall_only += 1
+                print(f'  只有付费墙源（{engine_hit.get("source", "")}），下载拿不到全本，不打标: '
+                      f'名单《{b.get("title", "")}》→ 候选《{engine_hit["title"]}》')
+                if engine_miss is not None:
+                    engine_miss.record(b['title'], list_author)
+                if not book15_skipped:
+                    time.sleep(SEARCH_DELAY)
+                continue
             queued_index.setdefault(_norm_title(engine_hit['title']), set()).add(
                 _done_author(hit_author))
             entry = {'url': engine_hit['url'], 'title': engine_hit['title'],
@@ -2465,6 +2494,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     engine_note = f'，引擎兜底命中 {engine_hits} 本' if engine_cli is not None else ''
     if resolved_done:
         engine_note += f'（另 {resolved_done} 本命中后判已打标/本轮重复）'
+    if paywall_only:
+        engine_note += f'（{paywall_only} 本只有付费墙源，未打标）'
     if engine_miss_skipped:
         engine_note += f'（{engine_miss_skipped} 本近期已搜无果，本轮未重搜）'
     if engine_stats.get('http_only'):

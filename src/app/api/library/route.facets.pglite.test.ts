@@ -41,11 +41,20 @@ beforeAll(async () => {
   } });
   await pg.exec(`INSERT INTO labeled_books(title,author,category,primary_genre) VALUES
     ('合成甲','作者1','', ''), ('合成乙','作者2','', ''), ('合成丙','作者3','其他', ''),
-    ('合成丁','作者4','', '仙侠'), ('合成戊','作者5','玄幻', '')`);
+    ('合成丁','作者4','', '仙侠'), ('合成戊','作者5','玄幻', ''), ('合成己','作者6','玄幻', '');
+    -- usable1104：只有 done 的书进书库；合成己只有 partial，列表与 facet 都不该算它。
+    INSERT INTO download_tasks(book_id,title,author,status,requested_by)
+      SELECT id, title, author, CASE WHEN title = '合成己' THEN 'partial' ELSE 'done' END, 'system' FROM labeled_books`);
 }, 60_000);
 afterAll(() => pg?.close());
 
 const get = async (query = '') => (await GET(new NextRequest(`http://synthetic.local/api/library${query}`))).json();
+
+it('usable1104：没有 done 任务的书不进列表、计数与 facet', async () => {
+  const data = await get();
+  expect(data.total).toBe(5);
+  expect(data.books.map((book: { title: string }) => book.title)).not.toContain('合成己');
+});
 
 it('分类聚合不出空名：空串 category 归入「其他」', async () => {
   const { facets } = await get();

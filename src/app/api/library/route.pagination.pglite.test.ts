@@ -44,7 +44,11 @@ beforeAll(async () => {
   } });
   await pg.exec(`INSERT INTO labeled_books(title,author,quality,labeled_at)
     SELECT 'synthetic group '||(n%2), 'synthetic author '||n, (n%2),
-      '2026-01-01'::timestamptz+(n%2)*interval '1 second' FROM generate_series(1,90)n; ANALYZE;`);
+      '2026-01-01'::timestamptz+(n%2)*interval '1 second' FROM generate_series(1,90)n;
+    -- usable1104：书库只列有 done 任务的书；每本先给一条系统 done（id 100+n）。
+    INSERT INTO download_tasks(id,book_id,title,author,status,requested_by)
+      SELECT 100+n, n, 't', 'a', 'done', 'system' FROM generate_series(1,90)n;
+    ANALYZE;`);
 }, 60_000);
 afterAll(() => pg?.close());
 
@@ -81,7 +85,7 @@ it('computes shared-read and my-download task ids per book on a later page', asy
     const books: { id: number; sharedReadTaskId: number | null; myDownloadTaskId: number | null }[] = (await response.json()).books;
     expect(books).toHaveLength(30);
     for (const book of books) {
-      expect(book.sharedReadTaskId).toBe(book.id % 3 === 0 ? 1000 + book.id : null);
+      expect(book.sharedReadTaskId).toBe(book.id % 3 === 0 ? 1000 + book.id : 100 + book.id);
       expect(book.myDownloadTaskId).toBe(book.id % 10 === 0 ? 3000 + book.id : book.id % 5 === 0 ? 2000 + book.id : null);
     }
   } finally {

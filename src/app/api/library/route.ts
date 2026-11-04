@@ -67,8 +67,13 @@ async function handleGET(req: NextRequest) {
     // 合批不改变错误路径；只读事务里每条语句仍取各自的 read-committed 快照，行/列/排序
     // 与片段拼装逐字不变。facets 只与全库聚合有关，本可以长期缓存，但改协议面太大，见回报。
     const [rows, countRows, catRows, finishRows] = (await s.transaction((tx) => {
+      // 书库只列真实可用的书（usable1104）：至少有一个 done 下载任务（完整 TXT 已入库/发布）。
+      // partial/failed 永不发布，只打了标却拿不到正文的书（如只有付费墙源）不进书库；
+      // 列表、计数与两个 facet 用同一条件，筛选条计数与列表一致。
+      const usable = tx`EXISTS (SELECT 1 FROM download_tasks ud
+                WHERE ud.book_id = labeled_books.id AND ud.status = 'done')`;
       // 动态条件拼装（neon 库的 tagged template 每个分支都要是完整 SQL 片段）
-      const conds = [];
+      const conds = [usable];
       if (query) {
         const like = `%${escapeLike(query.toLowerCase())}%`;
         conds.push(tx`(lower(title) LIKE ${like} ESCAPE '\\' OR lower(author) LIKE ${like} ESCAPE '\\' OR lower(labels::text) LIKE ${like} ESCAPE '\\')`);
@@ -83,16 +88,11 @@ async function handleGET(req: NextRequest) {
       }
       if (finish) conds.push(tx`finish_status = ${finish}`);
       // 动态条件拼装（neon tagged template 不支持 sql.join，用 AND 手动归并）
-      let where = tx``;
-      if (conds.length === 1) {
-        where = tx`WHERE ${conds[0]}`;
-      } else if (conds.length > 1) {
-        let merged = conds[0];
-        for (let i = 1; i < conds.length; i++) {
-          merged = tx`${merged} AND ${conds[i]}`;
-        }
-        where = tx`WHERE ${merged}`;
+      let merged = conds[0];
+      for (let i = 1; i < conds.length; i++) {
+        merged = tx`${merged} AND ${conds[i]}`;
       }
+      const where = tx`WHERE ${merged}`;
       // 质量优先：分数降序，未评分的沉底（按打标时间近的在前）
       const orderBy =
         sort === 'oldest' ? tx`labeled_at ASC`
@@ -131,11 +131,11 @@ async function handleGET(req: NextRequest) {
         tx`
         SELECT COALESCE(NULLIF(primary_genre, ''), NULLIF(category, ''), '其他') AS category,
                count(*)::int AS n
-        FROM labeled_books
+        FROM labeled_books WHERE ${usable}
         GROUP BY 1 ORDER BY n DESC LIMIT 20`,
         tx`
         SELECT finish_status, count(*)::int AS n FROM labeled_books
-        WHERE finish_status <> '' GROUP BY finish_status ORDER BY n DESC LIMIT 10`,
+        WHERE ${usable} AND finish_status <> '' GROUP BY finish_status ORDER BY n DESC LIMIT 10`,
       ];
     }, { readOnly: true })) as unknown as [
       LabeledBook[], { total: number }[], { category: string; n: number }[], { finish_status: string; n: number }[],

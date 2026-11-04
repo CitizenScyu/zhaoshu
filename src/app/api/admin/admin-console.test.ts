@@ -28,6 +28,7 @@ import { GET as usersGet } from './users/route';
 import * as usersRoute from './users/route';
 import { PATCH as userPatch } from './users/[id]/route';
 import { GET as labelGet, PATCH as labelPatch } from './label-model/route';
+import { POST as requeuePost } from './download-requeue/route';
 
 const OWNER_TOKEN = 'admin-console-owner-token';
 it('用户路由只导出 Next.js 支持的处理器', () => {
@@ -60,6 +61,7 @@ const WRITES: { name: string; path: string; handler: Handler; params?: Record<st
   { name: 'POST /api/admin/invites/[id]/revoke', path: '/api/admin/invites/7/revoke', handler: inviteRevoke as Handler, params: { id: '7' } },
   { name: 'PATCH /api/admin/users/[id]', path: '/api/admin/users/2', handler: userPatch as Handler, params: { id: '2' } },
   { name: 'PATCH /api/admin/label-model', path: '/api/admin/label-model', handler: labelPatch as Handler },
+  { name: 'POST /api/admin/download-requeue', path: '/api/admin/download-requeue', handler: requeuePost as Handler },
 ];
 
 const READS: { name: string; path: string; handler: Handler }[] = [
@@ -146,6 +148,21 @@ describe('管理 API 鉴权', () => {
     const req = owner('POST', route.path, {}, { Origin: 'https://evil.example', 'x-nf-csrf': '1' });
     const res = await call(route.handler, req, route.params);
     expect(res.status).toBe(403);
+    expect(db.queries).toHaveLength(0);
+  });
+});
+
+describe('下载重排（requeue1104）入参校验', () => {
+  it.each([
+    [{ }, 'INVALID_REVISION'],
+    [{ sourceRevision: 'Bad Rev' }, 'INVALID_REVISION'],
+    [{ sourceRevision: 'requeue-x', limit: 501 }, 'INVALID_LIMIT'],
+    [{ sourceRevision: 'requeue-x', limit: '1e2' }, 'INVALID_LIMIT'],
+    [{ sourceRevision: 'requeue-x', reasons: ['drop table'] }, 'INVALID_REASONS'],
+  ])('%j → 400 %s，不碰数据库', async (body, code) => {
+    const res = await call(requeuePost as Handler, owner('POST', '/api/admin/download-requeue', body));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code });
     expect(db.queries).toHaveLength(0);
   });
 });
