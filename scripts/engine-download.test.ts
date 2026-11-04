@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -651,6 +651,43 @@ describe('vipwall42 付费墙预览截断识别', () => {
     const r = await f.run(wrap(f, 30, previewText));
     expect(r.code).toBe(0);
     expect(r.manifest.status).toBe('done');
+  }, 60_000);
+});
+
+// tailwall1104：免费前段 + 书尾连续预览短章（中位数判据漏判的半免费书、小书）。
+describe('tailwall1104 书尾预览尾段识别', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const ch = (chars: number, title = '第1章') => ({ title, chars });
+  it('书尾连续 5 个短章且前有长章 ⇒ 判预览', () => {
+    expect(previewTailRun([ch(2200), ch(2200), ...Array.from({ length: 5 }, () => ch(200))])).toBe(true);
+    expect(previewTailRun([ch(2200), ...Array.from({ length: 4 }, () => ch(200))])).toBe(false);
+  });
+  it('全书皆短、尾段被长章打断、公告类短章均不判', () => {
+    expect(previewTailRun(Array.from({ length: 30 }, () => ch(200)))).toBe(false);
+    expect(previewTailRun([ch(2200), ch(200), ch(200), ch(200), ch(2200), ch(200), ch(200)])).toBe(false);
+    expect(previewTailRun([ch(2200), ch(200), ch(200), ch(200), ch(100, '完本感言'), ch(80, '新书已发'), ch(50, '请假条')])).toBe(false);
+    // 公告类不打断尾段
+    expect(previewTailRun([ch(2200), ch(200), ch(200), ch(100, '上架感言'), ch(200), ch(200), ch(200)])).toBe(true);
+  });
+  it('DOWNLOAD_PREVIEW_TAIL=0 关，缺省开', () => {
+    expect(previewTail({})).toBe(true);
+    expect(previewTail({ DOWNLOAD_PREVIEW_TAIL: '0' })).toBe(false);
+  });
+  it('整本：20 章免费 + 10 章预览尾段 ⇒ preview_truncated、零 book.txt', async () => {
+    const f = setup();
+    const catalog = `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: 30 }, (_, i) => `<dd><a href="/read/${i + 1}">第${i + 1}章</a></dd>`).join('')}</div>`;
+    const r = await f.run(async (url, opts) => {
+      if (url === 'https://book15.net/books/details1.html') {
+        return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog };
+      }
+      if (url.includes('/read/')) {
+        const n = Number(url.split('/read/')[1]);
+        return { url, text: `<li class="chapter-content" id="article-content"><p>${'文'.repeat(n <= 20 ? 2200 : 200)}</p></li>` };
+      }
+      return f.transport(url, opts);
+    });
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
   }, 60_000);
 });
 

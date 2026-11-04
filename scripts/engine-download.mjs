@@ -156,6 +156,25 @@ export function previewEarly(env = process.env) {
 }
 const PREVIEW_MIN_CHAPTERS = 50;
 const PREVIEW_MAX_CHARS = 500;
+// tailwall1104：「免费前段 + 付费预览尾段」——书尾连续 ≥ 5 个短章（< 500 字）且前面有正常长章即判 preview_truncated。
+// 中位数判据漏掉免费章过半的书和 < 50 章小书（2026-11-04 phoenix 只读：书库 1554 本里短章 ≥ 20% 的约 500 本，
+// 抽样 7999 书第 155–202 章全是 ~200 字截断预览）。公告/感言/新书类短章不计入也不打断尾段；全书皆短的小书不判（免误伤）。
+// DOWNLOAD_PREVIEW_TAIL=0 关（缺省开）。
+const PREVIEW_TAIL_RUN = 5;
+const TAIL_ASIDE_TITLE = /请假|无更|断更|停更|休更|今[天晚日]不更|请个假|感言|新书|完本|上架/;
+export function previewTail(env = process.env) {
+  return env.DOWNLOAD_PREVIEW_TAIL?.trim() !== '0';
+}
+export function previewTailRun(chapters) {
+  let run = 0;
+  for (let i = chapters.length - 1; i >= 0; i--) {
+    const { title, chars } = chapters[i];
+    if (TAIL_ASIDE_TITLE.test(title ?? '')) continue;
+    if (chars >= PREVIEW_MAX_CHARS) return run >= PREVIEW_TAIL_RUN;
+    run += 1;
+  }
+  return false;
+}
 
 // noticeskip1031：DOWNLOAD_NOTICE_PLACEHOLDER=1 时，章名是作者请假/无更/感言类公告、源站正文取空（empty_content_page /
 // empty_content）的章写占位文本按 done 收口（缺省/其他值 = 关，零行为变化：整章 failed → 全书 missing_chapters 不发布）。
@@ -557,6 +576,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     {
       const doneChars = manifest.chapters.filter(c => c.status === 'done').map(c => c.chars).sort((a, b) => a - b);
       if (doneChars.length >= PREVIEW_MIN_CHAPTERS && doneChars[Math.floor(doneChars.length / 2)] < PREVIEW_MAX_CHARS) throw new Error('preview_truncated');
+      if (previewTail() && previewTailRun(manifest.chapters)) throw new Error('preview_truncated');
     }
     const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
     atomic(join(dir, 'book.txt'), txt);
