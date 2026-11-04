@@ -20,6 +20,8 @@ function harness(opts: {
   builtinHosts?: string[];
   hostPriority?: (signal: AbortSignal) => Promise<ReadonlyMap<string, number>>;
   doomed?: string[];
+  poolRules?: (id: string) => unknown;
+  doomedRules?: (rules: unknown) => boolean;
   skipStrictToc?: boolean;
   missMemo?: ScanMissMemo;
   scanConcurrency?: number;
@@ -33,8 +35,9 @@ function harness(opts: {
   const selector = createSourceSelector({
     modules: {
       compile: {
-        compileSource: (s: { url: string }) => { compiles.push(s.url); return { url: s.url }; },
-        strictTocUnsupported: (compiled: { url: string }) => opts.doomed?.includes(compiled.url) ?? false,
+        compileSource: (s: { url: string; rules?: unknown }) => { compiles.push(s.url); return { url: s.url, rules: s.rules }; },
+        strictTocUnsupported: (compiled: { url: string; rules?: unknown }) =>
+          (opts.doomed?.includes(compiled.url) ?? false) || (opts.doomedRules?.(compiled.rules) ?? false),
       },
       supported: { BUILTIN_SOURCE_HOSTS: opts.builtinHosts ?? ['book15.net', 'www.book15.net'] },
       api: {
@@ -56,7 +59,8 @@ function harness(opts: {
       if (opts.poolThrows === 'sync') throw new Error('pool sync down');
       return (async () => {
         if (opts.poolThrows === 'async') throw new Error('pool async down');
-        return (opts.pool ?? []).map(url => ({ url, name: url, searchUrl: '/s' }));
+        return (opts.pool ?? []).map((url, i) => ({ url, name: url, searchUrl: '/s',
+          ...(opts.poolRules ? { rules: opts.poolRules(`${url}#${i}`) } : {}) }));
       })();
     },
     isSuspect: (host: string) => opts.suspect?.includes(host) ?? false,
@@ -96,6 +100,24 @@ describe('共用选源器', () => {
     await off.selector(request({ scanLimit: 3 }), freshSignal());
     expect(off.searchedUrls).toEqual(['https://a.example/', 'https://q.example/', 'https://b.example/']);
     expect(off.compiles).toEqual(off.searchedUrls);
+  });
+
+  it('tocmemo1104：同 url 的锚变体（规则各异）各记一条，轮间不互相顶掉、判定不串', async () => {
+    const pool = ['https://f.example/', 'https://f.example/', 'https://g.example/'];
+    const stable = new Map<string, object>();
+    for (const fresh of [true, false]) {
+      // fresh：每轮新规则对象（池缓存刷新）走 JSON 命中；否则同一对象走引用命中。
+      const h = harness({ pool, search: () => [], skipStrictToc: true,
+        poolRules: id => (fresh ? { id } : (stable.get(id) ?? stable.set(id, { id }).get(id))),
+        doomedRules: rules => (rules as { id?: string }).id === 'https://f.example/#1' });
+      for (let round = 0; round < 3; round += 1) {
+        const before = h.searchedUrls.length;
+        await h.selector(request(), freshSignal());
+        expect(h.searchedUrls.slice(before)).toEqual(['https://f.example/', 'https://g.example/']);
+      }
+      expect(h.compiles.filter(u => u === 'https://f.example/').length - h.searchedUrls.filter(u => u === 'https://f.example/').length).toBe(2);
+      expect(h.compiles.filter(u => u === 'https://g.example/').length - h.searchedUrls.filter(u => u === 'https://g.example/').length).toBe(1);
+    }
   });
 
   it('yield1030：hostPriority 稳定重排——高分 host 先扫，同分与缺席保持池序，scanLimit 不变', async () => {

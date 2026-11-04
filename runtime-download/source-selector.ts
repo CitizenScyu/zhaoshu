@@ -106,17 +106,27 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
   const timeoutMs = options.timeoutMs ?? 30_000;
   const builtinHosts = new Set(modules.supported.BUILTIN_SOURCE_HOSTS);
   // toctgate1030：按 url 记忆判定（规则对象同一或 JSON 相同才复用），免得每轮选源把全池重编一遍（编译缓存只 64 条）。
-  const tocMemo = new Map<string, { rules: unknown; json: string; doomed: boolean }>();
+  // tocmemo1104：source.url 已剥 #frag，锚变体（规则各不相同）共用同一 url；原来每 url 只记一条，变体轮流互相
+  // 顶掉，生产实测 659 源/轮里 441 个每轮必重编（w14 15 分钟 4409 次未命中，全部是同 url 异规则）。改为每 url
+  // 记一小组（按规则对象 / JSON 命中），超过上限丢最旧的一条，规则变更后的旧条目随之淘汰。
+  const TOC_MEMO_PER_URL = 32;
+  const tocMemo = new Map<string, Array<{ rules: unknown; json: string; doomed: boolean }>>();
   const strictTocDoomed = (source: PoolSource): boolean => {
     const unsupported = modules.compile.strictTocUnsupported;
     if (!unsupported) return false;
-    const hit = tocMemo.get(source.url);
-    if (hit && hit.rules === source.rules) return hit.doomed;
+    const entries = tocMemo.get(source.url) ?? [];
+    if (typeof source.rules === 'object' && source.rules !== null) {
+      const same = entries.find(entry => entry.rules === source.rules);
+      if (same) return same.doomed;
+    }
     const json = JSON.stringify(source.rules ?? null) + '\0' + JSON.stringify(source.searchUrl ?? null);
-    if (hit && hit.json === json) { hit.rules = source.rules; return hit.doomed; }
+    const hit = entries.find(entry => entry.json === json);
+    if (hit) { hit.rules = source.rules; return hit.doomed; }
     let doomed = false;
     try { doomed = unsupported(modules.compile.compileSource(source)); } catch { doomed = false; }
-    tocMemo.set(source.url, { rules: source.rules, json, doomed });
+    entries.push({ rules: source.rules, json, doomed });
+    if (entries.length > TOC_MEMO_PER_URL) entries.shift();
+    tocMemo.set(source.url, entries);
     return doomed;
   };
 
