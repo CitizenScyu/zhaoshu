@@ -132,6 +132,15 @@ const isPreviewTruncated = (outcome: AdapterOutcome) =>
   outcome.kind === 'incomplete' && outcome.reason === 'preview_truncated';
 
 /**
+ * resolvemiss1104：原源 host 不在下载池（resolveSource code=1 no_engine_source_for_host，零出网）。
+ * 打标池比下载池宽——2026-11-04 shudugu 等 74 本 attempt 1 即 download_failed 终态、从没试过别的源。
+ * 与身份缺失同样走引擎回退；选不到/候选全失败仍按原 failure 收口（终态语义不变）。
+ * detail 是 download-worker 白名单拼出的「构造器名[/码][@阶段]」，code=2 的解析失败已归 source_unavailable。
+ */
+const isUnresolvedHost = (outcome: AdapterOutcome) =>
+  outcome.kind === 'failure' && outcome.code === 'download_failed' && /^ResolveSourceError(@|$)/.test(outcome.detail ?? '');
+
+/**
  * download-worker incomplete 枚举里稳定的源级 reason（download-worker.ts 归类）：
  * source_unavailable / missing_chapters / toc_changed / operation_timeout——单源问题，标 temporary 后换源。
  * budget_exhausted / interrupted 是任务层停止：不标失败、不换源；白名单外的未知 incomplete 同样
@@ -373,7 +382,9 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               stop = stopped(context.signal);
               if (stop) return stop;
               // preview_truncated（原源是付费墙预览）：不 return primary——同源重试无意义，改走引擎回退换免费源。
-              if (!isSourceUnavailable(primary) && !isIdentityMiss(primary) && !isPreviewTruncated(primary)) return primary;
+              // resolvemiss1104：原源 host 不在下载池同样回退（见 isUnresolvedHost）。
+              if (!isSourceUnavailable(primary) && !isIdentityMiss(primary) && !isPreviewTruncated(primary)
+                && !isUnresolvedHost(primary)) return primary;
               // 930 确认点 2：原源被物理门拒绝（host_occupied / host_occupancy_unavailable）按原
               // 可重试分类收口，不触发扫池——“host 正被占用”对选新源的出网请求同样生效。
               if (primary.kind === 'incomplete' && primary.retryCause) return primary;

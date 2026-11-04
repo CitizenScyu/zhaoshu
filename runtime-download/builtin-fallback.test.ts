@@ -154,6 +154,27 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls).toEqual(['a.example']);
   });
 
+  it('resolvemiss1104：原源 host 不在下载池（ResolveSourceError）⇒ 换引擎候选；其他 download_failed 原样直通', async () => {
+    const unresolved: AdapterOutcome = { kind: 'failure', code: 'download_failed', detail: 'ResolveSourceError@resolve' };
+    const h = harness({ pool: ['https://a.example/'] });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': unresolved }, []), adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task(), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['a.example']);
+    // 候选全失败 ⇒ 仍按原 failure 收口。
+    const none = harness({ pool: ['https://a.example/'] });
+    expect(await none.fallback.wrapAdapter(adapter({ 'book15.net': unresolved }, []), adapter({}, []))
+      .download(task(), context())).toEqual(unresolved);
+    const other: AdapterOutcome = { kind: 'failure', code: 'download_failed', detail: 'TypeError@search' };
+    const direct = harness({ pool: ['https://a.example/'] });
+    const untouched: string[] = [];
+    expect(await direct.fallback.wrapAdapter(adapter({ 'book15.net': other }, []), adapter({}, untouched))
+      .download(task(), context())).toEqual(other);
+    expect(untouched).toEqual([]);
+  });
+
   it('逐书出网封顶：书不在池里时最多搜 MAX_FALLBACK_SCAN_SOURCES 个源', async () => {
     const pool = Array.from({ length: MAX_FALLBACK_SCAN_SOURCES + 10 }, (_, i) => `https://s${i}.example/`);
     const h = harness({ pool, noBook: pool.map(hostOf) });
