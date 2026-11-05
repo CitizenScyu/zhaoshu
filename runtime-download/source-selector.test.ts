@@ -150,6 +150,28 @@ describe('共用选源器', () => {
     expect(bare.searchedUrls).toEqual(['https://f.example/', 'https://f.example/']);
   });
 
+  it('scanerr1105：探测异常按固定分类计入选源日志（errors/errorKinds），不含原文；无异常时 errors=0 且无 errorKinds', async () => {
+    const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/'];
+    for (const concurrency of [1, 3]) {
+      const h = harness({ pool, scanConcurrency: concurrency, search: url => {
+        if (url === 'https://a.example/') throw Object.assign(new Error('secret body https://x'), { name: 'SourceHttpError', status: 503 });
+        if (url === 'https://b.example/') throw new TypeError('fetch failed');
+        if (url === 'https://c.example/') throw Object.assign(new Error('x'), { name: 'SourceHttpError', status: 503 });
+        return [];
+      } });
+      expect((await h.selector(request(), freshSignal())).scanned).toBe(4);
+      const fields = h.logs.find(l => l.message === '选源完成')?.fields;
+      expect(fields).toMatchObject({ errors: 3, errorKinds: { 'SourceHttpError:503': 2, TypeError: 1 } });
+      expect(typeof fields?.ms).toBe('number');
+      expect(fields).not.toHaveProperty('budgetHit');
+      expect(JSON.stringify(fields)).not.toContain('secret');
+    }
+    const clean = harness({ pool, search: () => [] });
+    await clean.selector(request(), freshSignal());
+    expect(clean.logs.find(l => l.message === '选源完成')?.fields).toMatchObject({ errors: 0 });
+    expect(clean.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('errorKinds');
+  });
+
   it('yield1030：hostPriority 稳定重排——高分 host 先扫，同分与缺席保持池序，scanLimit 不变', async () => {
     const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/', 'https://c.example/zh/'];
     const h = harness({ pool, search: () => [],

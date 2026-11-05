@@ -1,4 +1,4 @@
-import { identityMatches } from '../scripts/engine-download.mjs';
+import { errorKindOf, identityMatches } from '../scripts/engine-download.mjs';
 import { normalizeBookTitle } from '../src/lib/book-identity';
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
 import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
@@ -208,6 +208,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
   return async (request, signal) => {
     signal.throwIfAborted();
     if (request.scanBudget && request.scanBudget.remaining <= 0) return { picked: [], scanned: 0 };
+    const startedAt = Date.now();
     const budget = new AbortController();
     const timer = setTimeout(() => budget.abort(new Error('select_budget_exhausted')), request.budgetMs);
     const overall = AbortSignal.any([signal, budget.signal]);
@@ -282,6 +283,15 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       const missed = memo ? memo.load(task) : undefined;
       const misses: string[] = [];
       let remembered = 0;
+      // scanerr1105：探测异常（超时/HTTP/规则）被吞后与「无书」同记 scanned，0 候选里分不出真无书与探不到。
+      // 只计数与固定分类（errorKindOf：异常名/HTTP 状态/常量码，不含原文与 URL），不改任何判定。
+      let errors = 0;
+      const errorKinds = new Map<string, number>();
+      const noteError = (error: unknown): void => {
+        errors += 1;
+        const kind = errorKindOf(error);
+        errorKinds.set(kind, (errorKinds.get(kind) ?? 0) + 1);
+      };
       const concurrency = Math.max(1, Math.floor(options.scanConcurrency ?? 1));
       if (concurrency > 1) {
         // 窗口按池序排：队头未完成时后面完成的先缓存，提交始终从队头起（命中顺序 = 池序）。
@@ -302,6 +312,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
               if ('error' in outcome) {
                 signal.throwIfAborted();
                 if (isOccupancyUnavailable(outcome.error)) throw outcome.error;
+                if (!overall.aborted) noteError(outcome.error);
               } else if (outcome.hit) {
                 if (!outcome.late && picked.length < request.targetHits && !pickedHosts.includes(probe.host)) {
                   picked.push(probe.url);
@@ -353,12 +364,15 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
           signal.throwIfAborted();
           if (isOccupancyUnavailable(error)) throw error;
           if (overall.aborted) break;
+          noteError(error);
         }
       }
       memo?.record(task, misses);
       log('info', '选源完成', {
         taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts,
         ...(memo ? { remembered } : {}), ...(options.dedupeVariants ? { deduped } : {}),
+        errors, ...(errors ? { errorKinds: Object.fromEntries([...errorKinds].sort((a, b) => b[1] - a[1]).slice(0, 6)) } : {}),
+        ms: Date.now() - startedAt, ...(budget.signal.aborted ? { budgetHit: true } : {}),
       });
       return memo ? { picked, scanned, remembered } : { picked, scanned };
     } finally {
