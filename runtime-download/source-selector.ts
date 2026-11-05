@@ -313,7 +313,9 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       let errors = 0;
       let unprobed = 0;
       const errorKinds = new Map<string, number>();
-      const noteError = (error: unknown): void => {
+      // errhost1105：实探异常按「分类@host」计（只 host 名，同 hosts 字段口径），定位哪些站长期解码/HTTP 失败。
+      const errorHosts = new Map<string, number>();
+      const noteError = (error: unknown, host: string): void => {
         errors += 1;
         const kind = errorKindOf(error);
         errorKinds.set(kind, (errorKinds.get(kind) ?? 0) + 1);
@@ -322,6 +324,9 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
           unprobed += 1;
           scanned -= 1;
           if (request.scanBudget) request.scanBudget.remaining += 1;
+        } else {
+          const key = `${kind}@${host}`;
+          errorHosts.set(key, (errorHosts.get(key) ?? 0) + 1);
         }
       };
       const concurrency = Math.max(1, Math.floor(options.scanConcurrency ?? 1));
@@ -344,7 +349,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
               if ('error' in outcome) {
                 signal.throwIfAborted();
                 if (isOccupancyUnavailable(outcome.error)) throw outcome.error;
-                if (!overall.aborted) noteError(outcome.error);
+                if (!overall.aborted) noteError(outcome.error, probe.host);
               } else if (outcome.hit) {
                 if (!outcome.late && picked.length < request.targetHits && !pickedHosts.includes(probe.host)) {
                   picked.push(probe.url);
@@ -396,7 +401,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
           signal.throwIfAborted();
           if (isOccupancyUnavailable(error)) throw error;
           if (overall.aborted) break;
-          noteError(error);
+          noteError(error, host);
         }
       }
       memo?.record(task, misses);
@@ -406,6 +411,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         ...(options.skipZeroYield ? { zeroYieldSkipped } : {}),
         errors, ...(errors ? { errorKinds: Object.fromEntries([...errorKinds].sort((a, b) => b[1] - a[1]).slice(0, 6)) } : {}),
         ...(unprobed ? { unprobed } : {}),
+        ...(errorHosts.size ? { errorHosts: Object.fromEntries([...errorHosts].sort((a, b) => b[1] - a[1]).slice(0, 16)) } : {}),
         ms: Date.now() - startedAt, ...(budget.signal.aborted ? { budgetHit: true } : {}),
       });
       return memo ? { picked, scanned, remembered } : { picked, scanned };

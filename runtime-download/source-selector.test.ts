@@ -183,6 +183,8 @@ describe('共用选源器', () => {
       expect((await h.selector(request(), freshSignal())).scanned).toBe(4);
       const fields = h.logs.find(l => l.message === '选源完成')?.fields;
       expect(fields).toMatchObject({ errors: 3, errorKinds: { 'SourceHttpError:503': 2, TypeError: 1 } });
+      // errhost1105：实探异常按「分类@host」计，只 host 名。
+      expect(fields?.errorHosts).toEqual({ 'SourceHttpError:503@a.example': 1, 'TypeError@b.example': 1, 'SourceHttpError:503@c.example': 1 });
       expect(typeof fields?.ms).toBe('number');
       expect(fields).not.toHaveProperty('budgetHit');
       expect(JSON.stringify(fields)).not.toContain('secret');
@@ -191,6 +193,7 @@ describe('共用选源器', () => {
     await clean.selector(request(), freshSignal());
     expect(clean.logs.find(l => l.message === '选源完成')?.fields).toMatchObject({ errors: 0 });
     expect(clean.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('errorKinds');
+    expect(clean.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('errorHosts');
   });
 
   it('unprobed1105：本机门拒绝（未登记/占用/熔断/日限）不计 scanned、不占 scanLimit/scanBudget；全被挡 ⇒ scanned=0', async () => {
@@ -211,6 +214,8 @@ describe('共用选源器', () => {
       expect(scanBudget.remaining).toBe(8);
       expect(h.searchedUrls).toEqual(pool);
       expect(h.logs.find(l => l.message === '选源完成')?.fields).toMatchObject({ scanned: 2, errors: 5, unprobed: 4 });
+      // 门拒绝不进 errorHosts（只记实探异常）。
+      expect(h.logs.find(l => l.message === '选源完成')?.fields?.errorHosts).toEqual({ 'SourceHttpError:503@e.example': 1 });
     }
     const blocked = harness({ pool: pool.slice(0, 4), search: gate });
     expect(await blocked.selector(request(), freshSignal())).toEqual({ picked: [], scanned: 0 });

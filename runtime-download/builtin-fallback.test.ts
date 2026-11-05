@@ -567,6 +567,58 @@ describe('41-T8FB builtin-fallback', () => {
     expect(stored).toEqual([[1, ['https://b.example/']]]);
   });
 
+  it('zeroskip1105b：skipZeroYield 开 ⇒ recall 剔零产出 host 旧候选；全剔 ⇒ 重选出网；关/优先分读失败 ⇒ 照取', async () => {
+    const usable = [
+      { source_url: 'https://zero.example/b1', host: 'zero.example' },
+      { source_url: 'https://a.example/b1', host: 'a.example' },
+    ];
+    const build = (skipZeroYield: boolean, hostPriority: () => Promise<ReadonlyMap<string, number>>, rows = usable) => {
+      const searched: string[] = [];
+      const fallback = createBuiltinFallback({
+        modules: {
+          compile: { compileSource: () => ({}) },
+          supported: { BUILTIN_SOURCE_HOSTS: ['book15.net'] },
+          api: {
+            engineSearchBook: async (engine: { url: string }) => {
+              searched.push(hostOf(engine.url));
+              return [{ title: '测试书', author: '佚名', bookUrl: `https://${hostOf(engine.url)}/b/1` }];
+            },
+            engineFetchDetail: async () => ({ title: '测试书', author: '佚名' }),
+          },
+        },
+        transport: async () => { throw new Error('unused'); },
+        loadPool: async () => ['https://b.example/'].map(url => ({ url, name: url, searchUrl: '/s' })),
+        candidates: {
+          usable: async () => rows,
+          failedSources: async () => new Set<string>(),
+          replace: async () => {},
+          markFailure: async () => {},
+          occupiedHosts: async () => new Set<string>(),
+        },
+        hostPriority, skipZeroYield,
+      });
+      const recalled = async () => {
+        const calls: string[] = [];
+        await fallback.wrapAdapter(adapter({}, []), adapter({}, calls)).download(task(), context());
+        return calls;
+      };
+      return { fallback, searched, recalled };
+    };
+    const zero = async () => new Map([['zero.example', -1]]);
+    // 开：zero.example 旧候选不取，先试 a.example（失败后才补扫出网的 b.example）。
+    const on = build(true, zero);
+    expect(await on.recalled()).toEqual(['a.example', 'b.example']);
+    // 关：照旧两条旧候选都先取。
+    expect((await build(false, zero).recalled()).slice(0, 2)).toEqual(['zero.example', 'a.example']);
+    // 优先分读失败 ⇒ 空表不剔。
+    expect((await build(true, async () => { throw new Error('db down'); }).recalled()).slice(0, 2)).toEqual(['zero.example', 'a.example']);
+    // 旧候选全是零产出 host ⇒ recall 全空，预检走出网重选（b.example 命中）。
+    const all = build(true, zero, [usable[0]]);
+    expect(await all.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal()))
+      .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    expect(all.searched).toEqual(['b.example']);
+  });
+
   // bsrcfix-41：候选源持久化接缝（无 DB 时缺省 = 内存单槽旧行为，上面用例已覆盖；这里钉接缝语义）。
   // recall 上限是 min(maxSources, hostTarget)（默认 2/2）：多源逐一下载的用例要显式放开两者。
   function candidatesHarness(state: {

@@ -218,8 +218,10 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
    * 与出网选源同过滤口径：非 https / builtin host / suspect host / 重复 host 剔除，且不超过
    * min(maxSources, hostTarget) 个；过滤后为空 ⇒ 返回 null（走出网选源——已失败候选不重试，重扫补新源）。
    * 读库失败返回空数组，停止本轮，不盲扫。
+   * zeroskip1105b：skipZeroYield 开时零产出 host（hostPriority 负分）的旧候选同样不取（与出网选源同口径；
+   * 优先分读失败按空表，不剔）。
    */
-  const recallSources = async (task: TaskRow): Promise<string[] | null> => {
+  const recallSources = async (task: TaskRow, signal: AbortSignal): Promise<string[] | null> => {
     if (!candidates) return null;
     let rows: { source_url: string; host: string }[];
     try {
@@ -227,10 +229,15 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     } catch {
       return [];
     }
+    let priority: ReadonlyMap<string, number> = new Map();
+    if (options.skipZeroYield && options.hostPriority && rows.length) {
+      try { priority = await options.hostPriority(signal); } catch { signal.throwIfAborted(); }
+    }
     const picked: string[] = [];
     for (const row of rows) {
       const host = hostOf(row.source_url);
       if (!/^https:\/\//i.test(row.source_url) || !host || builtinHosts.has(host) || isSuspect(host) || isPaywallHost(host)) continue;
+      if ((priority.get(host) ?? 0) < 0) continue;
       if (picked.some(url => hostOf(url) === host)) continue;
       picked.push(row.source_url);
       if (picked.length >= Math.min(maxSources, hostTarget)) break;
@@ -298,7 +305,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
         signal.throwIfAborted();
         const builtin = isBuiltinTask(task);
         if (!builtin && !candidates) return inner(task, signal);
-        let sources = await recallSources(task);
+        let sources = await recallSources(task, signal);
         signal.throwIfAborted();
         let stage = 'search';
         let identityMissed = false;
@@ -386,7 +393,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
           if (kind === 'engine' && !candidates) return engine.download(task, context);
           let primary: AdapterOutcome | null = null;
           if (!sources) {
-            sources = await recallSources(task);
+            sources = await recallSources(task, context.signal);
             stop = stopped(context.signal);
             if (stop) return stop;
             if (sources === null && !skipOriginal(task)) {
