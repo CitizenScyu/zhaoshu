@@ -933,6 +933,18 @@ export function engineTocFanoutFollowEnabled(env: OrEnv = process.env): boolean 
 }
 
 /**
+ * ENGINE_TOC_MAX_PAGES 目录翻页页数上限（tocpages1105，缺省 20 = 逐字不变）。手机站笔趣阁系目录按页码分页、每页约 20 章，
+ * 20 页只装得下约 400 章：2026-11-05 pc-linux 实网 m.qbiqus「斗破苍穹」声明 83 页、「凡人修仙传」124 页，strict 一律 toc_limit
+ * （B 线 13:00–15:42 下载结局 541 条中 87 条）。只认十进制整数，夹到 [20, 500]；非法值回缺省。章节总量上限 MAX_SOURCE_CHAPTERS 不变。
+ * 无新位：只改目录求值的终止条件。
+ */
+export function engineTocMaxPages(env: OrEnv = process.env): number {
+  const raw = env.ENGINE_TOC_MAX_PAGES?.trim() ?? '';
+  if (!/^\d{1,6}$/.test(raw)) return 20;
+  return Math.min(500, Math.max(20, Number(raw)));
+}
+
+/**
  * ENGINE_CONTENT_TEXTNODES_FALLBACK 独立开关（textnodes1031，默认 off，口径同 ENGINE_SYNTAX_OR）。正文规则每支都是 `@textNodes`
  * 末端（含 XPath `/text()`）时只取直接子文本节点；站点改版把正文挪进 `<p>` 子元素后整章恒空（www.suduguu.com `.con@textNodes`：
  * 2026-10-31 生产 7 天 117 本 0 章成功、占 empty_content_page 九成）。on = 该页取空时同一选择器改取 `@html` 并按正文口径转纯文本。

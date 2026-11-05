@@ -384,6 +384,11 @@ export function rejectLanding(landing) {
   if (landing?.url) throw new Error('response_path_mismatch');
 }
 
+// tocpages1105：DOWNLOAD_TOC_PAGE_TIMEOUT=1 时目录 operation 的 operation_timeout 每取到一页重新计时（逐页 timeout-ms），
+// 缺省整段目录共用一个 timeout-ms（生产 30s）。配 ENGINE_TOC_MAX_PAGES 放大页数上限后，100+ 页目录在 rate-ms 800 与 host QPS≤1
+// 下要 1–2 分钟，整段计时必然超时；逐页计时仍保证单页卡死 timeout-ms 内中止，总页数由引擎页数上限兜底。只作用于目录。
+export const tocPageTimeout = (env = process.env) => env.DOWNLOAD_TOC_PAGE_TIMEOUT?.trim() === '1';
+
 export async function downloadBook(m, args, resolveSource, transport = fetchSourceText, hooks = {}) {
   const dir = resolve(args.out ?? 'engine-download', hash(args.source + canonicalBookKey(args.title, args.author)).slice(0, 24));
   mkdirSync(dir, { recursive: true });
@@ -443,9 +448,10 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     }
     await hooks.onProgress?.({ chaptersDone: manifest.chapters_done, chaptersTotal: manifest.chapters_total ?? manifest.chapters.length, charsTotal: manifest.chars });
   };
-  const operation = async (fn, landing) => {
+  const operation = async (fn, landing, perPage = false) => {
     const local = new AbortController();
-    const timeout = setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
+    const arm = () => setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
+    let timeout = arm();
     const signal = AbortSignal.any([controller.signal, local.signal]);
     const context = { signal, page: async (url, pageOptions) => {
       const page = await transport(url, { ...pageFetchOptions(pageOptions), signal, timeoutMs: args['timeout-ms'], beforeRequest: async requestSignal => {
@@ -458,6 +464,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       burstCount++;
       } });
       checkPagePath(page, url, pageOptions, landing);
+      if (perPage) { clearTimeout(timeout); timeout = arm(); }
       return page;
     } };
     try { signal.throwIfAborted(); return await sourceAbortable(Promise.resolve().then(() => fn(context)), signal); }
@@ -527,7 +534,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       if (!builtin) return (await m.api.engineFetchToc(engine, selected.tocUrl ?? selected.bookUrl, ctx, true, selected.vars, selected.book)).chapters;
       const page = await ctx.page(selected.bookUrl);
       return m.parser.parseSourceChapters(page.text, page.url);
-    });
+    }, undefined, tocPageTimeout());
     const chapters = await toc();
     if (!chapters.length) throw new Error('empty_toc');
     manifest.tocHash = hash(JSON.stringify(chapters));

@@ -21,7 +21,7 @@ import { enginePostSearchEnabled, engineSearchJsActive } from './compile-smoke';
 import { preloadJsSandbox } from './js-sandbox';
 import { buildSearchRequestWithNet, evaluateWithFieldNet, prepareSearchJs, searchJsTemplateLimit } from './search-js';
 import { strictTocUnsupported } from './compile';
-import { engineContentTextNodesFallbackEnabled, engineSyntaxJsBindEnabled, engineTocFanoutFollowEnabled, engineTocNextSkipChapterEnabled } from './syntax-flags';
+import { engineContentTextNodesFallbackEnabled, engineSyntaxJsBindEnabled, engineTocFanoutFollowEnabled, engineTocMaxPages, engineTocNextSkipChapterEnabled } from './syntax-flags';
 import { RuleEngineError, type CompiledRules, type FieldIr, type RuleIr, type SkippedField } from './types';
 import { stripUrlOptions } from './url-options';
 
@@ -50,8 +50,7 @@ export type EngineDetailResult = Partial<SourceBookIdentity> & { tocUrl?: string
 export interface EngineTocResult { chapters: SourceChapter[] }
 export interface EngineContentResult { text: string }
 
-/** 翻页安全上限（引擎无定时器，靠页数/章节数上限终止，§7.3）。 */
-const MAX_TOC_PAGES = 20;
+/** 翻页安全上限（引擎无定时器，靠页数/章节数上限终止，§7.3）。目录页数上限由 ENGINE_TOC_MAX_PAGES 定（缺省 20，见 syntax-flags.ts）。 */
 export const MAX_CONTENT_PAGES = 20; // E5 导出例外（41-M1.1）：阅读器正文 context 的 L1 上限复用此值，不另写数字
 const MAX_SEARCH_CANDIDATES = 50;
 const MAX_TITLE_LENGTH = 200;
@@ -351,7 +350,8 @@ export async function engineFetchToc(
   const followFanout = engineTocFanoutFollowEnabled();
   let followed = false;
   const entryFanout: (string | undefined)[] = [];
-  for (let pageIndex = 0; (next || fanout.length > 0) && pageIndex < MAX_TOC_PAGES && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
+  const maxTocPages = engineTocMaxPages();
+  for (let pageIndex = 0; (next || fanout.length > 0) && pageIndex < maxTocPages && seenUrls.size <= MAX_SOURCE_CHAPTERS; pageIndex += 1) {
     const fromFanout = !next;
     // 脚本侧（engine-download）的 context 是只带 page 的裸对象：没有余量查询即不截断。
     if (fromFanout && listFanout && !strict && typeof context.remainingFor === 'function' && context.remainingFor(0) < 1) break;

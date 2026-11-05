@@ -1,11 +1,12 @@
 // JS 链翻页单测（jsbox1027，legado 并发分支）：nextTocUrl / nextContentUrl 一次给出多个 URL 时
 // 全部抓取、这些页不再取下一页；单个 URL 时顺序跟随；非法 URL 在 strict 下抛错。非链路径逐字不变。
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SourceRequestContext } from '@/lib/source-reader';
 import { engineFetchContent, engineFetchToc, type EngineSource } from './api';
 import { compileSource } from './compile';
 import { preloadJsSandbox } from './js-sandbox';
+import { engineTocMaxPages } from './syntax-flags';
 
 const SITE = 'https://book15.net';
 const TOC_URL = `${SITE}/toc/1.html`;
@@ -105,6 +106,30 @@ describe('engineFetchToc: nextTocUrl JS 链', () => {
     const pages = new Map([[TOC_URL, ch(1)]]);
     for (let i = 1; i <= 30; i += 1) pages.set(`${TOC_URL}?p=${i}`, ch(i + 1));
     await expect(engineFetchToc(src, TOC_URL, context(pages), true)).rejects.toThrowError('toc_limit');
+  });
+});
+
+describe('tocpages1105：ENGINE_TOC_MAX_PAGES', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('解析：缺省/非法回 20，夹到 [20, 500]', () => {
+    expect(engineTocMaxPages({})).toBe(20);
+    expect(engineTocMaxPages({ ENGINE_TOC_MAX_PAGES: 'abc' })).toBe(20);
+    expect(engineTocMaxPages({ ENGINE_TOC_MAX_PAGES: '-5' })).toBe(20);
+    expect(engineTocMaxPages({ ENGINE_TOC_MAX_PAGES: '1e3' })).toBe(20);
+    expect(engineTocMaxPages({ ENGINE_TOC_MAX_PAGES: '5' })).toBe(20);
+    expect(engineTocMaxPages({ ENGINE_TOC_MAX_PAGES: ' 300 ' })).toBe(300);
+    expect(engineTocMaxPages({ ENGINE_TOC_MAX_PAGES: '9999' })).toBe(500);
+  });
+
+  it('strict：上限放大后 30 页 fanout 全部取完', async () => {
+    vi.stubEnv('ENGINE_TOC_MAX_PAGES', '40');
+    await preloadJsSandbox();
+    const src = source({ ruleToc: { nextTocUrl: '@js:Array.from({ length: 30 }, (_, i) => "/toc/1.html?p=" + (i + 1))' } });
+    const pages = new Map([[TOC_URL, ch(1)]]);
+    for (let i = 1; i <= 30; i += 1) pages.set(`${TOC_URL}?p=${i}`, ch(i + 1));
+    const result = await engineFetchToc(src, TOC_URL, context(pages), true);
+    expect(result.chapters).toHaveLength(31);
   });
 });
 

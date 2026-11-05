@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, checkPagePath, rejectLanding, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, checkPagePath, rejectLanding, tocPageTimeout, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -1748,5 +1748,49 @@ describe('searchredir1105：搜索跳转落地页交详情身份门', () => {
     }) as never;
     const result = await downloadBook({ api, compile, parser }, f.options, async () => ({ source: f.source, builtin: false }), moved);
     expect(result.manifest).toMatchObject({ errors: ['download_failed'], failure_phase: 'detail' });
+  });
+});
+
+describe('tocpages1105：目录页数上限与逐页计时', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('ENGINE_TOC_MAX_PAGES 放大后无尽翻页仍按新上限报 toc_limit', async () => {
+    vi.stubEnv('ENGINE_TOC_MAX_PAGES', '50');
+    const source = { url: 'https://book15.net/', name:'fixture', searchUrl:'', compiled: compile.compileSource({url:'https://book15.net/',searchUrl:'',rules:{ruleToc:{chapterList:'a.chapter',chapterName:'@text',chapterUrl:'@href',nextTocUrl:'a.next@href'}}}) };
+    let n = 0;
+    const context = { page: async (url: string) => ({url,text:`<a class="chapter" href="/c${++n}">章</a><a class="next" href="/page${n}">next</a>`}) };
+    await expect(api.engineFetchToc(source,source.url,context as unknown as Parameters<typeof api.engineFetchToc>[2],true)).rejects.toThrow('toc_limit');
+    expect(n).toBe(50);
+  });
+
+  it('tocPageTimeout：仅 1 开', () => {
+    expect(tocPageTimeout()).toBe(false);
+    vi.stubEnv('DOWNLOAD_TOC_PAGE_TIMEOUT', 'true');
+    expect(tocPageTimeout()).toBe(false);
+    vi.stubEnv('DOWNLOAD_TOC_PAGE_TIMEOUT', ' 1 ');
+    expect(tocPageTimeout()).toBe(true);
+  });
+
+  // 目录两页各慢 100ms：整段 > timeout-ms 150，单页 < 150。
+  const slowToc = (f: ReturnType<typeof setup>) => (async (url: string, opts: { signal: AbortSignal }) => {
+    if (url.endsWith('/page2') || url.endsWith('details1.html')) {
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(resolve, 100);
+        opts.signal.addEventListener('abort', () => { clearTimeout(t); reject(opts.signal.reason); }, { once: true });
+      });
+    }
+    return (f.transport as (u: string, o: never) => Promise<{ url: string; text: string }>)(url, opts as never);
+  }) as never;
+
+  it('关：整段目录共用一个 timeout-ms ⇒ operation_timeout；开：逐页计时跑完全书', async () => {
+    const off = setup(0); off.options['timeout-ms'] = 150;
+    const offResult = await off.run(slowToc(off));
+    expect(offResult.code).toBe(1);
+    expect(JSON.stringify(offResult.manifest.errors)).toContain('operation_timeout');
+    vi.stubEnv('DOWNLOAD_TOC_PAGE_TIMEOUT', '1');
+    const on = setup(0); on.options['timeout-ms'] = 150;
+    const onResult = await on.run(slowToc(on));
+    expect(onResult.code).toBe(0);
+    expect(onResult.manifest.chapters.every((c: { status: string }) => c.status === 'done')).toBe(true);
   });
 });
