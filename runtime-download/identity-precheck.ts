@@ -17,10 +17,11 @@
 // - 其余（源解析失败、未归类错误、4xx、逐请求超时、预检墙钟用尽、候选超过
 //   MAX_PRECHECK_CANDIDATES 且前面的都对不上）⇒ { ok: true, reason: 'identity_unverified' }，放行，由下载器按原路径处理。
 
-import { identityMatches, isSourceUnavailableError } from '../scripts/engine-download.mjs';
+import { identityMatches, isSourceUnavailableError, pageFetchOptions } from '../scripts/engine-download.mjs';
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
 import { sourceBookMatches } from '../src/lib/source-parser';
-import { sourceAbortable } from '../src/lib/source-fetch';
+import { sourceAbortable, type SourcePageRequest } from '../src/lib/source-fetch';
+import type { SourceCharset } from '../src/lib/source-charset';
 import { searchKeysOf } from '../src/lib/search-key';
 import type { TaskRow } from '../src/lib/download-worker';
 import type { PrecheckHook, PrecheckResult } from './executor';
@@ -29,7 +30,9 @@ import type { PrecheckHook, PrecheckResult } from './executor';
 export const IDENTITY_PRECHECK_BUDGET_MS = 120_000;
 
 type Page = { url: string; text: string };
-export type Transport = (url: string, options: { signal: AbortSignal; timeoutMs?: number }) => Promise<Page>;
+/** pageopts1105：引擎 context.page 的取页覆写（见 pageFetchOptions）。 */
+type PageOptions = { request?: SourcePageRequest; responseCharset?: SourceCharset | 'auto'; noFollow?: boolean };
+export type Transport = (url: string, options: { signal: AbortSignal; timeoutMs?: number } & PageOptions) => Promise<Page>;
 type Candidate = { title?: string; author?: string; bookUrl: string; book?: unknown; vars?: unknown };
 type Identity = { title?: string; author?: string };
 interface Modules {
@@ -73,11 +76,11 @@ export const MAX_PRECHECK_CANDIDATES = 50;
 export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs: number) {
   return {
     signal,
-    page: async (url: string) => {
+    page: async (url: string, pageOptions?: PageOptions) => {
       const local = new AbortController();
       const timer = setTimeout(() => local.abort(new Error('operation_timeout')), timeoutMs);
       try {
-        const page = await transport(url, { signal: AbortSignal.any([signal, local.signal]), timeoutMs });
+        const page = await transport(url, { ...pageFetchOptions(pageOptions), signal: AbortSignal.any([signal, local.signal]), timeoutMs });
         if (new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
         return page;
       } finally {

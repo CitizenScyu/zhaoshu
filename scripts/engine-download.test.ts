@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, policyCodeOf, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -933,6 +933,8 @@ describe('chaperr1031 逐章失败类别', () => {
     expect(errorKindOf(new TypeError('fetch failed https://x.example/a', { cause: { code: 'ECONNRESET' } }))).toBe('TypeError:ECONNRESET');
     expect(errorKindOf(new SourcePolicyError('书源正文跳转到了目录中的其他章节，请重试或更换书源'))).toMatch(/^SourcePolicyError:POLICY_[A-Z_]+$/);
     expect(errorKindOf(Object.assign(new Error('x'), { name: 'Bad Name!', code: 'lower' }))).toBe('Error');
+    expect(errorKindOf(new Error('response_path_mismatch'))).toBe('Error:response_path_mismatch');
+    expect(errorKindOf(new Error('operation_timeout'))).toBe('Error:operation_timeout');
     // 非 Error 抛出物：name 缺失不得落成 "undefined"（生产 15:34 首批 4 章即此形）。
     expect(errorKindOf({ status: 500 })).toBe('Object:500');
     expect(errorKindOf(Object.create(null))).toBe('unknown');
@@ -1615,5 +1617,37 @@ describe('authbridge42 下载腿作者名回退轮', () => {
     const r = await f.run();
     expect(r.code).toBe(0);
     expect(f.calls.filter(url => url.includes('/search'))).toHaveLength(1);
+  });
+});
+
+describe('pageopts1105：取页覆写透传', () => {
+  const overrides = { request: { method: 'POST' as const, body: 'k=1', charset: 'gbk' as const }, responseCharset: 'gbk' as const, noFollow: true };
+  const env = (flag?: string) => ({ DOWNLOAD_PAGE_OPTIONS: flag }) as unknown as NodeJS.ProcessEnv;
+
+  it('pageFetchOptions：开才透传且只取这三项；缺省/其他值/无覆写 = 空', () => {
+    expect(pageFetchOptions({ ...overrides, attempts: 1 }, env('1'))).toEqual(overrides);
+    expect(pageFetchOptions({ responseCharset: 'auto' }, env('1'))).toEqual({ responseCharset: 'auto' });
+    expect(pageFetchOptions(undefined, env('1'))).toEqual({});
+    expect(pageFetchOptions(overrides, env())).toEqual({});
+    expect(pageFetchOptions(overrides, env('0'))).toEqual({});
+  });
+
+  it.each([['1', true], [undefined, false]])('downloadBook 的 context.page（DOWNLOAD_PAGE_OPTIONS=%s）', async (flag, forwarded) => {
+    if (flag) vi.stubEnv('DOWNLOAD_PAGE_OPTIONS', flag);
+    const f = setup(0);
+    const seen: Array<Record<string, unknown>> = [];
+    const api = { engineSearchBook: async (_e: unknown, _t: string, ctx: { page(u: string, o?: unknown): Promise<unknown> }) => {
+      await ctx.page('https://book15.net/search', overrides);
+      throw new Error('stop_after_search');
+    } };
+    await downloadBook({ api, compile, parser }, f.options, async () => ({ source: f.source, builtin: false }), (async (url: string, opts: Record<string, unknown>) => {
+      seen.push(opts);
+      return { url, text: '' };
+    }) as never);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject(forwarded ? overrides : {});
+    if (!forwarded) expect(seen[0]).not.toHaveProperty('request');
+    expect(seen[0].signal).toBeInstanceOf(AbortSignal);
+    vi.unstubAllEnvs();
   });
 });

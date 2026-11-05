@@ -63,6 +63,25 @@ describe('T8 createSourceTransport 限速器接线', () => {
     expect(limiter.failures).toEqual([{ key: HOST, opts: undefined }]);
   });
 
+  it('pageopts1105：取页覆写交给 fetchSourceText——POST + body 真发出，GBK 响应按声明解码', async () => {
+    const gbk = Uint8Array.from([0xd5, 0xfd, 0xce, 0xc4]); // 「正文」
+    const fetchMock = vi.fn().mockResolvedValue(new Response(gbk, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const page = await createSourceTransport(fakeLimiter())(`https://${HOST}/s`, {
+      ...opts(), request: { method: 'POST', body: 'k=1', charset: 'gbk' }, responseCharset: 'gbk',
+    });
+    expect(page.text).toBe('正文');
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'POST' });
+    expect(new TextDecoder().decode(fetchMock.mock.calls[0][1].body)).toBe('k=1');
+  });
+
+  it('pageopts1105：不带覆写 = GET + UTF-8 严格解码，同改前', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(Uint8Array.from([0xd5, 0xfd, 0xce, 0xc4]), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(createSourceTransport(fakeLimiter())(`https://${HOST}/s`, opts())).rejects.toMatchObject({ code: 'ERR_ENCODING_INVALID_ENCODED_DATA' });
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'GET' });
+  });
+
   it('网络/传输错误（无 status）→ 不计熔断', async () => {
     // fetch 抛传输错误：fetchSourceText 会换 host 重试，最终仍抛无 status 的 TypeError。
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'))));

@@ -15,7 +15,8 @@ import * as supported from '../src/lib/supported-sources';
 import * as policy from '../src/lib/source-policy';
 import * as parser from '../src/lib/source-parser';
 import * as reader from '../src/lib/source-reader';
-import { fetchSourceText } from '../src/lib/source-fetch';
+import { fetchSourceText, type SourcePageRequest } from '../src/lib/source-fetch';
+import type { SourceCharset } from '../src/lib/source-charset';
 
 export {
   createFeedbackDeadlineLimiter, FeedbackDeadlineError, FeedbackHostStateError,
@@ -198,6 +199,10 @@ export type SourceTransport = (
   options: {
     signal: AbortSignal;
     timeoutMs?: number;
+    /** pageopts1105：引擎取页覆写，原样交给 fetchSourceText（见 scripts/engine-download.mjs pageFetchOptions）。 */
+    request?: SourcePageRequest;
+    responseCharset?: SourceCharset | 'auto';
+    noFollow?: boolean;
     beforeRequest?: (signal: AbortSignal) => Promise<void>;
     /** 调用方已有的物理策略门（冷却等）：每次物理发射前先走，再取限速许可。 */
     beforeFetch?: (signal: AbortSignal, url: string) => void | Promise<void>;
@@ -222,7 +227,7 @@ interface GateRejection { fromBeforeRequest?: boolean }
  */
 export function createSourceTransport(limiter?: RateLimiterLike): SourceTransport {
   return async (url, options) => {
-    const { signal, timeoutMs, beforeRequest, beforeFetch: callerGate, afterAcquire } = options;
+    const { signal, timeoutMs, request, responseCharset, noFollow, beforeRequest, beforeFetch: callerGate, afterAcquire } = options;
     // 最近一次物理发射的 host（许可按它取过）：无 responseHost 的 HTTP 失败反馈归它。
     let lastHost = hostOf(url);
     // opaque许可只在本次transport内保留原引用；不解析字段或按反馈host重绑。
@@ -242,7 +247,7 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
     let page: { url: string; text: string };
     // 请求结果与反馈结果分开捕获，反馈失败不能再次归因成HTTP失败。
     try {
-      page = await fetchSourceText(url, { signal, timeoutMs, beforeRequest, beforeFetch });
+      page = await fetchSourceText(url, { signal, timeoutMs, request, responseCharset, noFollow, beforeRequest, beforeFetch });
     } catch (error) {
       // 只认调用方取消reason的同一引用，不吞掉已收到的不同HTTP错误。
       if (signal.aborted && error === signal.reason) throw error;

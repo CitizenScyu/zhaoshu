@@ -226,6 +226,8 @@ export function chapterErrorKind(env = process.env) {
 }
 const CONST_CODE = /^[A-Z][A-Z0-9_]{1,39}$/;
 const SAFE_NAME = /^[A-Za-z]{1,32}$/;
+// pageopts1105：本地固定文案的失败单列（否则都是裸 Error，分不出响应路径被改写与逐请求超时）。
+const LOCAL_FAILURE = /^(response_path_mismatch|operation_timeout)$/;
 export function errorKindOf(error) {
   // name 缺失（非 Error 抛出物）时退到构造器名；先判 typeof，免得 regex 把 undefined 字面量化成 "undefined"。
   const ctor = error?.constructor?.name;
@@ -233,7 +235,8 @@ export function errorKindOf(error) {
     : typeof ctor === 'string' && SAFE_NAME.test(ctor) ? ctor : 'unknown';
   const status = Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599 ? `:${error.status}` : '';
   const own = typeof error?.code === 'string' ? error.code : error?.name === 'SourcePolicyError' ? policyCodeOf(error.message) : '';
-  const code = CONST_CODE.test(own) ? own : typeof error?.cause?.code === 'string' && CONST_CODE.test(error.cause.code) ? error.cause.code : '';
+  const code = CONST_CODE.test(own) ? own : typeof error?.cause?.code === 'string' && CONST_CODE.test(error.cause.code) ? error.cause.code
+    : LOCAL_FAILURE.test(error?.message) ? error.message : '';
   return name + status + (code ? `:${code}` : '');
 }
 
@@ -339,6 +342,16 @@ export const identityMatches = (detail, candidate, args) => {
 //   signal      —— 外部租约/截止信号：触发时等价 SIGINT，中断抓取并把 partial 检查点落盘；
 //   onProgress  —— 每次清单检查点（目录解析后、每章后、收尾）回调最新计数；抛错（租约丢失）
 //                  立即中断下载，不吞成单章失败。
+// pageopts1105：DOWNLOAD_PAGE_OPTIONS=1 时，引擎 context.page 的取页覆写（request=POST/body/头/字符集、responseCharset、noFollow）透传给
+// transport。缺省/其他值 = 关（零行为变化：只取 url，一律 GET + UTF-8 严格解码）。
+// 动机（2026-11-05 phoenix 只读）：B 线 page 只收 url，把覆写全丢了——引擎池 811 源里 328 个（187 host，占 44%）声明 GBK 或 POST，
+// GBK 站每轮 ERR_ENCODING_INVALID_ENCODED_DATA，POST 站被当 GET 发（405 / 无结果页记成「无书」），这些源在 B 线从未搜到过书。
+export function pageFetchOptions(opts, env = process.env) {
+  if (env.DOWNLOAD_PAGE_OPTIONS?.trim() !== '1' || !opts) return {};
+  const { request, responseCharset, noFollow } = opts;
+  return { ...(request ? { request } : {}), ...(responseCharset ? { responseCharset } : {}), ...(noFollow ? { noFollow } : {}) };
+}
+
 export async function downloadBook(m, args, resolveSource, transport = fetchSourceText, hooks = {}) {
   const dir = resolve(args.out ?? 'engine-download', hash(args.source + canonicalBookKey(args.title, args.author)).slice(0, 24));
   mkdirSync(dir, { recursive: true });
@@ -402,8 +415,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     const local = new AbortController();
     const timeout = setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
     const signal = AbortSignal.any([controller.signal, local.signal]);
-    const context = { signal, page: async url => {
-      const page = await transport(url, { signal, timeoutMs: args['timeout-ms'], beforeRequest: async requestSignal => {
+    const context = { signal, page: async (url, pageOptions) => {
+      const page = await transport(url, { ...pageFetchOptions(pageOptions), signal, timeoutMs: args['timeout-ms'], beforeRequest: async requestSignal => {
       requestSignal.throwIfAborted();
       const now = Date.now(), at = Math.max(now, nextAt);
       nextAt = at + args['rate-ms'];

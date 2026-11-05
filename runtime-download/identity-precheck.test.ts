@@ -9,7 +9,7 @@ import * as compile from '../src/lib/rule-engine/compile';
 import * as parser from '../src/lib/source-parser';
 import fixtures from '../src/lib/rule-engine/fixtures/smoke-174.json';
 import { downloadBook } from '../scripts/engine-download.mjs';
-import { createIdentityPrecheck } from './identity-precheck';
+import { createIdentityPrecheck, pageContext } from './identity-precheck';
 import type { TaskRow } from '../src/lib/download-worker';
 
 const modules = { api, compile, parser };
@@ -256,5 +256,28 @@ describe('41-T5-IDENTITY 身份预检钩子', () => {
       expect(await precheckFor(s.transport)(task('测试书', '测试书'))).toEqual(MATCH);
       expect(s.searches()).toHaveLength(1);
     });
+  });
+});
+
+describe('pageopts1105：pageContext 透传取页覆写', () => {
+  const overrides = { request: { method: 'POST' as const, body: 'k=1', charset: 'gbk' as const }, responseCharset: 'gbk' as const };
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  const run = async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const context = pageContext(async (url, options) => { seen.push(options); return { url, text: '' }; }, new AbortController().signal, 1000);
+    await context.page('https://a.example/s', overrides);
+    return seen[0];
+  };
+
+  it('开：request/responseCharset 交给 transport，signal/timeoutMs 不被覆写', async () => {
+    vi.stubEnv('DOWNLOAD_PAGE_OPTIONS', '1');
+    const options = await run();
+    expect(options).toMatchObject({ ...overrides, timeoutMs: 1000 });
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('缺省关：只有 signal/timeoutMs，同改前', async () => {
+    expect(Object.keys(await run()).sort()).toEqual(['signal', 'timeoutMs']);
   });
 });
