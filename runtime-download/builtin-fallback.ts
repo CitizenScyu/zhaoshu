@@ -82,6 +82,8 @@ export interface BuiltinFallbackOptions {
     failedSources: (bookId: number) => Promise<Set<string>>;
     replace: (bookId: number, sources: string[]) => Promise<void>;
     markFailure: (bookId: number, sourceUrl: string, kind: 'permanent' | 'temporary', reason: string) => Promise<void>;
+    /** yieldattr1105：回退源整本 complete ⇒ 记成功标记（产出归因到实际下载源）。缺省 = 不记；写失败只记日志、不影响收口。 */
+    markDone?: (bookId: number, sourceUrl: string) => Promise<void>;
     occupiedHosts: () => Promise<Set<string>>;
   };
   /** host 是否处于已知不可达窗口；缺省 = source-host-health.isHostSuspect。 */
@@ -425,7 +427,16 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
                 ...(next.kind === 'incomplete' && next.retryCause ? { retryCause: next.retryCause } : {}),
                 ...(next.kind === 'incomplete' && next.progressed ? { progressed: true } : {}),
               });
-              if (next.kind === 'complete') return next;
+              if (next.kind === 'complete') {
+                if (candidates?.markDone) {
+                  try {
+                    await candidates.markDone(task.book_id, url);
+                  } catch {
+                    log('error', '候选成功标记保存失败', { taskId: task.id, host, reason: 'candidate_persistence_unavailable' });
+                  }
+                }
+                return next;
+              }
               if (next.kind === 'failure') {
                 if (candidates) {
                   try {

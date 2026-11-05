@@ -6,7 +6,7 @@ import { loadPGlite, type PGliteLike } from '../lib/fixtures/pglite';
 import { createPGliteSql } from '../lib/fixtures/pglite-sql';
 import { initializeBusinessSchema } from '../lib/business-schema';
 import {
-  claimSourcePrefetch, classifyFailure, failedCandidateSources, markCandidateFailure, occupiedHosts,
+  claimSourcePrefetch, classifyFailure, failedCandidateSources, markCandidateDone, markCandidateFailure, occupiedHosts,
   productiveHostScores, releaseHostOccupancy, releaseSourcePrefetch, replaceSourceCandidates,
   tryOccupyHost, usableSourceCandidates, zeroYieldHosts,
 } from './download-source-candidates';
@@ -196,5 +196,36 @@ maybe('bsrcfix-41：候选源持久化与跨实例占位（0005 三表）', () =
     expect(await zeroYieldHosts(sql())).toEqual(new Map());
     await expect(zeroYieldHosts(sql(), 0)).rejects.toThrow('windowDays is invalid');
     await expect(zeroYieldHosts(sql(), 30, 0)).rejects.toThrow('minBooks is invalid');
+  });
+
+  it('yieldattr1105 markCandidateDone：回退站实收计入 productive、解除 zeroyield 降级；失败行被覆盖为成功', async () => {
+    await pg.exec(`
+      INSERT INTO labeled_books (title, author) SELECT 'b' || g, '' FROM generate_series(2, 5) g;
+      INSERT INTO download_source_candidates (book_id, source_url, host, failure, updated_at) VALUES
+        (1, 'https://www.f.example/', 'www.f.example', 'temporary', now()),
+        (2, 'https://www.f.example/', 'www.f.example', 'temporary', now()),
+        (3, 'https://www.f.example/', 'www.f.example', 'temporary', now()),
+        (4, 'https://www.f.example/b4', 'www.f.example', 'temporary', now()),
+        (1, 'https://old.example/', 'old.example', 'temporary', now()),
+        (2, 'https://old.example/', 'old.example', 'temporary', now()),
+        (3, 'https://old.example/', 'old.example', 'temporary', now()),
+        (4, 'https://old.example/', 'old.example', '', now() - interval '40 days');
+      UPDATE download_source_candidates SET failure_reason = 'done' WHERE book_id = 4 AND host = 'old.example';
+      INSERT INTO download_tasks (user_id, book_id, title, status, source_url, updated_at) VALUES
+        (1, 5, 't', 'done', 'https://builtin.example/book/5', now());
+    `);
+    expect(await zeroYieldHosts(sql(), 30, 3)).toEqual(new Map([['www.f.example', 4], ['old.example', 3]]));
+    // 书 5 的任务 source_url 记原始 builtin 源，实际由 m.f.example 回退下完（同站 www./m. 互认）。
+    await markCandidateDone(sql(), 5, 'https://m.f.example/b5');
+    // 书 4 曾在 www.f.example/b4 失败，重试下完 ⇒ 同行改成功标记，不再算失败书。
+    await markCandidateDone(sql(), 4, 'https://www.f.example/b4');
+    expect((await pg.query(`SELECT failure, failure_reason, position FROM download_source_candidates
+      WHERE book_id = 4 AND source_url = 'https://www.f.example/b4'`)).rows).toEqual([{ failure: '', failure_reason: 'done', position: 0 }]);
+    // old.example 的成功标记已过窗 ⇒ 仍降级。
+    expect(await zeroYieldHosts(sql(), 30, 3)).toEqual(new Map([['old.example', 3]]));
+    expect(await productiveHostScores(sql())).toEqual(new Map([
+      ['builtin.example', 1], ['m.f.example', 1], ['www.f.example', 1]]));
+    // 成功行 failure='' ⇒ usable 照常可见（重排时可直接复用该源）。
+    expect((await usableSourceCandidates(sql(), 5)).map(row => row.source_url)).toEqual(['https://m.f.example/b5']);
   });
 });

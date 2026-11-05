@@ -31,7 +31,7 @@ import { createSharedHostSuspect, hostSuspectDir, sharedHostSuspectEnabled } fro
 import { isHostSuspect, setHostHealthListener, sourceHostSuspectMs } from '../src/lib/source-host-health';
 import { peerOutRoots, resumePeersEnabled, resumeStaleLocksEnabled, seedFromPeers } from './resume-seed';
 import {
-  failedCandidateSources, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
+  failedCandidateSources, markCandidateDone, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
   usableSourceCandidates,
 } from '../src/lib/download-source-candidates';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
@@ -356,6 +356,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
           failedSources: (bookId) => failedCandidateSources(candidateSql, bookId),
           replace: (bookId, sources) => replaceSourceCandidates(candidateSql, bookId, sources),
           markFailure: (bookId, url, kind, reason) => markCandidateFailure(candidateSql, bookId, url, kind, reason),
+          markDone: (bookId, url) => markCandidateDone(candidateSql, bookId, url),
           occupiedHosts: () => occupiedHosts(candidateSql),
         },
       } : {}),

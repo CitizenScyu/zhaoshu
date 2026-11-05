@@ -97,6 +97,25 @@ export async function markCandidateFailure(
   ]);
 }
 
+/** yieldattr1105：引擎回退该源整本 complete 时写的成功标记（failure='' 不影响 usable 语义）。 */
+export const CANDIDATE_DONE_REASON = 'done';
+
+/**
+ * yieldattr1105：回退源整本下完 ⇒ 记成功标记，产出归因到实际下载源 host。
+ * 回退成功的任务 source_url 仍是原始 builtin 源（book.qq.com 等），只按任务 source_url 归因会把
+ * 真出书的回退站当成零产出降级。同序先锁 book 行；重选源（replace）会清掉该行，属可接受的丢失。
+ */
+export async function markCandidateDone(sql: CandidateSql, bookId: number, sourceUrl: string): Promise<void> {
+  await sql.transaction(tx => [
+    tx`SELECT id FROM labeled_books WHERE id = ${bookId} FOR UPDATE`,
+    tx`INSERT INTO download_source_candidates
+         (book_id, source_url, host, position, failure, failure_reason, updated_at)
+       VALUES (${bookId}, ${sourceUrl}, ${candidateHostOf(sourceUrl)}, 0, '', ${CANDIDATE_DONE_REASON}, now())
+       ON CONFLICT (book_id, source_url) DO UPDATE
+         SET failure = '', failure_reason = EXCLUDED.failure_reason, updated_at = now()`,
+  ]);
+}
+
 /** host 原子占位：被他人持有且未过期 ⇒ false；过期原子接管。expiresMs 必须 > 0。 */
 export async function tryOccupyHost(
   sql: CandidateSql,
@@ -162,14 +181,23 @@ export async function releaseSourcePrefetch(sql: CandidateSql, bookId: number, o
 /**
  * yield1030：近 windowDays 天内各 host 实收（status='done'）的任务数——选源扫描优先分。
  * 只认 done（真出过书），不认选源命中：命中但下载恒败的 host（invalid_chapter / pagination_cycle 型）
- * 提前只会更早占掉早停槽位。host 取自任务 source_url（引擎回退成功的任务记的是实际下载源）。
+ * 提前只会更早占掉早停槽位。host 取自任务 source_url，外加候选成功标记（yieldattr1105：回退成功的
+ * 任务 source_url 仍是原始 builtin 源，实际下载源只在候选标记里）。
  */
 export async function productiveHostScores(sql: CandidateSql, windowDays = 30): Promise<Map<string, number>> {
   if (!Number.isSafeInteger(windowDays) || windowDays <= 0) throw new Error('windowDays is invalid');
   const rows = await sql`
-    SELECT lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')) AS host, count(*)::int AS n
-    FROM download_tasks
-    WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day')
+    SELECT host, sum(n)::int AS n FROM (
+      SELECT lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')) AS host, count(*)::int AS n
+      FROM download_tasks
+      WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day')
+      GROUP BY 1
+      UNION ALL
+      SELECT lower(host), count(*)::int
+      FROM download_source_candidates
+      WHERE failure = '' AND failure_reason = ${CANDIDATE_DONE_REASON} AND host <> ''
+        AND updated_at > now() - (${windowDays}::int * interval '1 day')
+      GROUP BY 1) AS t
     GROUP BY 1` as unknown as { host: string | null; n: number }[];
   const scores = new Map<string, number>();
   for (const row of rows) if (row.host && Number.isFinite(Number(row.n)) && Number(row.n) > 0) scores.set(row.host, Number(row.n));
@@ -181,6 +209,8 @@ export async function productiveHostScores(sql: CandidateSql, windowDays = 30): 
  * 同 stationKeyOfHost）同窗口内一本 done 都没有的候选 host ⇒ 失败书数。选源扫描据此把它们降到池尾（不剔除）。
  * host 取候选表 host 列（= 选源池源 URL 的 host，与 selector 的 hostOf(source.url) 同键）。
  * 物理 host 门让出（占用/熔断）不 markFailure，所以这里不会把「忙」算成「没产出」。
+ * yieldattr1105：done 同时认候选成功标记（回退站实收），否则回退真出书的站会因任务 source_url
+ * 记的是原始 builtin 源而被误判零产出。
  */
 export async function zeroYieldHosts(sql: CandidateSql, windowDays = 30, minBooks = 5): Promise<Map<string, number>> {
   if (!Number.isSafeInteger(windowDays) || windowDays <= 0) throw new Error('windowDays is invalid');
@@ -189,7 +219,12 @@ export async function zeroYieldHosts(sql: CandidateSql, windowDays = 30, minBook
     WITH done AS (
       SELECT DISTINCT regexp_replace(lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')), '^((www|m)\\.)+', '') AS station
       FROM download_tasks
-      WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day'))
+      WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day')
+      UNION
+      SELECT regexp_replace(lower(host), '^((www|m)\\.)+', '')
+      FROM download_source_candidates
+      WHERE failure = '' AND failure_reason = ${CANDIDATE_DONE_REASON} AND host <> ''
+        AND updated_at > now() - (${windowDays}::int * interval '1 day'))
     SELECT lower(c.host) AS host, count(DISTINCT c.book_id)::int AS n
     FROM download_source_candidates c
     WHERE c.failure <> '' AND c.host <> '' AND c.updated_at > now() - (${windowDays}::int * interval '1 day')

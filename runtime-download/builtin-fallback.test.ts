@@ -577,6 +577,8 @@ describe('41-T8FB builtin-fallback', () => {
     failures: [number, string, string, string][];
     replaceError?: Error;
     failureError?: Error;
+    done?: [number, string][];
+    doneError?: Error;
   }, limits?: { hostTarget?: number; maxSources?: number }) {
     const searched: string[] = [];
     const fallback = createBuiltinFallback({
@@ -608,11 +610,40 @@ describe('41-T8FB builtin-fallback', () => {
           state.failures.push([bookId, url, kind, reason]);
         },
         occupiedHosts: async () => new Set(state.occupied ?? []),
+        ...(state.done ? {
+          markDone: async (bookId: number, url: string) => {
+            if (state.doneError) throw state.doneError;
+            state.done!.push([bookId, url]);
+          },
+        } : {}),
       },
       isSuspect: () => false,
     });
     return { fallback, searched };
   }
+
+  it('yieldattr1105：回退源整本 complete ⇒ markDone 记实际下载源；失败源不记；标记写失败不影响收口', async () => {
+    const usable = [
+      { source_url: 'https://bad.example/b1', host: 'bad.example' },
+      { source_url: 'https://good.example/b1', host: 'good.example' },
+    ];
+    const done = { kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1 } as const;
+    const state = { usable, stored: [], failures: [] as [number, string, string, string][], done: [] as [number, string][] };
+    const h = candidatesHarness(state);
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({}, []), adapter({ 'good.example': done }, calls)).download(task(), context());
+    expect(out).toEqual(done);
+    expect(calls).toEqual(['bad.example', 'good.example']);
+    expect(state.failures.map(f => f[1])).toEqual(['https://bad.example/b1']);
+    expect(state.done).toEqual([[1, 'https://good.example/b1']]);
+
+    const broken = { usable, stored: [], failures: [] as [number, string, string, string][], done: [] as [number, string][],
+      doneError: new Error('synthetic database failure') };
+    const out2 = await candidatesHarness(broken).fallback
+      .wrapAdapter(adapter({}, []), adapter({ 'good.example': done }, [])).download(task(), context());
+    expect(out2).toEqual(done);
+    expect(broken.done).toEqual([]);
+  });
 
   it('持久化命中 ⇒ 预检零出网放行（不读源池、不搜索）', async () => {
     const state = {
