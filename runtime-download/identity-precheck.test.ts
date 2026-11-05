@@ -280,4 +280,14 @@ describe('pageopts1105：pageContext 透传取页覆写', () => {
   it('缺省关：只有 signal/timeoutMs，同改前', async () => {
     expect(Object.keys(await run()).sort()).toEqual(['signal', 'timeoutMs']);
   });
+
+  it.each([['1', true], [undefined, false]])('postredir1105：POST 落到别的路径（DOWNLOAD_POST_REDIRECT=%s）', async (flag, allowed) => {
+    vi.stubEnv('DOWNLOAD_PAGE_OPTIONS', '1');
+    if (flag) vi.stubEnv('DOWNLOAD_POST_REDIRECT', flag);
+    const context = pageContext(async () => ({ url: 'https://a.example/search/result-1-0.html', text: '' }), new AbortController().signal, 1000);
+    const posted = context.page('https://a.example/e/search/index.php', overrides);
+    if (allowed) await expect(posted).resolves.toMatchObject({ url: 'https://a.example/search/result-1-0.html' });
+    else await expect(posted).rejects.toThrow('response_path_mismatch');
+    await expect(context.page('https://a.example/s?k=1', { responseCharset: 'auto' })).rejects.toThrow('response_path_mismatch');
+  });
 });

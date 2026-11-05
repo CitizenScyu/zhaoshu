@@ -352,6 +352,14 @@ export function pageFetchOptions(opts, env = process.env) {
   return { ...(request ? { request } : {}), ...(responseCharset ? { responseCharset } : {}), ...(noFollow ? { noFollow } : {}) };
 }
 
+// postredir1105：DOWNLOAD_POST_REDIRECT=1 时，真发出去的 POST 取页（即 pageFetchOptions 透传了 request.method=POST，只有引擎搜索请求）
+// 落到同站别的路径不再判 response_path_mismatch。帝国CMS 搜索是 POST /e/search/index.php → 302 → /search/result-<id>-0.html，
+// 落地页就是结果列表（2026-11-05 pc-linux 实网：m.jjjxsw.com / www.aijjxs.com 引擎照常解析出命中，B 线却整源判失败）。
+// 每一跳 Location 仍由 fetchSourceText 过 host 白名单/HTTPS 锁；GET 取页与详情/目录/正文的路径绑定（page-book binding）不变。
+export function postRedirectAllowed(opts, env = process.env) {
+  return env.DOWNLOAD_POST_REDIRECT?.trim() === '1' && pageFetchOptions(opts, env).request?.method === 'POST';
+}
+
 export async function downloadBook(m, args, resolveSource, transport = fetchSourceText, hooks = {}) {
   const dir = resolve(args.out ?? 'engine-download', hash(args.source + canonicalBookKey(args.title, args.author)).slice(0, 24));
   mkdirSync(dir, { recursive: true });
@@ -425,7 +433,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       nextAt = Math.max(nextAt, Date.now() + args['rate-ms']);
       burstCount++;
       } });
-      if (new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
+      if (!postRedirectAllowed(pageOptions) && new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
       return page;
     } };
     try { signal.throwIfAborted(); return await sourceAbortable(Promise.resolve().then(() => fn(context)), signal); }

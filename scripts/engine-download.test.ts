@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -1648,6 +1648,36 @@ describe('pageopts1105：取页覆写透传', () => {
     expect(seen[0]).toMatchObject(forwarded ? overrides : {});
     if (!forwarded) expect(seen[0]).not.toHaveProperty('request');
     expect(seen[0].signal).toBeInstanceOf(AbortSignal);
+    vi.unstubAllEnvs();
+  });
+});
+
+describe('postredir1105：POST 搜索跳转落地页不判路径改写', () => {
+  const env = (redirect?: string, pageOptions = '1') => ({ DOWNLOAD_POST_REDIRECT: redirect, DOWNLOAD_PAGE_OPTIONS: pageOptions }) as unknown as NodeJS.ProcessEnv;
+  const post = { request: { method: 'POST' as const, body: 'k=1', charset: 'gbk' as const } };
+
+  it('只有开关开、且 POST 真透传出去才放行', () => {
+    expect(postRedirectAllowed(post, env('1'))).toBe(true);
+    expect(postRedirectAllowed(post, env())).toBe(false);
+    expect(postRedirectAllowed(post, env('1', '0'))).toBe(false);
+    expect(postRedirectAllowed({ request: { method: 'GET' as const, charset: 'utf-8' as const } }, env('1'))).toBe(false);
+    expect(postRedirectAllowed({ responseCharset: 'auto' }, env('1'))).toBe(false);
+    expect(postRedirectAllowed(undefined, env('1'))).toBe(false);
+  });
+
+  it.each([['1', true], [undefined, false]])('downloadBook 的 context.page：POST 落到别的路径（DOWNLOAD_POST_REDIRECT=%s）', async (flag, allowed) => {
+    vi.stubEnv('DOWNLOAD_PAGE_OPTIONS', '1');
+    if (flag) vi.stubEnv('DOWNLOAD_POST_REDIRECT', flag);
+    const f = setup(0);
+    const outcomes: string[] = [];
+    const api = { engineSearchBook: async (_e: unknown, _t: string, ctx: { page(u: string, o?: unknown): Promise<unknown> }) => {
+      await ctx.page('https://book15.net/e/search/index.php', post).then(() => outcomes.push('ok'), (e: Error) => outcomes.push(e.message));
+      await ctx.page('https://book15.net/search?k=1').then(() => outcomes.push('ok'), (e: Error) => outcomes.push(e.message));
+      throw new Error('stop_after_search');
+    } };
+    await downloadBook({ api, compile, parser }, f.options, async () => ({ source: f.source, builtin: false }),
+      (async (url: string) => ({ url: url.replace(/\/(e\/search\/index\.php|search\?k=1)$/, '/search/result-1-0.html'), text: '' })) as never);
+    expect(outcomes).toEqual([allowed ? 'ok' : 'response_path_mismatch', 'response_path_mismatch']);
     vi.unstubAllEnvs();
   });
 });

@@ -17,7 +17,7 @@
 // - 其余（源解析失败、未归类错误、4xx、逐请求超时、预检墙钟用尽、候选超过
 //   MAX_PRECHECK_CANDIDATES 且前面的都对不上）⇒ { ok: true, reason: 'identity_unverified' }，放行，由下载器按原路径处理。
 
-import { identityMatches, isSourceUnavailableError, pageFetchOptions } from '../scripts/engine-download.mjs';
+import { identityMatches, isSourceUnavailableError, pageFetchOptions, postRedirectAllowed } from '../scripts/engine-download.mjs';
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
 import { sourceBookMatches } from '../src/lib/source-parser';
 import { sourceAbortable, type SourcePageRequest } from '../src/lib/source-fetch';
@@ -81,7 +81,7 @@ export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs
       const timer = setTimeout(() => local.abort(new Error('operation_timeout')), timeoutMs);
       try {
         const page = await transport(url, { ...pageFetchOptions(pageOptions), signal: AbortSignal.any([signal, local.signal]), timeoutMs });
-        if (new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
+        if (!postRedirectAllowed(pageOptions) && new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
         return page;
       } finally {
         clearTimeout(timer);
