@@ -188,7 +188,8 @@ class DoneAuthorGate(unittest.TestCase):
                     stack.enter_context(mock.patch.object(dl, 'fetch_douban_books', return_value=[candidate]))
                     stack.enter_context(mock.patch.object(dl, 'fetch_qidian_finish_books', return_value=[candidate]))
                     for name in ('fetch_zongheng_complete_books', 'fetch_17k_quanben_books', 'fetch_qidian_rank_books',
-                                 'fetch_qimao_rank_books', 'fetch_17k_top_books'):
+                                 'fetch_qimao_rank_books', 'fetch_17k_top_books',
+                                 'fetch_jjwxc_finish_books', '_fetch_page'):
                         stack.enter_context(mock.patch.object(dl, name, return_value=[]))
                     cli = FakeCli(author)
                     if adapter == 'douban':
