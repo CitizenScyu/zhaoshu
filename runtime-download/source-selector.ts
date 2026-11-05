@@ -93,6 +93,7 @@ export interface SourceSelectionRequest {
  * 说明这本书整池没人挂，免费站收录以天计 ⇒ 长退避；scanned===0 是 busy 全占/池不可读/预算尽 ⇒ 快退避。
  * 扫描 0 个源时也如实返回 0，不粉饰。remembered = 按确认无书记忆跳过的源数（scanmiss1101；无记忆时缺席），
  * scanned + remembered > 0 同样说明这本书整池没人挂（记忆里的源是 TTL 内实探过的）。
+ * unprobed1105：被本机门挡下、没向源站问过的源（isUnprobed）不计 scanned、不占 scanLimit/scanBudget。
  */
 export interface SourceSelection {
   picked: string[];
@@ -110,6 +111,18 @@ const hostOf = (url: string): string => {
 const isOccupancyUnavailable = (error: unknown): boolean =>
   typeof error === 'object' && error !== null
   && (error as { code?: unknown }).code === 'HOST_OCCUPANCY_UNAVAILABLE';
+
+// unprobed1105：本机门拒绝——host 未登记共享限速（HOST_LOCK_MISSING）、被别的 worker 占用（HOST_OCCUPIED）、
+// 限速器熔断/日限（CircuitOpenError/DailyRequestBudgetError）——根本没向源站问这本书，不是「这个源没书」。照旧计入
+// scanned 会让整池被门挡住也被 nocand42 当成「整池实探零候选」长退避（2026-11-05 phoenix：255 个池 host 未登记，
+// 每轮约 80 个源这样被算成已扫）。
+const UNPROBED_CODES = new Set(['HOST_LOCK_MISSING', 'HOST_OCCUPIED']);
+const UNPROBED_NAMES = new Set(['CircuitOpenError', 'DailyRequestBudgetError']);
+const isUnprobed = (error: unknown): boolean => {
+  const e = error as { code?: unknown; name?: unknown; cause?: { code?: unknown } } | null | undefined;
+  return UNPROBED_CODES.has(e?.code as string) || UNPROBED_CODES.has(e?.cause?.code as string)
+    || UNPROBED_NAMES.has(e?.name as string);
+};
 
 export function createSourceSelector(options: SourceSelectorOptions): SourceSelector {
   const modules = options.modules as Modules;
@@ -298,11 +311,18 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       // scanerr1105：探测异常（超时/HTTP/规则）被吞后与「无书」同记 scanned，0 候选里分不出真无书与探不到。
       // 只计数与固定分类（errorKindOf：异常名/HTTP 状态/常量码，不含原文与 URL），不改任何判定。
       let errors = 0;
+      let unprobed = 0;
       const errorKinds = new Map<string, number>();
       const noteError = (error: unknown): void => {
         errors += 1;
         const kind = errorKindOf(error);
         errorKinds.set(kind, (errorKinds.get(kind) ?? 0) + 1);
+        // unprobed1105：门拒绝退还名额（errors/errorKinds 照记）。
+        if (isUnprobed(error)) {
+          unprobed += 1;
+          scanned -= 1;
+          if (request.scanBudget) request.scanBudget.remaining += 1;
+        }
       };
       const concurrency = Math.max(1, Math.floor(options.scanConcurrency ?? 1));
       if (concurrency > 1) {
@@ -385,6 +405,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         ...(memo ? { remembered } : {}), ...(options.dedupeVariants ? { deduped } : {}),
         ...(options.skipZeroYield ? { zeroYieldSkipped } : {}),
         errors, ...(errors ? { errorKinds: Object.fromEntries([...errorKinds].sort((a, b) => b[1] - a[1]).slice(0, 6)) } : {}),
+        ...(unprobed ? { unprobed } : {}),
         ms: Date.now() - startedAt, ...(budget.signal.aborted ? { budgetHit: true } : {}),
       });
       return memo ? { picked, scanned, remembered } : { picked, scanned };

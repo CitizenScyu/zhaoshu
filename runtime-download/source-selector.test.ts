@@ -193,6 +193,33 @@ describe('共用选源器', () => {
     expect(clean.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('errorKinds');
   });
 
+  it('unprobed1105：本机门拒绝（未登记/占用/熔断/日限）不计 scanned、不占 scanLimit/scanBudget；全被挡 ⇒ scanned=0', async () => {
+    const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/', 'https://e.example/', 'https://f.example/'];
+    const gate = (url: string) => {
+      if (url === 'https://a.example/') throw Object.assign(new Error('x'), { name: 'SharedRateControlError', code: 'HOST_LOCK_MISSING' });
+      if (url === 'https://b.example/') throw Object.assign(new Error('x'), { name: 'HostOccupiedError', code: 'HOST_OCCUPIED' });
+      if (url === 'https://c.example/') throw Object.assign(new Error('x'), { name: 'CircuitOpenError' });
+      if (url === 'https://d.example/') throw Object.assign(new Error('x'), { name: 'Error', cause: { code: 'HOST_LOCK_MISSING' } });
+      if (url === 'https://e.example/') throw Object.assign(new Error('x'), { name: 'SourceHttpError', status: 503 });
+      return [];
+    };
+    for (const concurrency of [1, 3]) {
+      const h = harness({ pool, scanConcurrency: concurrency, search: gate });
+      const scanBudget = { remaining: 10 };
+      // 4 个门拒绝退还名额 ⇒ scanLimit 2 仍能实探到 e、f。
+      expect((await h.selector(request({ scanLimit: 2, scanBudget }), freshSignal())).scanned).toBe(2);
+      expect(scanBudget.remaining).toBe(8);
+      expect(h.searchedUrls).toEqual(pool);
+      expect(h.logs.find(l => l.message === '选源完成')?.fields).toMatchObject({ scanned: 2, errors: 5, unprobed: 4 });
+    }
+    const blocked = harness({ pool: pool.slice(0, 4), search: gate });
+    expect(await blocked.selector(request(), freshSignal())).toEqual({ picked: [], scanned: 0 });
+    // 真实探测失败（HTTP 503 等）照旧计 scanned；无门拒绝时日志无 unprobed。
+    const real = harness({ pool: ['https://e.example/'], search: gate });
+    expect((await real.selector(request(), freshSignal())).scanned).toBe(1);
+    expect(real.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('unprobed');
+  });
+
   it('yield1030：hostPriority 稳定重排——高分 host 先扫，同分与缺席保持池序，scanLimit 不变', async () => {
     const pool = ['https://a.example/', 'https://b.example/', 'https://c.example/', 'https://d.example/', 'https://c.example/zh/'];
     const h = harness({ pool, search: () => [],
