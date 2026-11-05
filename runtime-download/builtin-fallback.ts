@@ -103,6 +103,8 @@ export interface BuiltinFallbackOptions {
   skipStrictToc?: boolean;
   /** variantdup1105：透传给 selector，同 url 功能规则全同的锚变体只扫第一条；缺省关。 */
   dedupeVariants?: boolean;
+  /** zeroskip1105：透传给 selector，零产出 host（hostPriority 负分）出池不扫；缺省关。 */
+  skipZeroYield?: boolean;
   /** scanmiss1101：透传给 selector 的确认无书记忆；缺省无（逐字同改前）。 */
   missMemo?: ScanMissMemo;
   /** scanpar1104：透传给 selector 的同时探测源数；缺省 1（串行，逐字同改前）。 */
@@ -191,6 +193,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     hostPriority: options.hostPriority,
     skipStrictToc: options.skipStrictToc,
     dedupeVariants: options.dedupeVariants,
+    skipZeroYield: options.skipZeroYield,
     missMemo: options.missMemo,
     scanConcurrency: options.scanConcurrency,
   });

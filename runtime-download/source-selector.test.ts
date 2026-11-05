@@ -24,6 +24,7 @@ function harness(opts: {
   doomedRules?: (rules: unknown) => boolean;
   skipStrictToc?: boolean;
   dedupeVariants?: boolean;
+  skipZeroYield?: boolean;
   missMemo?: ScanMissMemo;
   scanConcurrency?: number;
 }) {
@@ -69,6 +70,7 @@ function harness(opts: {
     hostPriority: opts.hostPriority,
     skipStrictToc: opts.skipStrictToc,
     dedupeVariants: opts.dedupeVariants,
+    skipZeroYield: opts.skipZeroYield,
     missMemo: opts.missMemo,
     scanConcurrency: opts.scanConcurrency,
   });
@@ -87,6 +89,25 @@ describe('共用选源器', () => {
     expect((await h.selector(request({ scanLimit: 200 }), freshSignal())).picked).toEqual([]);
     expect(h.searchedUrls).toHaveLength(200);
     expect(h.detailUrls).toEqual([]);
+  });
+
+  it('zeroskip1105：skipZeroYield 开 ⇒ 负分 host 出池零出网、不占 scanLimit（轮转也转不回来）；关 ⇒ 只降序照扫', async () => {
+    const pool = ['https://z.example/', 'https://a.example/', 'https://y.example/', 'https://b.example/', 'https://c.example/'];
+    const hostPriority = async () => new Map([['z.example', -1], ['y.example', -1], ['c.example', 3]]);
+    const on = harness({ pool, search: () => [], hostPriority, skipZeroYield: true });
+    expect((await on.selector(request({ scanLimit: 3 }), freshSignal())).scanned).toBe(3);
+    expect(on.searchedUrls).toEqual(['https://c.example/', 'https://a.example/', 'https://b.example/']);
+    expect(on.logs.find(l => l.message === '选源完成')?.fields?.zeroYieldSkipped).toBe(2);
+    on.searchedUrls.length = 0;
+    await on.selector(request({ scanLimit: 3, rotate: 1 }), freshSignal());
+    expect(on.searchedUrls.every(url => !/[zy]\.example/.test(url))).toBe(true);
+    const off = harness({ pool, search: () => [], hostPriority });
+    await off.selector(request({ scanLimit: 5 }), freshSignal());
+    expect(off.searchedUrls).toEqual(['https://c.example/', 'https://a.example/', 'https://b.example/', 'https://z.example/', 'https://y.example/']);
+    expect(off.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('zeroYieldSkipped');
+    // 无优先分（读失败回空表）⇒ 不剔任何源。
+    const empty = harness({ pool, search: () => [], hostPriority: async () => new Map(), skipZeroYield: true });
+    expect((await empty.selector(request(), freshSignal())).scanned).toBe(5);
   });
 
   it('toctgate1030：skipStrictToc 开 ⇒ strict 目录必拒的源零出网出池、不耗 scanLimit；关 ⇒ 逐字同改前', async () => {

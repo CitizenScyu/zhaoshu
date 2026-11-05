@@ -46,6 +46,12 @@ export function dedupeVariantsEnabled(env: Record<string, string | undefined> = 
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+/** zeroskip1105：DOWNLOAD_SCAN_SKIP_ZERO_YIELD 开 ⇒ 零产出 host 出池不扫（见 source-selector skipZeroYield）。缺省关；须同开 DEMOTE_ZERO_YIELD 才有负分可依。 */
+export function skipZeroYieldEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.DOWNLOAD_SCAN_SKIP_ZERO_YIELD?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
 /** scanpar1104：DOWNLOAD_SCAN_CONCURRENCY = 选源同时探测源数（见 source-selector scanConcurrency）。缺省/非法 = 1（串行），上限 8。 */
 export function scanConcurrency(env: Record<string, string | undefined> = process.env): number {
   const raw = env.DOWNLOAD_SCAN_CONCURRENCY?.trim() ?? '';

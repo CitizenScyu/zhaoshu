@@ -7,7 +7,7 @@ vi.mock('../src/lib/download-source-candidates', () => ({ productiveHostScores: 
 
 import {
   createHostPriority, dedupeVariantsEnabled, demoteZeroYieldEnabled, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanConcurrency, scanRotateEnabled,
-  skipStrictTocEnabled,
+  skipStrictTocEnabled, skipZeroYieldEnabled,
 } from './host-priority';
 
 const sql = {} as never;
@@ -28,6 +28,14 @@ describe('yield1030 host-priority', () => {
     expect(skipStrictTocEnabled({})).toBe(false);
     expect(skipStrictTocEnabled({ DOWNLOAD_SCAN_SKIP_STRICT_TOC: 'yes' })).toBe(false);
     expect(skipStrictTocEnabled({ DOWNLOAD_SCAN_SKIP_STRICT_TOC: ' On ' })).toBe(true);
+  });
+
+  it('zeroskip1105：DOWNLOAD_SCAN_SKIP_ZERO_YIELD 缺省/非真值关，1/true/on 开', () => {
+    expect(skipZeroYieldEnabled({})).toBe(false);
+    expect(skipZeroYieldEnabled({ DOWNLOAD_SCAN_SKIP_ZERO_YIELD: 'yes' })).toBe(false);
+    expect(skipZeroYieldEnabled({ DOWNLOAD_SCAN_SKIP_ZERO_YIELD: '0' })).toBe(false);
+    expect(skipZeroYieldEnabled({ DOWNLOAD_SCAN_SKIP_ZERO_YIELD: ' On ' })).toBe(true);
+    expect(skipZeroYieldEnabled({ DOWNLOAD_SCAN_SKIP_ZERO_YIELD: '1' })).toBe(true);
   });
 
   it('variantdup1105：DOWNLOAD_SCAN_DEDUPE_VARIANTS 缺省/非真值关，1/true/on 开', () => {

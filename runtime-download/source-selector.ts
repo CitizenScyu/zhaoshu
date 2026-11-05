@@ -50,6 +50,12 @@ export interface SourceSelectorOptions {
    */
   dedupeVariants?: boolean;
   /**
+   * zeroskip1105：hostPriority 记负分（零产出，见 zeroYieldHosts）的源直接出池，不探测、不占 scanLimit。只降序不够：
+   * 轮转把池尾整段转到窗口前部，零产出站照样被选中。生产只读（2026-11-05 近 3 天）：zzxsa 326、17k 系 165、xxsy 62、
+   * ixdzs 36、xs8 20 次候选失败、0 本 done。零产出判据 30 天滚动，失败老化后自动回池重试。缺省关 = 逐字同改前。
+   */
+  skipZeroYield?: boolean;
+  /**
    * scanmiss1101：确认无书记忆（见 scan-miss-memo.ts）。缺省 = 无记忆（逐字同改前）。命中的源不出网、不扣
    * scanBudget，但照旧占 scanLimit 名额（轮转窗口划分不变，记忆只省请求、不扩扫描面）。
    */
@@ -233,6 +239,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       }
       if (options.skipStrictToc) pool = pool.filter(source => !strictTocDoomed(source));
       let lead = 0;
+      let zeroYieldSkipped = 0;
       if (options.hostPriority) {
         let priority: ReadonlyMap<string, number> = new Map();
         try {
@@ -242,6 +249,11 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         }
         if (priority.size) {
           const rank = (s: PoolSource) => priority.get(hostOf(s.url)) ?? 0;
+          if (options.skipZeroYield) {
+            const before = pool.length;
+            pool = pool.filter(source => rank(source) >= 0);
+            zeroYieldSkipped = before - pool.length;
+          }
           pool = pool.map((source, index) => ({ source, index, p: rank(source) }))
             .sort((a, b) => b.p - a.p || a.index - b.index)
             .map(entry => entry.source);
@@ -371,6 +383,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
       log('info', '选源完成', {
         taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts,
         ...(memo ? { remembered } : {}), ...(options.dedupeVariants ? { deduped } : {}),
+        ...(options.skipZeroYield ? { zeroYieldSkipped } : {}),
         errors, ...(errors ? { errorKinds: Object.fromEntries([...errorKinds].sort((a, b) => b[1] - a[1]).slice(0, 6)) } : {}),
         ms: Date.now() - startedAt, ...(budget.signal.aborted ? { budgetHit: true } : {}),
       });
