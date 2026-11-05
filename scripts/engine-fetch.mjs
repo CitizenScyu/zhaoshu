@@ -22,10 +22,18 @@ import { downloadErrorKind, engineErrorKind } from './engine-error-kind.mjs';
 import { loadEnginePoolCached } from './engine-pool-cache.mjs';
 
 // CLI 层宽上限（无 serverless 限制，但仍有界防挂死）。
-const SEARCH_TIMEOUT_MS = 30_000;
+// srchbudget1105：search 改前沿用阅读器口径 context(12)+openPool(4)——全局兜底只有 24 点，815 源的池
+// 实测只搜到前约 130 个源就整体「书源查询预算已用完」（鹿鼎记 343 源、庶女嫡妃同），后面的源从未被问到，
+// labeler 把这种假 miss 记进 engine-miss 6 小时。CLI 不在 serverless 里，全局兜底按池大小给足
+// （每源仍受 child 的 L1 单源点数 PER_SOURCE_REQUESTS 约束，不会因此多打任何一个站）；
+// 组间并发抬到 SEARCH_CLI_CONCURRENCY（同站仍串行，每站同一时刻至多 1 个请求）；
+// 墙钟 45s 留在 labeler 的 ENGINE_CLI_TIMEOUT(60s) 之内——到点交付已收集的候选（池序），不被外层杀掉。
+// .88 实测（815 源）：全池约 27s；庶女嫡妃精确同名候选 0 → 172（40 站），鹿鼎记 8 → 28（金庸 0 → 10）。
+const SEARCH_TIMEOUT_MS = 45_000;
+const SEARCH_CLI_CONCURRENCY = 16;
 const TOC_TIMEOUT_MS = 60_000;
 const CONTENT_TIMEOUT_MS = 30_000;
-const POOL_SIZE = 4; // 与 DEFAULT_READING_POOL_LIMIT 同量级；仅用于 context.openPool 抬全局兜底上限。
+const POOL_SIZE = 4; // 与 DEFAULT_READING_POOL_LIMIT 同量级；仅用于 toc/content 的 context.openPool 抬全局兜底上限。
 
 class ExitError extends Error {
   // kind：--json 错误行的 errorKind；缺省按退出码（2=用法错，1=无结果）。
@@ -219,11 +227,13 @@ async function cmdSearch(m, args) {
   // builtin 段经 builtinPoolEntry——无活跃 builtin 时为空数组，退休源不进搜索池。
   const sources = excludeSkippedSources(
     [...(args.noBuiltin ? [] : builtinPoolEntry(m)), ...enginePool], args.skipHosts);
-  const context = new m.reader.SourceRequestContext(signal, 12);
-  context.openPool(POOL_SIZE);
+  // srchbudget1105：全局兜底 = 源数 × 单源点数（见 SEARCH_TIMEOUT_MS 处）。
+  const context = new m.reader.SourceRequestContext(
+    signal, Math.max(12, sources.length * m.reader.PER_SOURCE_REQUESTS));
   // espfix41：改前逐源串行（墙钟=各源之和）；改后按目标站分组、组内串行、组间有界并发，
   // 每源一个切片子 context（卡死的源 SEARCH_SOURCE_SLICE_MS 放弃）。候选仍按池序输出。
   const candidates = await searchSources({
+    concurrency: SEARCH_CLI_CONCURRENCY,
     sources,
     signal,
     hostKey: (source) => searchHostOf(m, source, args.title),

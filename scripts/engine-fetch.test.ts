@@ -396,4 +396,20 @@ describe('cli639：builtin 池段数组合同与退休 host 池反查前收口',
     expect(retired).toBeGreaterThan(direct);
     expect(pool).toBeGreaterThan(retired);
   });
+
+  it('srchbudget1105（源文本）：search 全局兜底按池大小给足、墙钟留在 labeler CLI 超时之内', () => {
+    // 改前 context(12)+openPool(4) 只有 24 点，815 源池搜到约 130 源就整体「书源查询预算已用完」。
+    const source = readFileSync(cli, 'utf8');
+    const start = source.indexOf('async function cmdSearch');
+    const end = source.indexOf('\nasync function ', start + 1);
+    const body = source.slice(start, end);
+    expect(body).toMatch(/new m\.reader\.SourceRequestContext\(\s*signal, Math\.max\(12, sources\.length \* m\.reader\.PER_SOURCE_REQUESTS\)\)/);
+    expect(body).not.toContain('openPool(');
+    expect(body).toContain('concurrency: SEARCH_CLI_CONCURRENCY');
+    const timeout = Number(/const SEARCH_TIMEOUT_MS = ([\d_]+);/.exec(source)?.[1].replace(/_/g, ''));
+    // labeler 侧 douban_list.ENGINE_CLI_TIMEOUT = 60s：CLI 须先到点交付已收集候选，不被外层杀掉。
+    const labelerTimeout = Number(/^ENGINE_CLI_TIMEOUT = (\d+)/m.exec(readFileSync(join(scriptsDir, 'douban_list.py'), 'utf8'))?.[1]);
+    expect(timeout).toBeGreaterThan(30_000);
+    expect(timeout).toBeLessThan(labelerTimeout * 1000 - 10_000);
+  });
 });
