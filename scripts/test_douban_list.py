@@ -1043,6 +1043,22 @@ class TestEngineCliInvocation(unittest.TestCase):
             self.assertNotIn(k, got['env'])
         self.assertFalse(any('fake-not-real' in str(part) for part in got['cmd']))
 
+    def test_forward_env_engine_flag_prefix(self):
+        # engflags1105：ENGINE_* 开关按前缀转发（空值不转发）；前缀外的键（含 LLM key）照旧不转发
+        env = {'ENGINE_SEARCH_JS': '1', 'ENGINE_SYNTAX_JS': '1', 'ENGINE_BLANK_X': ' ',
+               'LLM_API_KEY': 'test-key-not-real', 'XENGINE_SEARCH_JS': '1'}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in env:
+                os.environ.pop(k, None)
+            cli = douban_list.EngineCli(node='node', script_path='/repo/scripts/engine-fetch.mjs',
+                                        database_url='x', forward_env=env)
+            got = self._capture_env(cli)
+        self.assertEqual(got['env']['ENGINE_SEARCH_JS'], '1')
+        self.assertEqual(got['env']['ENGINE_SYNTAX_JS'], '1')
+        for k in ('ENGINE_BLANK_X', 'LLM_API_KEY', 'XENGINE_SEARCH_JS'):
+            self.assertNotIn(k, got['env'])
+        self.assertFalse(any('ENGINE_SEARCH_JS' in str(part) for part in got['cmd']))
+
     def test_forward_env_keeps_database_url_behavior(self):
         # d) DATABASE_URL 原有行为不变：构造参数注入；forward_env 里的 DATABASE_URL 不走转发
         env = {'DATABASE_URL': 'postgresql://other:pw2@elsewhere/db',

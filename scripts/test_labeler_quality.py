@@ -670,7 +670,7 @@ class TestMainPrecheck(unittest.TestCase):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
                        done_index=None,
                        engine_cli=None, book15_breaker=None, source_policy=None,
-                       engine_miss=None):
+                       engine_miss=None, list_cursor=None, deepen_min=0):
             return [book]
 
         def fake_label(text, *a, **k):

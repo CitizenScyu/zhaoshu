@@ -86,6 +86,7 @@ LLM_FAIL_BREAK = 2
 REQUIRED_DOUBAN_LIST_API = (
     'Book15Breaker', 'CONTENT_TOC_MIN_MATCH', 'CONTENT_TOC_MIN_NAME_CHARS', 'ENGINE_CLI_TIMEOUT',
     'ENGINE_MISS_FILENAME', 'EngineCli', 'EngineMissMemo', 'EngineUnavailable',
+    'LIST_CURSOR_FILENAME', 'ListCursor',
     '_AUTHOR_SUFFIX_RE', '_body_decides', '_char_ngrams',
     '_clean_body_chapters', '_informative_toc_titles', '_is_auxiliary_toc_name', '_norm_author',
     '_norm_generic_toc_word', '_norm_title', '_norm_title_bare', '_split_toc_numbering',
@@ -93,7 +94,7 @@ REQUIRED_DOUBAN_LIST_API = (
     'author_matches', 'body_pair_details', 'build_douban_queue', 'build_webnovel_queue',
     'engine_fallback_enabled', 'fetch_content_fingerprint', 'is_placeholder_author',
     'load_done_index', 'resolve_book15_breaker', 'resolve_douban_pages',
-    'resolve_engine_miss_ttl', 'same_book',
+    'resolve_engine_miss_ttl', 'resolve_list_deepen_min', 'same_book',
     'search_engine', 'title_compatible', 'validate_engine',
 )
 REQUIRED_SOURCE_POLICY_API = (
@@ -4196,6 +4197,8 @@ def main() -> int:
             engine_miss = douban_list.EngineMissMemo.load(
                 data_path(douban_list.ENGINE_MISS_FILENAME),
                 douban_list.resolve_engine_miss_ttl(env))
+            # listdeep1105：固定名单打干后队列不足下限 ⇒ 七猫书库按游标往后翻（LABELER_LIST_DEEPEN_MIN=0 关闭）
+            list_cursor = douban_list.ListCursor.load(data_path(douban_list.LIST_CURSOR_FILENAME))
             all_books = (douban_list.build_douban_queue(
                              bridged, done_index=done_index, pages=pages,
                              engine_cli=engine_cli, book15_breaker=book15_breaker,
@@ -4204,8 +4207,11 @@ def main() -> int:
                          else douban_list.build_webnovel_queue(
                              bridged, done_index=done_index, pages=pages,
                              engine_cli=engine_cli, book15_breaker=book15_breaker,
-                             source_policy=SOURCE_POLICY, engine_miss=engine_miss))
+                             source_policy=SOURCE_POLICY, engine_miss=engine_miss,
+                             list_cursor=list_cursor,
+                             deepen_min=douban_list.resolve_list_deepen_min(env)))
             engine_miss.save()
+            list_cursor.save()
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')
         else:
             print('拉取榜单书目...')

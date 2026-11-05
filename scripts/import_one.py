@@ -720,6 +720,10 @@ class AutoImporter:
                           [record['title']])
         twin = find_twin(rows, record['author'])
         if twin is not None:
+            # 欠账扫描里孪生也是永久状态，逐条打印会每轮重刷同一行（twinquiet1105：gate.log
+            # 里 id=508 一行刷了 1181 次）；扫描只汇总条数，逐条作者对照在首次打标时已打印。
+            if self._quiet_review:
+                return 'twin-skipped'
             # 输出两侧原始作者，便于人工复核宽松键有没有把「同名书不同作者」误合（rvauthor 增量建议 3）
             self.log(f'  自动导入: 与既有非不动点行 id={twin.get("id")} 归一后身份相同，'
                      f'跳过写入（避免凭空多一行）；库内作者={twin.get("author")!r} '
@@ -789,7 +793,7 @@ class AutoImporter:
         except OSError as error:
             self.log(f'  自动导入: 读取 {path} 失败（忽略）: {error}')
             return 0
-        done = attempted = reviewed = 0
+        done = attempted = reviewed = twinned = 0
         scan_cap = max(limit, IMPORT_BACKLOG_SCAN_CAP)
         # review 是永久状态，每轮都会被重扫一遍：逐条打印时一天 28 轮刷出约 1.2 万行同样的
         # 「作者为空」，把 gate.log 里真正的信号淹掉（2026-11-03 实测）。这里只汇总一行；
@@ -817,11 +821,16 @@ class AutoImporter:
                     done += 1
                 elif status == 'review':
                     reviewed += 1
+                elif status == 'twin-skipped':
+                    twinned += 1
         finally:
             self._quiet_review = False
         if reviewed:
             self.log(f'  自动导入: 欠账扫描 {attempted} 条，其中 {reviewed} 条 review（逐条原因见首次打标日志）→ '
                      f'不自动导入，留给完整导入器 import_labels.mjs')
+        if twinned:
+            self.log(f'  自动导入: 欠账扫描 {attempted} 条，其中 {twinned} 条与既有行归一后同身份 → '
+                     f'跳过写入（逐条作者对照见首次打标日志）')
         return done
 
     def status_line(self):

@@ -437,7 +437,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
                        done_index=None,
                        engine_cli=None, book15_breaker=None, source_policy=None,
-                       engine_miss=None):
+                       engine_miss=None, list_cursor=None, deepen_min=0):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -478,7 +478,7 @@ class TestMainRejectsIdentityMismatch(unittest.TestCase):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
                        done_index=None,
                        engine_cli=None, book15_breaker=None, source_policy=None,
-                       engine_miss=None):
+                       engine_miss=None, list_cursor=None, deepen_min=0):
             return [book]
 
         out, err = io.StringIO(), io.StringIO()
@@ -557,7 +557,7 @@ class TestFailureClassification(unittest.TestCase):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
                        done_index=None,
                        engine_cli=None, book15_breaker=None, source_policy=None,
-                       engine_miss=None):
+                       engine_miss=None, list_cursor=None, deepen_min=0):
             return list(books)
 
         out = io.StringIO()
@@ -599,7 +599,7 @@ class TestMainWiresBook15Breaker(unittest.TestCase):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
                        done_index=None,
                        engine_cli=None, book15_breaker=None, source_policy=None,
-                       engine_miss=None):
+                       engine_miss=None, list_cursor=None, deepen_min=0):
             seen.append(book15_breaker)
             return []
 
@@ -945,7 +945,7 @@ class TestMainSwitchesSourceAndRecordsIt(unittest.TestCase):
         def fake_build(http_get, skip_titles=None, include_douban=True, pages=None,
                        done_index=None,
                        engine_cli=None, book15_breaker=None, source_policy=None,
-                       engine_miss=None):
+                       engine_miss=None, list_cursor=None, deepen_min=0):
             return [dict(b) for b in books]
 
         out = io.StringIO()

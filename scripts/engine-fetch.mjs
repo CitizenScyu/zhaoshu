@@ -28,9 +28,11 @@ import { loadEnginePoolCached } from './engine-pool-cache.mjs';
 // （每源仍受 child 的 L1 单源点数 PER_SOURCE_REQUESTS 约束，不会因此多打任何一个站）；
 // 组间并发抬到 SEARCH_CLI_CONCURRENCY（同站仍串行，每站同一时刻至多 1 个请求）；
 // 墙钟 45s 留在 labeler 的 ENGINE_CLI_TIMEOUT(60s) 之内——到点交付已收集的候选（池序），不被外层杀掉。
-// .88 实测（815 源）：全池约 27s；庶女嫡妃精确同名候选 0 → 172（40 站），鹿鼎记 8 → 28（金庸 0 → 10）。
+// .88 实测（815 源）：并发 16 全池约 27s；庶女嫡妃精确同名候选 0 → 172（40 站），鹿鼎记 8 → 28（金庸 0 → 10）。
+// 再开 ENGINE_SEARCH_JS 等开关（labeler 转发 ENGINE_*）后 JS 搜索源也参与：并发 16 要 41–46s（撞墙钟），
+// 并发 48 全池 18s。
 const SEARCH_TIMEOUT_MS = 45_000;
-const SEARCH_CLI_CONCURRENCY = 16;
+const SEARCH_CLI_CONCURRENCY = 48;
 const TOC_TIMEOUT_MS = 60_000;
 const CONTENT_TIMEOUT_MS = 30_000;
 const POOL_SIZE = 4; // 与 DEFAULT_READING_POOL_LIMIT 同量级；仅用于 toc/content 的 context.openPool 抬全局兜底上限。

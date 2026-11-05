@@ -832,6 +832,28 @@ class TestAutoImporter(TempDirCase):
         self.assertIn('不自动导入', logs[0])
         self.assertNotIn('欠账扫描', logs[0])
 
+    def test_backlog_summarises_twin_skips_instead_of_logging_each(self):
+        # twinquiet1105：孪生同样是永久状态，旧代码每轮欠账扫描都把同一行「与既有非不动点行
+        # id=… 归一后身份相同」重打一遍（gate.log 里 id=508 刷了 1181 次）。扫描只汇总，
+        # 首次打标仍逐条给两侧作者。
+        rec = record(author='作者甲')
+        jsonl = self.dir / 'labels.jsonl'
+        jsonl.write_text(json.dumps(rec, ensure_ascii=False), encoding='utf-8')
+        db = FakeDb()
+        db.seed('测试书', '作&#32773;甲')
+        logs = []
+        importer = import_one.AutoImporter(database_url='postgresql://u:p@db.example/neondb',
+                                           directory=self.dir, sql_exec=db, log=logs.append)
+        self.assertEqual(importer.retry_backlog(jsonl, limit=2), 0)
+        self.assertEqual(len(logs), 1)
+        self.assertIn('欠账扫描 1 条，其中 1 条与既有行归一后同身份', logs[0])
+        self.assertNotIn('id=', logs[0])
+        logs.clear()
+        self.assertEqual(importer.import_record(rec), 'twin-skipped')
+        self.assertEqual(len(logs), 1)
+        self.assertIn('归一后身份相同', logs[0])
+        self.assertEqual(len(db.rows), 1)
+
     def test_retry_backlog_disabled_or_missing_file(self):
         db = FakeDb()
         importer = self.importer(db)

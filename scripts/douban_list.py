@@ -1040,6 +1040,17 @@ def _short_stderr(stderr: str | None, limit: int = 200) -> str:
 # 从打标 .env 转发给引擎子进程的键（白名单，不做通配）：源池产物开关与路径。
 # 引擎读产物免一次库读；路径坏/产物缺时引擎自动回退查库（phxengine42 §7/§8）。
 ENGINE_FORWARD_ENV_KEYS = ('SHUYUAN_POOL_ARTIFACT', 'SHUYUAN_POOL_ARTIFACT_PATH')
+# engflags1105：引擎语法/JS 开关（ENGINE_SEARCH_JS、ENGINE_SYNTAX_* 等，B 线下载机同名同值）按前缀转发。
+# 不转发时 CLI 里这些开关全关：池里 303/815 个需 JS 的搜索源一律「不支持该书源的动态搜索规则」，
+# 打标线永远搜不到这部分源。前缀只放引擎开关，不放任何凭据类键。
+ENGINE_FORWARD_ENV_PREFIXES = ('ENGINE_',)
+
+
+def engine_forward_env(env: dict | None) -> dict:
+    """打标 .env 字典 → 转发给引擎子进程的键值（白名单键 + 前缀键，只取有值的）。"""
+    return {k: v for k, v in (env or {}).items()
+            if (k in ENGINE_FORWARD_ENV_KEYS or k.startswith(ENGINE_FORWARD_ENV_PREFIXES))
+            and isinstance(v, str) and v.strip()}
 
 
 class EngineCli:
@@ -1053,7 +1064,7 @@ class EngineCli:
     凭据红线：DATABASE_URL 只经**子进程 env** 注入（db.ts 模块初始化读它），
     绝不进命令行参数、日志或异常消息；stdout/stderr 只在调用方按需截断摘要。
 
-    forward_env：调用方的 .env 字典；只取 ENGINE_FORWARD_ENV_KEYS 白名单里有值的键，
+    forward_env：调用方的 .env 字典；只取 ENGINE_FORWARD_ENV_KEYS 白名单与 ENGINE_FORWARD_ENV_PREFIXES 前缀里有值的键，
     同样只经子进程 env 注入（打标 .env 不 export，不转发引擎就读不到源池产物开关）。"""
 
     def __init__(self, node: str, script_path: str, database_url: str,
@@ -1064,8 +1075,7 @@ class EngineCli:
         # hook 默认取 engine-fetch.mjs 同目录的 ts-esm-loader.mjs
         self.hook_path = hook_path or str(Path(script_path).parent / 'ts-esm-loader.mjs')
         self._database_url = database_url
-        self._forward_env = {k: forward_env[k] for k in ENGINE_FORWARD_ENV_KEYS
-                             if forward_env and (forward_env.get(k) or '').strip()}
+        self._forward_env = engine_forward_env(forward_env)
         self.timeout = timeout
 
     def _import_target(self) -> str:
@@ -2868,7 +2878,11 @@ _QM_AUTHOR_RE = re.compile(r'href="(?:https?:)?//www\.qimao\.com/zuozhe/[^"]*"[^
 
 def parse_qimao_rank(html: str) -> list[dict]:
     """七猫榜单页 → [{title, author, origin}]；作者只在本条与下一条书名锚点之间找，避免串条。"""
-    entries = list(_QM_TITLE_RE.finditer(html))
+    return _parse_qimao_entries(html, _QM_TITLE_RE, '七猫榜单')
+
+
+def _parse_qimao_entries(html: str, title_re: re.Pattern, origin: str) -> list[dict]:
+    entries = list(title_re.finditer(html))
     books, seen = [], set()
     for i, m in enumerate(entries):
         title = unescape(m.group(1)).strip()
@@ -2880,7 +2894,7 @@ def parse_qimao_rank(html: str) -> list[dict]:
         if key and key not in seen:
             seen.add(key)
             books.append({'title': title, 'author': unescape(a.group(1)).strip() if a else '',
-                          'origin': '七猫榜单', 'douban_url': ''})
+                          'origin': origin, 'douban_url': ''})
     return books
 
 
@@ -2895,12 +2909,98 @@ def fetch_qimao_rank_books(http_get) -> list[dict]:
     return books
 
 
+# ---- 名单自动加深（listdeep1105）----
+# 固定名单源（上面各站首页/榜单首页 + 豆瓣首页）合计约 680 本，打完就枯：此后每轮候选全是已打标
+# 或近期引擎 miss 的书，名单不会自己变长。七猫书库按点击排序可翻数百页（每页 15 本；2026-11-05
+# .88 实测 p200 仍有书、p1000 空页），作「越打越深」的后备名单：固定名单解析出的打标队列不足
+# 下限时，从游标页起往后翻，逐页过同一套搜索校验，凑够即停。游标跨轮落盘、只进不退（本轮翻过
+# 的页下轮不再重翻），翻到空页回第 1 页（已打标的书照常被 done_index 跳过，没打成的书再试一次）。
+QIMAO_SHUKU_URL = QIMAO_BASE + '/shuku/a-a-a-a-a-a-a-click-{page}/'
+_QM_SHUKU_TITLE_RE = re.compile(
+    r'<span\s[^>]*class="s-tit"[^>]*>\s*<a\s[^>]*href="(?:https?:)?//www\.qimao\.com/shuku/\d+/"'
+    r'[^>]*>([^<]+)</a>')
+LIST_DEEPEN_ENV = 'LABELER_LIST_DEEPEN_MIN'   # 队列下限；0 关闭加深
+LIST_DEEPEN_MIN = 10
+LIST_DEEPEN_MAX_PAGES = 4                     # 每轮最多翻页数（每页 15 本）
+LIST_DEEPEN_PAGE_DELAY = 1.0
+LIST_CURSOR_FILENAME = 'labels-list-cursor.json'
+LIST_CURSOR_QIMAO = 'qimao_shuku'
+
+
+def parse_qimao_shuku(html: str) -> list[dict]:
+    """七猫书库列表页 → [{title, author, origin}]（书名在 span.s-tit 里，作者锚点同榜单页）。"""
+    return _parse_qimao_entries(html, _QM_SHUKU_TITLE_RE, '七猫书库')
+
+
+def resolve_list_deepen_min(env: dict | None = None) -> int:
+    """加深下限：env 字典 → 进程环境 → 默认；非法值回落默认，<=0 表示关闭。"""
+    raw = str((env or {}).get(LIST_DEEPEN_ENV) or os.environ.get(LIST_DEEPEN_ENV) or '').strip()
+    try:
+        return int(raw) if raw else LIST_DEEPEN_MIN
+    except ValueError:
+        return LIST_DEEPEN_MIN
+
+
+class ListCursor:
+    """名单加深游标：{"version":1,"pages":{名单名: 下一页页码}}。读坏/缺文件 = 从第 1 页起。"""
+
+    def __init__(self, path, pages: dict | None = None):
+        self.path = Path(path)
+        self.pages: dict[str, int] = dict(pages or {})
+        self.dirty = False
+
+    @classmethod
+    def load(cls, path) -> 'ListCursor':
+        try:
+            raw = json.loads(Path(path).read_text(encoding='utf-8')).get('pages')
+            pages = {str(k): v for k, v in raw.items()
+                     if isinstance(v, int) and not isinstance(v, bool) and v >= 1}
+        except FileNotFoundError:
+            pages = {}
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            print(f'  提示: 名单加深游标读取失败（从第 1 页起）: {e}', file=sys.stderr)
+            pages = {}
+        return cls(path, pages)
+
+    def get(self, name: str) -> int:
+        return self.pages.get(name, 1)
+
+    def set(self, name: str, page: int) -> None:
+        if self.pages.get(name) != page:
+            self.pages[name] = page
+            self.dirty = True
+
+    def save(self) -> None:
+        """原子写（临时文件 + os.replace）；失败只告警（下轮从旧游标起，最多重翻几页）。"""
+        if not self.dirty:
+            return
+        tmp = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix='.list-cursor-')
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump({'version': 1, 'pages': self.pages}, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+            tmp = None
+            self.dirty = False
+        except OSError as e:
+            print(f'  提示: 名单加深游标写入失败（不影响本轮）: {e}', file=sys.stderr)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
 def build_webnovel_queue(http_get, include_douban: bool = True,
                          skip_titles: set | None = None,
                          pages: int | None = None, engine_cli=None,
                          book15_breaker: Book15Breaker | None = None,
                          source_policy=None, done_index: dict[str, set[str]] | None = None,
-                         engine_miss: EngineMissMemo | None = None) -> list[dict]:
+                         engine_miss: EngineMissMemo | None = None,
+                         list_cursor: ListCursor | None = None,
+                         deepen_min: int = 0) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
@@ -2910,20 +3010,23 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     skip_titles = 已打标书名，搜索前跳过（收益最大的一刀）。
     done_index传入完成记录的作者信息；与旧skip_titles接口分开。
     产出与 fetch_rank_books() 同构，每个候选过 search_book15（LIKE + title_compatible）。
+    list_cursor + deepen_min>0（listdeep1105）：队列不足 deepen_min 本时从七猫书库游标页往后翻
+    （见 LIST_DEEPEN_* 注释）；list_cursor=None 时行为不变，游标由调用方保存。
     """
     candidates: list[dict] = []
     seen: set = set()
 
-    def add_batch(batch: list[dict], origin: str):
-        added = 0
+    def add_batch(batch: list[dict], origin: str) -> list[dict]:
+        added = []
         for b in batch:
             k = _norm_title(b.get('title', ''))
             if k and k not in seen:
                 seen.add(k)
                 b['origin'] = origin
                 candidates.append(b)
-                added += 1
-        print(f'{origin}: 新增 {added} 本（累计 {len(candidates)}）')
+                added.append(b)
+        print(f'{origin}: 新增 {len(added)} 本（累计 {len(candidates)}）')
+        return added
 
     # 顺序 = 预期命中率（完本经典 > 在更新书 > 豆瓣补充）；任何源失败只告警。
     add_batch(fetch_qidian_finish_books(http_get), '起点完本频道')
@@ -2935,7 +3038,39 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     add_batch(fetch_17k_top_books(http_get), '17K榜单')
     if include_douban:
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
-    return _resolve_candidates(candidates, http_get, skip_titles=skip_titles,
-                               engine_cli=engine_cli, book15_breaker=book15_breaker,
-                               source_policy=source_policy, done_index=done_index,
-                               engine_miss=engine_miss)
+
+    def resolve(batch: list[dict]) -> list[dict]:
+        return _resolve_candidates(batch, http_get, skip_titles=skip_titles,
+                                   engine_cli=engine_cli, book15_breaker=book15_breaker,
+                                   source_policy=source_policy, done_index=done_index,
+                                   engine_miss=engine_miss)
+
+    queue = resolve(candidates)
+    if list_cursor is None or deepen_min <= 0 or len(queue) >= deepen_min:
+        return queue
+    urls = {q.get('url') for q in queue}
+    page = list_cursor.get(LIST_CURSOR_QIMAO)
+    for n in range(LIST_DEEPEN_MAX_PAGES):
+        if n:
+            time.sleep(LIST_DEEPEN_PAGE_DELAY)
+        try:
+            batch = parse_qimao_shuku(http_get(QIMAO_SHUKU_URL.format(page=page)))
+        except Exception as e:
+            # 游标不动：下轮从同一页再试
+            print(f'  七猫书库[第 {page} 页] 拉取失败（游标留在本页）: {e}', file=sys.stderr)
+            break
+        if not batch:
+            print(f'名单加深: 七猫书库第 {page} 页无书 → 游标回到第 1 页')
+            list_cursor.set(LIST_CURSOR_QIMAO, 1)
+            break
+        print(f'名单加深: 队列 {len(queue)} 本 < 下限 {deepen_min}，翻七猫书库第 {page} 页')
+        added = add_batch(batch, '七猫书库')
+        page += 1
+        list_cursor.set(LIST_CURSOR_QIMAO, page)
+        for q in resolve(added):
+            if q.get('url') not in urls:
+                urls.add(q.get('url'))
+                queue.append(q)
+        if len(queue) >= deepen_min:
+            break
+    return queue
