@@ -3164,8 +3164,124 @@ def fetch_jjwxc_finish_books(http_get) -> list[dict]:
     return books
 
 
+FANQIE_BASE = 'https://fanqienovel.com'
+# 书库接口（2026-11-05 实测）：creation_status=0 完结、sort=0 按在读人数降序、gender 1 男频 / 0 女频 / -1 全部。
+# 返回 offset = page_index×page_count 起的书；offset ≥ 100 后每页最多回 10 本 → 加深按 10 本/页、从 offset 100 起。
+FANQIE_LIBRARY_URL = (FANQIE_BASE + '/api/author/library/book_list/v0/?page_count={count}&page_index={index}'
+                      '&gender={gender}&category_id=-1&creation_status=0&word_count=-1&book_type=-1&sort=0')
+FANQIE_TOP_GENDERS = (1, 0)     # 名单首页：男频、女频完结热门各取前 FANQIE_TOP_COUNT 本
+FANQIE_TOP_COUNT = 100
+FANQIE_DEEP_PAGE_SIZE = 10
+# 书名/作者/在读数用私用区字符混淆（U+E3E8 起 372 个码位，网页靠字体还原）。下表由书库接口的混淆串与
+# 详情页 /page/<id> 明文逐字对齐得出（2026-11-05，约 150 本、0 冲突，隔时段复抓一致）；\x00 = 未对齐到的码位
+# （实测男女频 360 本书名/作者都没用到）。排行接口 /api/rank/ 是另一套映射，不能套用。
+# 映射若被换掉：fetch_fanqie_finish_books 每轮拿详情页明文书名核对，对不上本轮就不用番茄名单。
+_FANQIE_FONT_FIRST = 0xE3E8
+_FANQIE_FONT = (
+    '体y十现快便话却月物水的放知爱万\x00表风理O老也p常克平几最主她s将法情o光a我呢'
+    '\x00员太每望受教w利军已\x00人如变得要少斯门电m男没AK国时中走么何口小向问轻T\x00神'
+    '下间车fG度\x00又大面远就写\x00给通起实E\x00它去S到道数吃们加P是无把事西多界\x00发新'
+    '外活解孩只作前\x00尔经\x00\x00心告父等\x00民全这9果安\x00i母8\x00说任先和地C张战场\x00像c'
+    '\x00你使\x00样总目x性处音头\x00应乐关能花l当名手4重字声力友然生代内里本回真入师象\x00'
+    '0点\x00亲V种动英命\x00hX做特边高有B为期自年马认出接至H正方感所明者\x00F住学还分'
+    '意更其n但比觉以由死家让失士\x002I金叫身报听\x00再原山海白很见5直位第工个开岁好用'
+    '都于可同3次四\x00日信与女笑满并部什不从或机此\x00了记三e些\x00N夫会才儿眼两美被一公'
+    '来立\x00长对己看k许因相色后往打结格过世气7子条在书之定v拉成进带着东上想天他妈1'
+    '文而路那别德6\x00t行候难'
+)
+_FANQIE_PUA_RE = re.compile('[\ue000-\uf8ff]')
+_FANQIE_TITLE_RE = re.compile(r'<title>(.*?)完整版在线免费阅读_', re.S)
+_fanqie_font_ok: bool | None = None     # 本进程（= 本轮打标）详情页核对结果；None = 还没核对
+
+
+def _fanqie_decode(text: str) -> str:
+    out = []
+    for ch in text or '':
+        i = ord(ch) - _FANQIE_FONT_FIRST
+        plain = _FANQIE_FONT[i] if 0 <= i < len(_FANQIE_FONT) else ''
+        out.append(plain if plain and plain != '\x00' else ch)
+    return ''.join(out)
+
+
+def _fanqie_entries(text: str, origin: str) -> list[tuple[str, dict]]:
+    """书库接口 JSON → [(book_id, {title, author, origin, finished?})]；解码后书名仍含私用区字符的书不收
+    （书名不可信，不拿去搜），作者含私用区字符就留空（交给引擎同名书判别）。"""
+    data = json.loads(text).get('data') or {}
+    entries, seen = [], set()
+    for b in data.get('book_list') or []:
+        title = _fanqie_decode(str(b.get('book_name') or '')).strip()
+        author = _fanqie_decode(str(b.get('author') or '')).strip()
+        key = _norm_title(title)
+        if not title or not key or key in seen or _FANQIE_PUA_RE.search(title):
+            continue
+        seen.add(key)
+        book = {'title': title, 'author': '' if _FANQIE_PUA_RE.search(author) else author,
+                'origin': origin, 'douban_url': ''}
+        if str(b.get('creation_status')) == '0':
+            book['finished'] = True
+        entries.append((str(b.get('book_id') or ''), book))
+    return entries
+
+
+def _fanqie_font_check(http_get, entries: list[tuple[str, dict]]) -> bool:
+    """取首本书详情页的明文书名核对解码结果；拉取失败或对不上都算不通过（宁可本轮不用番茄，不拿错名去搜）。"""
+    if not entries:
+        return False
+    bid, book = entries[0]
+    try:
+        m = _FANQIE_TITLE_RE.search(http_get(f'{FANQIE_BASE}/page/{bid}'))
+    except Exception as e:
+        print(f'  番茄[详情页核对] 拉取失败，本轮不用番茄名单: {e}', file=sys.stderr)
+        return False
+    plain = unescape(m.group(1)).strip() if m else ''
+    if not plain or _norm_title(plain) != _norm_title(book['title']):
+        print(f'  番茄书名解码核对不通过（详情页「{plain}」≠ 解码「{book["title"]}」），本轮不用番茄名单',
+              file=sys.stderr)
+        return False
+    return True
+
+
+def fetch_fanqie_finish_books(http_get) -> list[dict]:
+    """番茄完结热门（男频、女频各前 100 本）；先过详情页核对，结果记进 _fanqie_font_ok 供本轮加深用。"""
+    global _fanqie_font_ok
+    entries: list[tuple[str, dict]] = []
+    for gender in FANQIE_TOP_GENDERS:
+        url = FANQIE_LIBRARY_URL.format(count=FANQIE_TOP_COUNT, index=0, gender=gender)
+        try:
+            entries.extend(_fanqie_entries(http_get(url), '番茄完结'))
+        except Exception as e:
+            print(f'  番茄[完结热门 gender={gender}] 拉取失败: {e}', file=sys.stderr)
+    _fanqie_font_ok = _fanqie_font_check(http_get, entries)
+    if not _fanqie_font_ok:
+        return []
+    books, seen = [], set()
+    for _bid, b in entries:                 # 男女频榜有交叉
+        if _norm_title(b['title']) not in seen:
+            seen.add(_norm_title(b['title']))
+            books.append(b)
+    return books
+
+
+def parse_fanqie_library(text: str) -> list[dict]:
+    """加深用：番茄书库一页。本轮详情页核对没通过（或没做）就抛错 → 加深按失败处理、游标不动。"""
+    if _fanqie_font_ok is not True:
+        raise RuntimeError('番茄书名解码本轮未核对通过')
+    return [b for _bid, b in _fanqie_entries(text, '番茄完结')]
+
+
+def fanqie_deep_url(page: int) -> str:
+    """加深第 page 页（1 起）= offset FANQIE_TOP_COUNT + (page-1)×10，接在名单首页的前 100 本之后。"""
+    index = FANQIE_TOP_COUNT // FANQIE_DEEP_PAGE_SIZE + page - 1
+    return FANQIE_LIBRARY_URL.format(count=FANQIE_DEEP_PAGE_SIZE, index=index, gender=-1)
+
+
+def _deep_url(url_fmt, page: int) -> str:
+    """加深名单的 URL：模板串按 {page} 填，或可调用对象（页码不是线性映射的站，如番茄）。"""
+    return url_fmt(page) if callable(url_fmt) else url_fmt.format(page=page)
+
+
 # 加深名单（plat1105）：各平台「完结 + 人气排序」书库，按页游标轮转（每次加深从下一个平台起）。
-# (游标名, URL 模板, 解析函数, 来源标记)；顺序 = 轮转顺序，免费站在前、付费为主的站在后。
+# (游标名, URL 模板或 page→URL 函数, 解析函数, 来源标记)；顺序 = 轮转顺序，免费站在前、付费为主的站在后。
 LIST_DEEP_SOURCES = (
     (LIST_CURSOR_QIMAO, QIMAO_SHUKU_URL, parse_qimao_shuku, '七猫书库完结'),
     ('17k_fin_click', Y17K_BASE + '/all/book/2_0_0_0_3_4_1_0_{page}.html', parse_17k_quanben,
@@ -3176,6 +3292,7 @@ LIST_DEEP_SOURCES = (
     ('faloo_fin_click', FALOO_BASE + '/y_0_0_0_0_2_3_{page}.html', parse_faloo_list, '飞卢完本总点击'),
     ('sfacg_fin', SFACG_BASE + '/List/default.aspx?&tid=-1&if=1&PageIndex={page}', parse_sfacg_list,
      'SF完结'),
+    ('fanqie_fin_hot', fanqie_deep_url, parse_fanqie_library, '番茄完结'),
 )
 
 LIST_QUEUE_MAX_ENV = 'LABELER_LIST_QUEUE_MAX'   # 每轮入队上限；0 不限
@@ -3316,6 +3433,7 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     add_batch(fetch_zongheng_complete_books(http_get), '纵横完本', finished=True)
     add_batch(fetch_17k_quanben_books(http_get), '17K完本', finished=True)
     add_batch(fetch_qimao_rank_books(http_get, QIMAO_OVER_RANKS), '七猫完结榜', finished=True)
+    add_batch(fetch_fanqie_finish_books(http_get), '番茄完结', finished=True)
     add_batch(fetch_jjwxc_finish_books(http_get), '晋江完结榜', finished=True)
     add_batch(_fetch_page(http_get, '红袖[完本页]', HONGXIU_BASE + '/finish', parse_hongxiu_books),
               '红袖完本', finished=True)
@@ -3357,7 +3475,7 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
             time.sleep(LIST_DEEPEN_PAGE_DELAY)
         fetched += 1
         try:
-            batch = parser(http_get(url_fmt.format(page=page))) if page <= LIST_DEEPEN_PAGE_CAP else []
+            batch = parser(http_get(_deep_url(url_fmt, page))) if page <= LIST_DEEPEN_PAGE_CAP else []
         except Exception as e:
             # 游标不动：下次轮到它从同一页再试；本次加深不再碰这个站
             print(f'  {origin}[第 {page} 页] 拉取失败（游标留在本页）: {e}', file=sys.stderr)

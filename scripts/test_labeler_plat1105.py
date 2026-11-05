@@ -11,6 +11,7 @@
 import contextlib
 import email.message
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -235,7 +236,12 @@ class ResolveStatusAndLimitTest(unittest.TestCase):
         self.assertIn('引擎搜索 2/2 次）、3 本候选留待下轮', out.getvalue())
 
 def deep_url(i, page):
-    return dl.LIST_DEEP_SOURCES[i][1].format(page=page)
+    return dl._deep_url(dl.LIST_DEEP_SOURCES[i][1], page)
+
+
+def deep_prefix(src):
+    url_fmt = src[1]
+    return url_fmt.split('{page}')[0] if isinstance(url_fmt, str) else url_fmt(1).split('page_index')[0]
 
 
 class MultiSourceDeepenTest(unittest.TestCase):
@@ -245,17 +251,17 @@ class MultiSourceDeepenTest(unittest.TestCase):
         self.cursor_path = Path(tempfile.mkdtemp()) / dl.LIST_CURSOR_FILENAME
         self.seen = []
         self.pages = {}
-        self.fail = set()
+        self.down = set()
         self.out = io.StringIO()
 
     def http_get(self, url):
         self.seen.append(url)
-        if url in self.fail:
+        if url in self.down:
             raise ConnectionError('synthetic down')
         return self.pages.get(url, '<html></html>')
 
     def deep_seen(self):
-        prefixes = [s[1].split('{page}')[0] for s in dl.LIST_DEEP_SOURCES]
+        prefixes = [deep_prefix(s) for s in dl.LIST_DEEP_SOURCES]
         return [u for u in self.seen if any(u.startswith(p) for p in prefixes)]
 
     def build(self, cursor, deepen_min=50):
@@ -281,7 +287,7 @@ class MultiSourceDeepenTest(unittest.TestCase):
         titles = [q['title'] for q in queue]
         self.assertEqual(titles, ['七库甲', '一七甲', '红甲', '红乙', '塔甲'])
         self.assertTrue(all(q['finished'] for q in queue))
-        self.assertEqual([cursor.get(s[0]) for s in dl.LIST_DEEP_SOURCES], [2, 2, 2, 2, 1, 1])
+        self.assertEqual([cursor.get(s[0]) for s in dl.LIST_DEEP_SOURCES], [2, 2, 2, 2, 1, 1, 1])
         self.assertEqual(cursor.get(dl.LIST_CURSOR_ROTATE), 2)
         # 下次从第 2 个平台起
         self.seen.clear()
@@ -291,7 +297,7 @@ class MultiSourceDeepenTest(unittest.TestCase):
     def test_failure_skips_platform_keeps_its_cursor_and_empty_page_resets(self):
         cursor = dl.ListCursor(self.cursor_path, {dl.LIST_DEEP_SOURCES[0][0]: 5,
                                                   dl.LIST_DEEP_SOURCES[1][0]: 9})
-        self.fail = {deep_url(0, 5)}
+        self.down = {deep_url(0, 5)}
         self.pages = {deep_url(2, 1): HX_HTML}
         queue = self.build(cursor)
         self.assertEqual(self.deep_seen(),
@@ -321,7 +327,89 @@ class MultiSourceDeepenTest(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
         self.assertNotIn(dl.LIST_CURSOR_ROTATE, keys)
         for s in dl.LIST_DEEP_SOURCES:
-            self.assertIn('{page}', s[1])
+            self.assertTrue(callable(s[1]) or '{page}' in s[1], s[0])
+
+
+_FQ_REVERSE = {ch: chr(dl._FANQIE_FONT_FIRST + i) for i, ch in reversed(list(enumerate(dl._FANQIE_FONT)))
+               if ch != '\x00'}
+_FQ_UNMAPPED = chr(dl._FANQIE_FONT_FIRST + dl._FANQIE_FONT.index('\x00'))
+
+
+def fq(text):
+    """按解码表把明文混淆回私用区字符（表里没有的字原样保留，与接口实际返回一致）。"""
+    return ''.join(_FQ_REVERSE.get(c, c) for c in text)
+
+
+def fq_list(*books):
+    return json.dumps({'code': 0, 'data': {'book_list': [
+        {'book_id': bid, 'book_name': name, 'author': author, 'creation_status': cs}
+        for bid, name, author, cs in books]}}, ensure_ascii=False)
+
+
+class FanqieListTest(unittest.TestCase):
+    """番茄书库接口：私用区混淆解码、详情页逐轮核对、核对不过整站停用、加深页码映射。"""
+
+    def setUp(self):
+        patcher = mock.patch.object(dl, '_fanqie_font_ok', None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.out = io.StringIO()
+        self.seen = []
+        self.detail_title = '我不是戏神'
+        self.lists = {
+            1: fq_list(('11', fq('我不是戏神'), fq('三九音域'), 0),
+                       ('12', fq('十日终焉'), fq('杀虫队队员'), 0),
+                       ('13', fq('书名') + _FQ_UNMAPPED, fq('某人'), 0)),         # 未对齐码位：不收
+            0: fq_list(('21', fq('备用联系人'), fq('绒绒') + _FQ_UNMAPPED, 0),   # 作者不可信：留空
+                       ('22', fq('十日终焉'), fq('杀虫队队员'), 0)),             # 跨性别重复：去重
+        }
+
+    def http_get(self, url):
+        self.seen.append(url)
+        if url == dl.FANQIE_BASE + '/page/11':
+            return f'<html><title>{self.detail_title}完整版在线免费阅读_{self.detail_title}小说_番茄小说官网</title>'
+        for gender, body in self.lists.items():
+            if url == dl.FANQIE_LIBRARY_URL.format(count=dl.FANQIE_TOP_COUNT, index=0, gender=gender):
+                return body
+        raise ConnectionError('synthetic down')
+
+    def fetch(self):
+        with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(self.out):
+            return dl.fetch_fanqie_finish_books(self.http_get)
+
+    def test_decodes_titles_and_authors_and_checks_detail_page(self):
+        books = self.fetch()
+        self.assertTrue(dl._fanqie_font_ok)
+        self.assertEqual([(b['title'], b['author']) for b in books],
+                         [('我不是戏神', '三九音域'), ('十日终焉', '杀虫队队员'), ('备用联系人', '')])
+        self.assertTrue(all(b['finished'] for b in books))
+        self.assertIn(dl.FANQIE_BASE + '/page/11', self.seen)           # 核对的是首本书
+
+    def test_detail_mismatch_or_failure_disables_fanqie_for_the_round(self):
+        self.detail_title = '我不是戏'
+        self.assertEqual(self.fetch(), [])
+        self.assertFalse(dl._fanqie_font_ok)
+        self.assertIn('核对不通过', self.out.getvalue())
+        with self.assertRaises(RuntimeError):                         # 加深也不用
+            dl.parse_fanqie_library(self.lists[1])
+        self.lists = {}                                               # 名单全拉不到：同样停用、不请求详情页
+        self.seen.clear()
+        self.assertEqual(self.fetch(), [])
+        self.assertNotIn(dl.FANQIE_BASE + '/page/11', self.seen)
+
+    def test_deep_page_follows_the_top_hundred_and_parses_after_check(self):
+        self.assertIn('page_count=10&page_index=10&', dl.fanqie_deep_url(1))
+        self.assertIn('page_count=10&page_index=12&', dl.fanqie_deep_url(3))
+        self.assertIn('creation_status=0', dl.fanqie_deep_url(1))
+        with self.assertRaises(RuntimeError):                         # 本轮还没核对
+            dl.parse_fanqie_library(self.lists[0])
+        self.fetch()
+        self.assertEqual([b['title'] for b in dl.parse_fanqie_library(self.lists[0])],
+                         ['备用联系人', '十日终焉'])
+
+    def test_decode_leaves_non_pua_text_untouched(self):
+        self.assertEqual(dl._fanqie_decode('Ab，1' + fq('我')), 'Ab，1我')
+        self.assertEqual(dl._fanqie_decode(_FQ_UNMAPPED), _FQ_UNMAPPED)
 
 
 class _Resp:
