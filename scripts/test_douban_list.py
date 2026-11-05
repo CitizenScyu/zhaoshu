@@ -1753,6 +1753,21 @@ class TestSearchEngineAlternates(unittest.TestCase):
         hit = douban_list.search_engine(cli, '剑来')
         self.assertEqual(len(hit['alternates']), douban_list.ENGINE_MAX_ALTERNATES)
 
+    def test_alternates_prefer_distinct_hosts(self):
+        # altdiv1105：同 host 的备选排到不同 host 之后；名额有剩才回填
+        rows = [('m.qd.example', '1'), ('m.qd.example', '2'), ('m.qd.example', '3'),
+                ('m.qd.example', '4'), ('zd.example', '1'), ('s9.example', '1')]
+        cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([
+            {'source': h, 'title': '剑来', 'author': '', 'bookUrl': f'https://{h}/b{n}'}
+            for h, n in rows]))})
+        with contextlib.redirect_stdout(io.StringIO()):
+            hit = douban_list.search_engine(cli, '剑来')
+        self.assertEqual(hit['url'], 'https://m.qd.example/b1')
+        self.assertEqual([a['url'] for a in hit['alternates']],
+                         ['https://zd.example/b1', 'https://s9.example/b1',
+                          'https://m.qd.example/b2', 'https://m.qd.example/b3',
+                          'https://m.qd.example/b4'])
+
     def test_queue_entry_carries_alternates(self):
         no_wait(self)
         cli = FakeEngineCli({'search': _proc(0, _engine_search_stdout([

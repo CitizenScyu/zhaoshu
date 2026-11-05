@@ -2184,7 +2184,9 @@ def _annotate_bogus(hit: dict | None, bogus_raw: str) -> dict | None:
 # 仍只反映主候选的选择过程。只在有备选时才给 hit 加 alternates 键。
 # 名单有作者：author_matches 已验证的在前、候选作者空的在后，错配不收（_known_author_alternates）；
 # 名单无作者：服从 _pick_author_unknown——判歧义则无主候选也无备选，否则其余兼容候选都可作备选。
-ENGINE_MAX_ALTERNATES = 3
+# altdiv1105：上限 3→5，且先每个 host 各取一条、再回填同 host 的——实网同书 4 个备选里 3 条同属
+# m.qidian.com，一死全死，换源等于没换（11-05 [21/203]）。
+ENGINE_MAX_ALTERNATES = 5
 
 
 def _known_author_alternates(title: str, author: str, candidates: list) -> list[dict]:
@@ -2218,16 +2220,20 @@ DEPRIORITIZED_SOURCE_HOSTS = PAYWALL_HOSTS
 PAYWALL_SKIP_ENV = 'LABELER_PAYWALL_SKIP'
 
 
-def _is_deprioritized(entry) -> bool:
+def _entry_host(entry) -> str:
     if not isinstance(entry, dict):
-        return False
+        return ''
     host = entry.get('source') or ''
     if not host:
         try:
             host = urllib.parse.urlsplit(entry.get('bookUrl') or entry.get('url') or '').hostname or ''
         except ValueError:
             host = ''
-    return host.lower() in DEPRIORITIZED_SOURCE_HOSTS
+    return host.lower()
+
+
+def _is_deprioritized(entry) -> bool:
+    return _entry_host(entry) in DEPRIORITIZED_SOURCE_HOSTS
 
 
 def _deprioritize_sources(items: list) -> list:
@@ -2250,14 +2256,21 @@ def _with_alternates(hit: dict | None, pool: list[dict]) -> dict | None:
     降权源（DEPRIORITIZED_SOURCE_HOSTS）排在备选末位。"""
     if hit is None:
         return None
-    seen, alternates = {hit['url']}, []
+    seen, unique = {hit['url']}, []
     for entry in _deprioritize_sources(pool):
-        if entry['url'] in seen:
-            continue
-        seen.add(entry['url'])
-        alternates.append(dict(entry))
-        if len(alternates) >= ENGINE_MAX_ALTERNATES:
-            break
+        if entry['url'] not in seen:
+            seen.add(entry['url'])
+            unique.append(entry)
+    # altdiv1105：先取与主源及已选备选都不同 host 的，名额有剩再按原序回填同 host 的。
+    used_hosts, diverse, same_host = {_entry_host(hit)}, [], []
+    for entry in unique:
+        host = _entry_host(entry)
+        if host and host not in used_hosts:
+            used_hosts.add(host)
+            diverse.append(entry)
+        else:
+            same_host.append(entry)
+    alternates = [dict(e) for e in (diverse + same_host)[:ENGINE_MAX_ALTERNATES]]
     if alternates:
         hit['alternates'] = alternates
     return hit
