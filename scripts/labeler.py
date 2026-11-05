@@ -94,7 +94,7 @@ REQUIRED_DOUBAN_LIST_API = (
     'author_matches', 'body_pair_details', 'build_douban_queue', 'build_webnovel_queue',
     'engine_fallback_enabled', 'fetch_content_fingerprint', 'is_placeholder_author',
     'load_done_index', 'resolve_book15_breaker', 'resolve_douban_pages',
-    'resolve_engine_miss_ttl', 'resolve_list_deepen_min', 'same_book',
+    'resolve_engine_miss_ttl', 'resolve_list_deepen_min', 'resolve_list_queue_max', 'same_book',
     'search_engine', 'title_compatible', 'validate_engine',
 )
 REQUIRED_SOURCE_POLICY_API = (
@@ -387,6 +387,25 @@ def resolve_models(env: dict, use_db: bool = True) -> tuple[list[str], str]:
 SOURCE_POLICY: 'labeler_source_policy.SourcePolicy | None' = None
 
 
+_META_CHARSET_RE = re.compile(rb'<meta[^>]+charset=["\']?([A-Za-z0-9_-]+)', re.I)
+
+
+def decode_page(raw: bytes, header_charset: str | None = None) -> str:
+    """gbkdec1105：页面字节 → 文本。合法 UTF-8 一律按 UTF-8（与改前逐字一致）；
+    解不开且响应头/页首 meta 声明 GB 系编码（晋江、飞卢等）才按 gb18030 解，其余仍 UTF-8 replace。"""
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        pass
+    declared = (header_charset or '').lower()
+    if not declared:
+        m = _META_CHARSET_RE.search(raw[:4096])
+        declared = m.group(1).decode('ascii', 'replace').lower() if m else ''
+    if declared.startswith('gb'):
+        return raw.decode('gb18030', 'replace')
+    return raw.decode('utf-8', 'replace')
+
+
 def http_get(url: str, timeout: int = 30) -> str:
     """站点页面 GET（失败重试 HTTP_RETRY 次）。签名保持 (url, timeout) 不变，
     便于单测继续用 `labeler.http_get = lambda url, timeout=30: ...` 替换传输层。
@@ -406,7 +425,9 @@ def http_get(url: str, timeout: int = 30) -> str:
         try:
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=timeout) as res:
-                text = res.read().decode('utf-8', 'replace')
+                headers = getattr(res, 'headers', None)
+                charset = headers.get_content_charset() if hasattr(headers, 'get_content_charset') else None
+                text = decode_page(res.read(), charset)
             if SOURCE_POLICY is not None:
                 SOURCE_POLICY.record_success(labeler_source_policy.host_of(url))
             return text
@@ -4197,7 +4218,8 @@ def main() -> int:
             engine_miss = douban_list.EngineMissMemo.load(
                 data_path(douban_list.ENGINE_MISS_FILENAME),
                 douban_list.resolve_engine_miss_ttl(env))
-            # listdeep1105：固定名单打干后队列不足下限 ⇒ 七猫书库按游标往后翻（LABELER_LIST_DEEPEN_MIN=0 关闭）
+            # listdeep1105/plat1105：固定名单打干后队列不足下限 ⇒ 各平台完结书库按游标轮转往后翻
+            # （LABELER_LIST_DEEPEN_MIN=0 关闭）；每轮入队上限 LABELER_LIST_QUEUE_MAX（0 不限）
             list_cursor = douban_list.ListCursor.load(data_path(douban_list.LIST_CURSOR_FILENAME))
             all_books = (douban_list.build_douban_queue(
                              bridged, done_index=done_index, pages=pages,
@@ -4209,7 +4231,8 @@ def main() -> int:
                              engine_cli=engine_cli, book15_breaker=book15_breaker,
                              source_policy=SOURCE_POLICY, engine_miss=engine_miss,
                              list_cursor=list_cursor,
-                             deepen_min=douban_list.resolve_list_deepen_min(env)))
+                             deepen_min=douban_list.resolve_list_deepen_min(env),
+                             queue_max=douban_list.resolve_list_queue_max(env)))
             engine_miss.save()
             list_cursor.save()
             print(f'{args.source} 线共 {len(all_books)} 本（搜索命中后）')

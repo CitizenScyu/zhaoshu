@@ -2320,7 +2320,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                         skip_titles: set | None = None, engine_cli=None,
                         book15_breaker: Book15Breaker | None = None,
                         source_policy=None, done_index: dict[str, set[str]] | None = None,
-                        engine_miss: EngineMissMemo | None = None) -> list[dict]:
+                        engine_miss: EngineMissMemo | None = None,
+                        limit: int = 0) -> list[dict]:
     """候选名单（[{title, author, ...}]）→ 过 book15 搜索+校验的打标队列。
 
     各名单源共用：命中记队列（category 记来源标记，默认取候选自带 origin，
@@ -2342,8 +2343,14 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
 
     engine_miss（engmiss1104）：引擎干净 miss 的跨轮记忆；TTL 内同（名单书名, 名单作者）不再
     发引擎搜索、照常计入 miss。只记 search_engine 正常返回 None（不含 EngineUnavailable/输出坏）。
-    None 时行为不变；保存由调用方负责。"""
+    None 时行为不变；保存由调用方负责。
+
+    limit>0（plat1105）：入队满 limit 本、或引擎实搜满 LIST_SEARCH_BUDGET_FACTOR×limit 次即停，
+    剩余候选不搜（留待下轮）——后者防低命中名单（如晋江）每轮把建队拖成几小时；0 = 不限（旧行为）。
+    候选带 finished（finlist1105）⇒ 条目 status 记「完结」（入库 finish_status，书库页显示完结标）。"""
     queue: list[dict] = []
+    deferred = 0
+    engine_searches = 0                     # plat1105：真发出的引擎搜索（记忆跳过/已打标不计）
     miss: list[str] = []
     skipped = 0
     engine_miss_skipped = 0
@@ -2357,7 +2364,11 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     engine_stats: dict = {}
     engine_junk = EngineJunkTracker() if engine_cli is not None else None
     engine_disabled = False
-    for b in candidates:
+    for idx, b in enumerate(candidates):
+        if limit > 0 and (len(queue) >= limit
+                          or engine_searches >= LIST_SEARCH_BUDGET_FACTOR * limit):
+            deferred = len(candidates) - idx
+            break
         key = _norm_title(b.get('title', ''))
         if ((skip_titles and key and key in skip_titles)
                 or (done_index is not None and is_done_candidate(b.get('title', ''), b.get('author'), done_index))):
@@ -2399,7 +2410,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
             entry = {'url': hit['url'], 'title': hit['title'],
                      'author': list_author,
                      'category': origin or b.get('origin', ''),
-                     'status': '',
+                     'status': '完结' if b.get('finished') else '',
                      'douban_url': b.get('douban_url', '')}
             if bare_region_label or list_author_bogus:
                 entry['list_author_raw'] = raw_author
@@ -2432,6 +2443,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                 time.sleep(SEARCH_DELAY)
             continue
         if engine_cli is not None and not engine_disabled:
+            engine_searches += 1
             bad_before = engine_stats.get('bad_output', 0)
             try:
                 engine_hit = search_engine(engine_cli, b['title'], list_author,
@@ -2486,7 +2498,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                      'list_title': b.get('title', ''),
                      'author': list_author,
                      'category': origin or b.get('origin', ''),
-                     'status': '',
+                     'status': '完结' if b.get('finished') else '',
                      'douban_url': b.get('douban_url', ''),
                      'engine': True,
                      'source_host': engine_hit['source']}
@@ -2530,8 +2542,12 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     # M1：只剩国别标注的条目在引擎兜底前直接拒收；有拒收才补这一段（无则本行逐字不变）。
     region_note = (f'，国别标注名单作者拒收 {bare_region_rejected} 本'
                    if bare_region_rejected else '')
+    # plat1105：触达入队上限才补一段（无则本行逐字不变）。
+    limit_note = (f'，达本轮上限（入队 {len(queue)}/{limit} 本、引擎搜索 {engine_searches}/'
+                  f'{LIST_SEARCH_BUDGET_FACTOR * limit} 次）、{deferred} 本候选留待下轮'
+                  if deferred else '')
     print(f'book15 命中 {book15_hits} 本，未命中 {len(miss)} 本，'
-          f'跳过已打标 {skipped} 本{engine_note}{breaker_note}{region_note}'
+          f'跳过已打标 {skipped} 本{engine_note}{breaker_note}{region_note}{limit_note}'
           f'{"（" + "、".join(miss[:10]) + ("…" if len(miss) > 10 else "") + "）" if miss else ""}')
     return queue
 
@@ -2881,10 +2897,12 @@ def fetch_17k_top_books(http_get) -> list[dict]:
 # 榜单页纯 SSR、UTF-8、无 JS 盾（local-server 实测 200 / 约 100KB），每榜 20 本：
 #   <a … class="s-book-title" …>书名</a> … <a href="https://www.qimao.com/zuozhe/…">作者</a>
 # 七猫是免费阅读平台，书目在源池里普遍有免费镜像（付费墙独源的 QQ 系正相反）。
-# slug 只收页面导航里实测出现的男频榜（女频路径未见，不猜）。
+# slug 只收实测可抓的榜（plat1105：女频 girl/hot|collect|over 2026-11-05 .88 实测同构 SSR）。
+# 完结榜（*/over/date）单列 QIMAO_OVER_RANKS，入队时标完结、排在连载榜前面。
 QIMAO_BASE = 'https://www.qimao.com'
-QIMAO_RANKS = ('boy/hot/date', 'boy/hot/month', 'boy/over/date', 'boy/new/date',
-               'boy/collect/date', 'boy/update/date')
+QIMAO_RANKS = ('boy/hot/date', 'boy/hot/month', 'boy/new/date',
+               'boy/collect/date', 'boy/update/date', 'girl/hot/date', 'girl/collect/date')
+QIMAO_OVER_RANKS = ('boy/over/date', 'girl/over/date')
 _QM_TITLE_RE = re.compile(r'<a\s[^>]*class="s-book-title"[^>]*>([^<]+)</a>')
 _QM_AUTHOR_RE = re.compile(r'href="(?:https?:)?//www\.qimao\.com/zuozhe/[^"]*"[^>]*>([^<]+)</a>')
 
@@ -2911,10 +2929,10 @@ def _parse_qimao_entries(html: str, title_re: re.Pattern, origin: str) -> list[d
     return books
 
 
-def fetch_qimao_rank_books(http_get) -> list[dict]:
-    """七猫 6 榜（热度日/月、完结、新书、收藏、更新，各 20 本）；单榜失败只告警。"""
+def fetch_qimao_rank_books(http_get, ranks: tuple = QIMAO_RANKS) -> list[dict]:
+    """七猫榜单（默认男频热度日/月、新书、收藏、更新 + 女频热度、收藏，各 20 本）；单榜失败只告警。"""
     books: list[dict] = []
-    for rank in QIMAO_RANKS:
+    for rank in ranks:
         try:
             books.extend(parse_qimao_rank(http_get(f'{QIMAO_BASE}/paihang/{rank}/')))
         except Exception as e:
@@ -2928,7 +2946,9 @@ def fetch_qimao_rank_books(http_get) -> list[dict]:
 # .88 实测 p200 仍有书、p1000 空页），作「越打越深」的后备名单：固定名单解析出的打标队列不足
 # 下限时，从游标页起往后翻，逐页过同一套搜索校验，凑够即停。游标跨轮落盘、只进不退（本轮翻过
 # 的页下轮不再重翻），翻到空页回第 1 页（已打标的书照常被 done_index 跳过，没打成的书再试一次）。
-QIMAO_SHUKU_URL = QIMAO_BASE + '/shuku/a-a-a-a-a-a-a-click-{page}/'
+# plat1105：URL 第 7 位 = 是否完结（1=已完结，2026-11-05 实测筛选按钮 active 于「已完结」），
+# 只翻完结书；且不再只翻七猫——LIST_DEEP_SOURCES 多平台完结书库轮转（见下）。
+QIMAO_SHUKU_URL = QIMAO_BASE + '/shuku/a-a-a-a-a-a-1-click-{page}/'
 _QM_SHUKU_TITLE_RE = re.compile(
     r'<span\s[^>]*class="s-tit"[^>]*>\s*<a\s[^>]*href="(?:https?:)?//www\.qimao\.com/shuku/\d+/"'
     r'[^>]*>([^<]+)</a>')
@@ -2936,13 +2956,252 @@ LIST_DEEPEN_ENV = 'LABELER_LIST_DEEPEN_MIN'   # 队列下限；0 关闭加深
 LIST_DEEPEN_MIN = 10
 LIST_DEEPEN_MAX_PAGES = 4                     # 每轮最多翻页数（每页 15 本）
 LIST_DEEPEN_PAGE_DELAY = 1.0
+LIST_DEEPEN_PAGE_CAP = 300                    # 游标超过此页回第 1 页（个别站越界页重复返回末页）
 LIST_CURSOR_FILENAME = 'labels-list-cursor.json'
-LIST_CURSOR_QIMAO = 'qimao_shuku'
+LIST_CURSOR_QIMAO = 'qimao_shuku_fin'         # 原 qimao_shuku（全部书）游标不复用：筛选口径变了
+LIST_CURSOR_ROTATE = '_rotate'                # 下次加深从第几个名单起（1 起），每次加深后移一位
 
 
 def parse_qimao_shuku(html: str) -> list[dict]:
     """七猫书库列表页 → [{title, author, origin}]（书名在 span.s-tit 里，作者锚点同榜单页）。"""
     return _parse_qimao_entries(html, _QM_SHUKU_TITLE_RE, '七猫书库')
+
+
+# ---- 多平台名单（plat1105，2026-11-05 用户指令：各大平台都要找、尽量先找完结的）----
+# 下列页面均为 .88 以打标 UA（zhaoshu-labeler/1.0）实测 200 + SSR；合成测试片段按实测结构缩写。
+# 不接：番茄（书名字体反爬，私有区码位）、起点桌面/女频与 qdmm（JS 盾 / 404）、QQ 阅读（付费墙独源）、
+# 纵横 /rank?nav=*（只 SSR 默认人气榜，其余榜客户端渲染）、优书网/有毒（连接重置 / 空壳）。
+# 晋江/飞卢是 GBK 页：依赖 labeler.http_get 的 gbkdec1105 按声明编码解码（UTF-8 页行为不变）。
+ZONGHENG_BASE = 'https://www.zongheng.com'
+JJWXC_BASE = 'https://www.jjwxc.net'
+JJWXC_FINISH_RANKS = (16, 20)        # topten.php?orderstr=：16 完结金榜、20 完结高分（各约 200–400 本）
+HONGXIU_BASE = 'https://www.hongxiu.com'
+XXSY_BASE = 'https://www.xxsy.net'
+XXSY_FINISH_SECTION = '完结榜'
+CIWEIMAO_BASE = 'https://www.ciweimao.com'
+TADU_BASE = 'https://www.tadu.com'
+SFACG_BASE = 'https://book.sfacg.com'
+FALOO_BASE = 'https://b.faloo.com'
+_TAG_RE = re.compile(r'<[^>]+>')
+# 引号感知的开标签体：晋江 rel="…<br>…" / data-recommendInfo='{"…"}' 里带 > 与另一种引号
+_ATTRS = r"""(?:[^>"']|"[^"]*"|'[^']*')*?"""
+
+
+def _anchor_text(inner: str) -> str:
+    text = re.sub(r'\s+', ' ', unescape(_TAG_RE.sub('', inner or ''))).strip()
+    return text if 2 <= len(text) <= 40 else ''
+
+
+def _parse_anchor_list(html: str, book_re: re.Pattern, origin: str,
+                       author_re: re.Pattern | None = None) -> list[dict]:
+    """书目锚点按书 id 归并 → [{title, author, origin}]。
+
+    book_re：group1 = 书 id，group2 = 书名（锚点内 HTML 或 title 属性）；同一本书的封面/书名/简介锚点
+    共用 id，书名取该 id 第一个非空短文本。作者只在「本 id 首个锚点 → 下一本书首个锚点」之间找
+    （与 _parse_qimao_entries 同口径，不串条）。跨 id 按归一化书名去重。"""
+    order: list[tuple[int, str]] = []
+    titles: dict[str, str] = {}
+    for m in book_re.finditer(html):
+        bid = m.group(1)
+        if bid not in titles:
+            titles[bid] = ''
+            order.append((m.start(), bid))
+        if not titles[bid]:
+            titles[bid] = _anchor_text(m.group(2))
+    books, seen = [], set()
+    for i, (start, bid) in enumerate(order):
+        title = titles[bid]
+        key = _norm_title(title)
+        if not title or not key or key in seen:
+            continue
+        seen.add(key)
+        author = ''
+        if author_re is not None:
+            end = order[i + 1][0] if i + 1 < len(order) else len(html)
+            for a in author_re.finditer(html, start, end):
+                author = _anchor_text(a.group(1))
+                if author:
+                    break
+        books.append({'title': title, 'author': author, 'origin': origin, 'douban_url': ''})
+    return books
+
+
+_ZH_RANK_BOOK_RE = re.compile(
+    r'<a\s[^>]*href="(?:https?:)?//www\.zongheng\.com/detail/(\d+)"[^>]*>(.*?)</a>', re.S)
+_ZH_RANK_AUTHOR_RE = re.compile(
+    r'<a\s[^>]*href="(?:https?:)?//home\.zongheng\.com/show/userInfo/\d+\.html"[^>]*>(.*?)</a>', re.S)
+
+
+def parse_zongheng_rank(html: str) -> list[dict]:
+    """纵横桌面排行页 /rank（默认人气榜 SSR，约 30 本）。"""
+    return _parse_anchor_list(html, _ZH_RANK_BOOK_RE, '纵横排行', _ZH_RANK_AUTHOR_RE)
+
+
+_JJ_CHUNK_RE = re.compile(r'<(?:tr|li)[\s>]', re.I)
+_JJ_BOOK_RE = re.compile(
+    r'<a\s' + _ATTRS + r'href="onebook\.php\?novelid=(\d+)"' + _ATTRS + r'>(.*?)</a>', re.S)
+_JJ_AUTHOR_RE = re.compile(
+    r'<a\s' + _ATTRS + r'href="oneauthor\.php\?authorid=\d+"' + _ATTRS + r'>(.*?)</a>', re.S)
+
+
+def parse_jjwxc_topten(html: str) -> list[dict]:
+    """晋江排行页 topten.php → [{title, author, origin}]。
+
+    两种实测形态：完结金榜是 <li>书名锚点 作者锚点</li>，完结高分是 <tr>作者格 书名格</tr>（作者在前）。
+    按 <li>/<tr> 切块，块内恰有一本书时才取块内第一个作者锚点（多书块不猜作者）。"""
+    books, seen = [], set()
+    for chunk in _JJ_CHUNK_RE.split(html):
+        hits = [(m.group(1), _anchor_text(m.group(2))) for m in _JJ_BOOK_RE.finditer(chunk)]
+        ids = {bid for bid, _ in hits}
+        author = ''
+        if len(ids) == 1:
+            a = _JJ_AUTHOR_RE.search(chunk)
+            author = _anchor_text(a.group(1)) if a else ''
+        for _bid, title in hits:
+            key = _norm_title(title)
+            if title and key and key not in seen:
+                seen.add(key)
+                books.append({'title': title, 'author': author if len(ids) == 1 else '',
+                              'origin': '晋江完结榜', 'douban_url': ''})
+    return books
+
+
+_HX_BOOK_RE = re.compile(r'<h3>\s*<a\s[^>]*href="/book/(\d+)"[^>]*>(.*?)</a>', re.S)
+_HX_AUTHOR_RE = re.compile(r'<h4>\s*<a[^>]*>(.*?)</a>', re.S)
+
+
+def parse_hongxiu_books(html: str) -> list[dict]:
+    """红袖添香完本页 /finish 与书库列表 /category/…（同一 all-book-list 结构）。"""
+    return _parse_anchor_list(html, _HX_BOOK_RE, '红袖完本', _HX_AUTHOR_RE)
+
+
+_XXSY_ITEM_RE = re.compile(
+    r'data-bookid="(\d+)"[^>]*>\s*<span class="piao">([^<]*)</span>.*?'
+    r'<a\s[^>]*href="/book/\1"[^>]*>(.*?)</a>', re.S)
+_XXSY_SECTION_RE = re.compile(r'<h3[^>]*>([^<]+)</h3>')
+
+
+def parse_xxsy_rank(html: str) -> list[dict]:
+    """潇湘书院排行页 /rank（6 个榜，li 里作者 span.piao 在书名前）；「完结榜」区块的书标 finished。"""
+    sections = [(m.start(), m.group(1).strip()) for m in _XXSY_SECTION_RE.finditer(html)]
+    books, by_key = [], {}
+    for m in _XXSY_ITEM_RE.finditer(html):
+        title = _anchor_text(m.group(3))
+        key = _norm_title(title)
+        if not title or not key:
+            continue
+        section = ''
+        for pos, name in sections:
+            if pos > m.start():
+                break
+            section = name
+        finished = section == XXSY_FINISH_SECTION
+        if key in by_key:
+            by_key[key]['finished'] = by_key[key].get('finished') or finished
+            continue
+        b = {'title': title, 'author': _anchor_text(m.group(2)), 'origin': '潇湘榜单',
+             'douban_url': ''}
+        if finished:
+            b['finished'] = True
+        by_key[key] = b
+        books.append(b)
+    return books
+
+
+_CWM_BOOK_RE = re.compile(
+    r'<a\s[^>]*href="https?://www\.ciweimao\.com/book/(\d+)"[^>]*?title="([^"]*)"')
+_CWM_AUTHOR_RE = re.compile(
+    r'<p class="author">\s*<a\s[^>]*href="https?://www\.ciweimao\.com/reader/\d+"[^>]*>(.*?)</a>', re.S)
+
+
+def parse_ciweimao_rank(html: str) -> list[dict]:
+    """刺猬猫排行首页 /rank-index（书名取 title 属性：锚点内带「序号[分类]」前缀；只有各榜榜首带作者）。"""
+    return _parse_anchor_list(html, _CWM_BOOK_RE, '刺猬猫榜单', _CWM_AUTHOR_RE)
+
+
+_TADU_BOOK_RE = re.compile(r'<a\s[^>]*href="/book/(\d+)/"[^>]*class="bookNm"[^>]*>(.*?)</a>', re.S)
+_TADU_AUTHOR_RE = re.compile(r'class="authorNm"[^>]*>(.*?)</a>', re.S)
+
+
+def parse_tadu_store(html: str) -> list[dict]:
+    """塔读书库列表 /store/…（完结筛选页）。"""
+    return _parse_anchor_list(html, _TADU_BOOK_RE, '塔读完结', _TADU_AUTHOR_RE)
+
+
+_SF_BOOK_RE = re.compile(r'<strong>\s*<a\s[^>]*href="/Novel/(\d+)/"[^>]*>(.*?)</a>', re.S)
+_SF_AUTHOR_RE = re.compile(r'作\s*者\s*[:：]\s*<a\s[^>]*href="/Club/\d+/"[^>]*>(.*?)</a>', re.S)
+
+
+def parse_sfacg_list(html: str) -> list[dict]:
+    """SF 轻小说书库列表 /List/default.aspx（if=1 已完结）。"""
+    return _parse_anchor_list(html, _SF_BOOK_RE, 'SF完结', _SF_AUTHOR_RE)
+
+
+_FALOO_BOOK_RE = re.compile(
+    r'<h1[^>]*>\s*<a\s[^>]*href="(?:https?:)?//b\.faloo\.com/(\d+)\.html"[^>]*>(.*?)</a>', re.S)
+_FALOO_AUTHOR_RE = re.compile(
+    r'<a\s[^>]*href="(?:https?:)?//b\.faloo\.com/l_0_1\.html\?t=2[^"]*"[^>]*>(.*?)</a>', re.S)
+
+
+def parse_faloo_list(html: str) -> list[dict]:
+    """飞卢书库列表 y_…（完本 + 总点击排序）；书名在 h1 锚点，作者是紧随的 l_0_1.html?t=2 检索锚点。"""
+    return _parse_anchor_list(html, _FALOO_BOOK_RE, '飞卢完本', _FALOO_AUTHOR_RE)
+
+
+def _fetch_page(http_get, label: str, url: str, parser) -> list[dict]:
+    try:
+        return parser(http_get(url))
+    except Exception as e:
+        print(f'  {label} 拉取失败: {e}', file=sys.stderr)
+        return []
+
+
+def fetch_jjwxc_finish_books(http_get) -> list[dict]:
+    books: list[dict] = []
+    for order in JJWXC_FINISH_RANKS:
+        books.extend(_fetch_page(http_get, f'晋江[orderstr={order}]',
+                                 f'{JJWXC_BASE}/topten.php?orderstr={order}&t=1', parse_jjwxc_topten))
+    return books
+
+
+# 加深名单（plat1105）：各平台「完结 + 人气排序」书库，按页游标轮转（每次加深从下一个平台起）。
+# (游标名, URL 模板, 解析函数, 来源标记)；顺序 = 轮转顺序，免费站在前、付费为主的站在后。
+LIST_DEEP_SOURCES = (
+    (LIST_CURSOR_QIMAO, QIMAO_SHUKU_URL, parse_qimao_shuku, '七猫书库完结'),
+    ('17k_fin_click', Y17K_BASE + '/all/book/2_0_0_0_3_4_1_0_{page}.html', parse_17k_quanben,
+     '17K完本总点击'),
+    ('hongxiu_fin_click', HONGXIU_BASE + '/category/f1_f1_1_f1_f1_f1_17_{page}', parse_hongxiu_books,
+     '红袖完本点击'),
+    ('tadu_fin', TADU_BASE + '/store/98-f-0-15-a-20-p-{page}-909', parse_tadu_store, '塔读完结'),
+    ('faloo_fin_click', FALOO_BASE + '/y_0_0_0_0_2_3_{page}.html', parse_faloo_list, '飞卢完本总点击'),
+    ('sfacg_fin', SFACG_BASE + '/List/default.aspx?&tid=-1&if=1&PageIndex={page}', parse_sfacg_list,
+     'SF完结'),
+)
+
+LIST_QUEUE_MAX_ENV = 'LABELER_LIST_QUEUE_MAX'   # 每轮入队上限；0 不限
+LIST_SEARCH_BUDGET_FACTOR = 2                   # 每轮引擎实搜上限 = 2×入队上限（约 15–20 秒/次）
+LIST_QUEUE_MAX = 120     # 约 4–5 小时打标量（2026-11-05 实测 ~27 本/时）：轮次变短 → 名单更新更勤、
+                         # 完结优先跨轮生效，也不为排不上号的书提前花搜索时间
+
+
+def resolve_list_queue_max(env: dict | None = None) -> int:
+    """入队上限：env 字典 → 进程环境 → 默认；非法值回落默认，<=0 表示不限。"""
+    raw = str((env or {}).get(LIST_QUEUE_MAX_ENV) or os.environ.get(LIST_QUEUE_MAX_ENV) or '').strip()
+    try:
+        return int(raw) if raw else LIST_QUEUE_MAX
+    except ValueError:
+        return LIST_QUEUE_MAX
+
+
+def order_completed_first(candidates: list[dict]) -> list[dict]:
+    """finlist1105：完结书整体排在前面；同一档内按来源轮转（各平台交替出书，大名单不霸占队首）。"""
+    groups: dict[str, list[dict]] = {}
+    for b in candidates:
+        groups.setdefault(b.get('origin', ''), []).append(b)
+    mixed: list[dict] = []
+    for i in range(max((len(g) for g in groups.values()), default=0)):
+        mixed.extend(g[i] for g in groups.values() if i < len(g))
+    return [b for b in mixed if b.get('finished')] + [b for b in mixed if not b.get('finished')]
 
 
 def resolve_list_deepen_min(env: dict | None = None) -> int:
@@ -3013,7 +3272,7 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
                          source_policy=None, done_index: dict[str, set[str]] | None = None,
                          engine_miss: EngineMissMemo | None = None,
                          list_cursor: ListCursor | None = None,
-                         deepen_min: int = 0) -> list[dict]:
+                         deepen_min: int = 0, queue_max: int = 0) -> list[dict]:
     """网文站名单（主）+ 豆瓣 tag（补充）→ book15 打标队列。
 
     用户指令（2026-09-18）：网文站榜单是对口 book15 的一手来源，优先；
@@ -3023,67 +3282,102 @@ def build_webnovel_queue(http_get, include_douban: bool = True,
     skip_titles = 已打标书名，搜索前跳过（收益最大的一刀）。
     done_index传入完成记录的作者信息；与旧skip_titles接口分开。
     产出与 fetch_rank_books() 同构，每个候选过 search_book15（LIKE + title_compatible）。
-    list_cursor + deepen_min>0（listdeep1105）：队列不足 deepen_min 本时从七猫书库游标页往后翻
-    （见 LIST_DEEPEN_* 注释）；list_cursor=None 时行为不变，游标由调用方保存。
+    list_cursor + deepen_min>0（listdeep1105）：队列不足 deepen_min 本时按游标翻加深名单
+    （见 LIST_DEEPEN_* / LIST_DEEP_SOURCES 注释）；list_cursor=None 时行为不变，游标由调用方保存。
+    plat1105/finlist1105：名单扩到各大平台；完结书（完本页/完结榜/完结筛选，或页面逐条标完结）带
+    finished，入队前排到最前、同档按平台轮转（order_completed_first），条目 status 记「完结」。
+    queue_max>0：入队满 queue_max 本即停止搜索，剩余候选留待下轮（完结优先在跨轮意义上成立）。
     """
     candidates: list[dict] = []
-    seen: set = set()
+    by_key: dict[str, dict] = {}
 
-    def add_batch(batch: list[dict], origin: str) -> list[dict]:
+    def add_batch(batch: list[dict], origin: str, finished: bool = False) -> list[dict]:
         added = []
         for b in batch:
             k = _norm_title(b.get('title', ''))
-            if k and k not in seen:
-                seen.add(k)
-                b['origin'] = origin
-                candidates.append(b)
-                added.append(b)
+            if not k:
+                continue
+            if k in by_key:
+                # 先进了连载榜、又出现在完结名单上 → 认完结（不改归属来源）
+                if finished or b.get('finished'):
+                    by_key[k]['finished'] = True
+                continue
+            by_key[k] = b
+            b['origin'] = origin
+            if finished:
+                b['finished'] = True
+            candidates.append(b)
+            added.append(b)
         print(f'{origin}: 新增 {len(added)} 本（累计 {len(candidates)}）')
         return added
 
-    # 顺序 = 预期命中率（完本经典 > 在更新书 > 豆瓣补充）；任何源失败只告警。
-    add_batch(fetch_qidian_finish_books(http_get), '起点完本频道')
-    add_batch(fetch_zongheng_complete_books(http_get), '纵横完本')
-    add_batch(fetch_17k_quanben_books(http_get), '17K完本')
+    # 先完结名单、后连载榜单、豆瓣补充；任何源失败只告警（单页失败不连坐）。
+    add_batch(fetch_qidian_finish_books(http_get), '起点完本频道', finished=True)
+    add_batch(fetch_zongheng_complete_books(http_get), '纵横完本', finished=True)
+    add_batch(fetch_17k_quanben_books(http_get), '17K完本', finished=True)
+    add_batch(fetch_qimao_rank_books(http_get, QIMAO_OVER_RANKS), '七猫完结榜', finished=True)
+    add_batch(fetch_jjwxc_finish_books(http_get), '晋江完结榜', finished=True)
+    add_batch(_fetch_page(http_get, '红袖[完本页]', HONGXIU_BASE + '/finish', parse_hongxiu_books),
+              '红袖完本', finished=True)
     add_batch(fetch_qidian_rank_books(http_get), '起点榜单')
     # lists1104：原名单源已抽干（每轮候选 0–1 本），补七猫榜单 + 17K 排行榜首页。
     add_batch(fetch_qimao_rank_books(http_get), '七猫榜单')
     add_batch(fetch_17k_top_books(http_get), '17K榜单')
+    add_batch(_fetch_page(http_get, '纵横[排行页]', ZONGHENG_BASE + '/rank', parse_zongheng_rank),
+              '纵横排行')
+    add_batch(_fetch_page(http_get, '潇湘[排行页]', XXSY_BASE + '/rank', parse_xxsy_rank), '潇湘榜单')
+    add_batch(_fetch_page(http_get, '刺猬猫[排行页]', CIWEIMAO_BASE + '/rank-index',
+                          parse_ciweimao_rank), '刺猬猫榜单')
     if include_douban:
         add_batch(fetch_douban_books(http_get, pages=pages), '豆瓣网文tag')
 
-    def resolve(batch: list[dict]) -> list[dict]:
+    def resolve(batch: list[dict], limit: int = 0) -> list[dict]:
         return _resolve_candidates(batch, http_get, skip_titles=skip_titles,
                                    engine_cli=engine_cli, book15_breaker=book15_breaker,
                                    source_policy=source_policy, done_index=done_index,
-                                   engine_miss=engine_miss)
+                                   engine_miss=engine_miss, limit=limit)
 
-    queue = resolve(candidates)
+    ordered = order_completed_first(candidates)
+    finished_n = sum(1 for b in ordered if b.get('finished'))
+    print(f'完结优先: 完结 {finished_n} 本在前、其余 {len(ordered) - finished_n} 本在后'
+          + (f'；本轮入队上限 {queue_max} 本' if queue_max > 0 else ''))
+    queue = resolve(ordered, limit=queue_max)
     if list_cursor is None or deepen_min <= 0 or len(queue) >= deepen_min:
         return queue
     urls = {q.get('url') for q in queue}
-    page = list_cursor.get(LIST_CURSOR_QIMAO)
-    for n in range(LIST_DEEPEN_MAX_PAGES):
-        if n:
+    sources = LIST_DEEP_SOURCES
+    start = (list_cursor.get(LIST_CURSOR_ROTATE) - 1) % len(sources)
+    active = [sources[(start + i) % len(sources)] for i in range(len(sources))]
+    fetched = i = 0
+    while active and fetched < LIST_DEEPEN_MAX_PAGES and len(queue) < deepen_min:
+        src = active[i % len(active)]
+        key, url_fmt, parser, origin = src
+        page = list_cursor.get(key)
+        if fetched:
             time.sleep(LIST_DEEPEN_PAGE_DELAY)
+        fetched += 1
         try:
-            batch = parse_qimao_shuku(http_get(QIMAO_SHUKU_URL.format(page=page)))
+            batch = parser(http_get(url_fmt.format(page=page))) if page <= LIST_DEEPEN_PAGE_CAP else []
         except Exception as e:
-            # 游标不动：下轮从同一页再试
-            print(f'  七猫书库[第 {page} 页] 拉取失败（游标留在本页）: {e}', file=sys.stderr)
-            break
+            # 游标不动：下次轮到它从同一页再试；本次加深不再碰这个站
+            print(f'  {origin}[第 {page} 页] 拉取失败（游标留在本页）: {e}', file=sys.stderr)
+            active.remove(src)
+            continue
         if not batch:
-            print(f'名单加深: 七猫书库第 {page} 页无书 → 游标回到第 1 页')
-            list_cursor.set(LIST_CURSOR_QIMAO, 1)
-            break
-        print(f'名单加深: 队列 {len(queue)} 本 < 下限 {deepen_min}，翻七猫书库第 {page} 页')
-        added = add_batch(batch, '七猫书库')
-        page += 1
-        list_cursor.set(LIST_CURSOR_QIMAO, page)
+            print(f'名单加深: {origin}第 {page} 页无书 → 游标回到第 1 页')
+            if page != 1:
+                list_cursor.set(key, 1)
+            active.remove(src)
+            continue
+        print(f'名单加深: 队列 {len(queue)} 本 < 下限 {deepen_min}，翻{origin}第 {page} 页')
+        added = add_batch(batch, origin, finished=True)
+        list_cursor.set(key, page + 1)
         for q in resolve(added):
             if q.get('url') not in urls:
                 urls.add(q.get('url'))
                 queue.append(q)
-        if len(queue) >= deepen_min:
-            break
+        i += 1
+    nxt = (start + 1) % len(sources) + 1
+    if nxt != list_cursor.get(LIST_CURSOR_ROTATE):
+        list_cursor.set(LIST_CURSOR_ROTATE, nxt)
     return queue

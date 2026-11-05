@@ -72,6 +72,8 @@ class BuildQueueTest(unittest.TestCase):
         if url.startswith(dl.QIMAO_BASE + '/paihang/'):
             if url.endswith('/boy/new/date/'):
                 raise ConnectionError('synthetic down')
+            if url.endswith('/over/date/'):     # plat1105：完结榜单列，测试里给空页
+                return '<html></html>'
             return QIMAO_HTML
         if url == dl.Y17K_BASE + '/top/':
             return Y17K_TOP_HTML
@@ -95,7 +97,7 @@ class BuildQueueTest(unittest.TestCase):
 
     def test_new_sources_feed_candidates_and_one_bad_rank_does_not_sink_the_rest(self):
         candidates = self.build()
-        for rank in dl.QIMAO_RANKS:
+        for rank in dl.QIMAO_RANKS + dl.QIMAO_OVER_RANKS:
             self.assertIn(f'{dl.QIMAO_BASE}/paihang/{rank}/', self.seen)
         self.assertIn(dl.Y17K_BASE + '/top/', self.seen)
         by_title = {c['title']: c['origin'] for c in candidates}
@@ -107,7 +109,10 @@ class BuildQueueTest(unittest.TestCase):
 
 
 class ListDeepenTest(unittest.TestCase):
-    """listdeep1105：固定名单打干后，队列不足下限就按游标翻七猫书库，游标跨轮只进不退。"""
+    """listdeep1105：固定名单打干后，队列不足下限就按游标翻七猫书库，游标跨轮只进不退。
+
+    plat1105 起加深名单是多平台轮转（见 test_labeler_plat1105）；这里把名单固定为只有七猫书库，
+    单独验证单个名单的翻页/游标语义。"""
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
@@ -137,6 +142,7 @@ class ListDeepenTest(unittest.TestCase):
 
         with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(self.out), \
                 mock.patch.object(dl, '_resolve_candidates', fake_resolve), \
+                mock.patch.object(dl, 'LIST_DEEP_SOURCES', dl.LIST_DEEP_SOURCES[:1]), \
                 mock.patch.object(dl, 'LIST_DEEPEN_PAGE_DELAY', 0):
             return dl.build_webnovel_queue(self.http_get, include_douban=False,
                                            list_cursor=cursor, deepen_min=deepen_min)
@@ -206,6 +212,7 @@ class ListDeepenTest(unittest.TestCase):
         with contextlib.redirect_stdout(self.out), \
                 mock.patch.object(dl, '_resolve_candidates', fake_resolve), \
                 mock.patch.object(dl, 'LIST_DEEPEN_PAGE_DELAY', 0), \
+                mock.patch.object(dl, 'LIST_DEEP_SOURCES', dl.LIST_DEEP_SOURCES[:1]), \
                 mock.patch.object(dl, 'LIST_DEEPEN_MAX_PAGES', 1):
             dl.build_webnovel_queue(http_get, include_douban=False,
                                     list_cursor=dl.ListCursor(self.cursor_path), deepen_min=3)
