@@ -70,6 +70,19 @@ EXIT_COMPANION_TOO_OLD = 5   # 配套文件版本不匹配：fail-closed（0/1/2
 # 「探测→重启」循环，每圈白烧 25 万字段探测。
 EXIT_IDLE = 6
 IDLE_EXIT_ENV = 'LABELER_EXIT_IDLE'
+# srcfail1105：细分退出码，仅当调用方在进程环境设 DETAIL_EXIT_ENV=1 才启用（gatekeeper 会设；手动跑、
+# 旧门卫不设 ⇒ 照旧 0/1/2，opt-in 理由同 EXIT_IDLE）。旧口径「整轮零成功 ⇒ 2 ⇒ 渠道坏」把书源失效也记到
+# 渠道头上：2026-11-03～05 名单只剩几本只有死源的书，每轮 0 成功（失败分类全是「源失效放弃」，模型一次没调），
+# 门卫每圈回去做 PASS_N × 整链 25 万字段探测——三天 423 次、标价约 $6700，同期真打标约 $1200。
+#   EXIT_SOURCE_ONLY：零成功且没有一本失败在模型链上（书源/身份/取文问题）——渠道未被证坏，门卫待机后直接试跑。
+#   EXIT_PARTIAL：有成功也有失败——本轮已证渠道可用，门卫不探测。
+#   2 只留给「模型链真的耗尽过」：零成功且含 LLM链耗尽，或连续 LLM_FAIL_BREAK 本耗尽而提前收轮。
+EXIT_SOURCE_ONLY = 7
+EXIT_PARTIAL = 8
+DETAIL_EXIT_ENV = 'LABELER_EXIT_DETAIL'
+# 坏窗口熔断（同 opt-in）：门卫不再每轮先探测后，坏窗口由 labeler 自己尽快发现——连续这么多本模型链耗尽
+# （中间夹的书源失败不清零，只有成功打标清零）即收轮退 2，门卫回去探测等窗口。
+LLM_FAIL_BREAK = 2
 REQUIRED_DOUBAN_LIST_API = (
     'Book15Breaker', 'CONTENT_TOC_MIN_MATCH', 'CONTENT_TOC_MIN_NAME_CHARS', 'ENGINE_CLI_TIMEOUT',
     'ENGINE_MISS_FILENAME', 'EngineCli', 'EngineMissMemo', 'EngineUnavailable',
@@ -4323,6 +4336,9 @@ def main() -> int:
         with open(data_path('labels-stub.jsonl'), 'a', encoding='utf-8') as f:
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
+    detail_exit = os.environ.get(DETAIL_EXIT_ENV) == '1'
+    llm_streak = 0          # srcfail1105：连续模型链耗尽本数（成功清零，书源失败不清零）
+    llm_tripped = False
     for i, b in enumerate(queue, 1):
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         fetch_stats: dict = {}      # 引擎取文统计（lbladfix41：跳过的公告条目 / 试读章数）
@@ -4566,6 +4582,7 @@ def main() -> int:
             with open(out_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(b_out, ensure_ascii=False) + '\n')
             ok += 1
+            llm_streak = 0
             # 即时导入书库。import_record 内部吞掉所有异常并记 fail log，
             # 这里的 try/except 只是最后一道保险：导入问题绝不能让打标循环中断。
             if importer is not None and importer.enabled:
@@ -4611,18 +4628,32 @@ def main() -> int:
         except Exception as e:
             print(f'  失败: {e}', file=sys.stderr)
             fail += 1
-            count_failure(classify_failure(e))
+            failure_kind = classify_failure(e)
+            count_failure(failure_kind)
+            if failure_kind == 'LLM链耗尽':
+                llm_streak += 1
+                if detail_exit and llm_streak >= LLM_FAIL_BREAK:
+                    print(f'  连续 {llm_streak} 本模型链耗尽：渠道疑似转坏，提前收轮'
+                          f'（余 {len(queue) - i} 本下轮再跑）')
+                    llm_tripped = True
+                    break
         time.sleep(LLM_INTERVAL_SEC)
     print(f'\n完成: 成功 {ok} / 失败 {fail} / 残本候选跳过 {stub_skipped}，结果在 labels.jsonl')
     if fail:
         print(format_failure_kinds(fail_kinds))
     # exit 2 = 整轮零成功（渠道坏，门卫据此回等待窗口）；1 = 部分失败；0 = 全成功；
-    # EXIT_IDLE = 空队列且调用方 opt-in（见常量处）
+    # EXIT_IDLE = 空队列且调用方 opt-in；EXIT_SOURCE_ONLY / EXIT_PARTIAL / 熔断 = srcfail1105 opt-in（见常量处）
     if not queue and os.environ.get(IDLE_EXIT_ENV) == '1':
         return EXIT_IDLE
-    if ok == 0 and fail > 0:
+    if llm_tripped:
         return 2
-    return 0 if fail == 0 else 1
+    if ok == 0 and fail > 0:
+        if detail_exit and not fail_kinds.get('LLM链耗尽'):
+            return EXIT_SOURCE_ONLY
+        return 2
+    if fail == 0:
+        return 0
+    return EXIT_PARTIAL if detail_exit else 1
 
 
 if __name__ == '__main__':

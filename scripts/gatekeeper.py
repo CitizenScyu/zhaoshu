@@ -41,6 +41,10 @@ IDLE_EXIT_ENV = 'LABELER_EXIT_IDLE'
 # 空队列后待机多久再试跑。名单源抽干后每轮 0 本（2026-11-04 生产实测），旧逻辑照样每圈
 # 「睡 10 分钟 + PASS_N 次整链 25 万字段探测」——不调模型就能知道没活干，探测纯属白烧。
 IDLE_SLEEP = 3600
+# srcfail1105（语义见 labeler.EXIT_SOURCE_ONLY 处；字面值理由同 EXIT_IDLE）。
+EXIT_SOURCE_ONLY = 7
+EXIT_PARTIAL = 8
+DETAIL_EXIT_ENV = 'LABELER_EXIT_DETAIL'
 # 探测链要不要带上数据库 app_settings.label_model（链首）？labeler 启动时走
 # `resolve_models(env, use_db=not args.no_db_model)`，而 LABELER_CMD 未带 `--no-db-model`，
 # 所以 labeler 实际 use_db=True。门卫探测必须用同一条链，否则「探测的就是要跑的」不成立
@@ -175,10 +179,30 @@ def launch_labeler() -> int:
     两处各补一遍的写法迟早漏掉一处，而漏掉的那处正好是没人测的那处（本仓已有先例）。"""
     t0 = time.time()
     # opt-in 空队列退出码（见 labeler.EXIT_IDLE）；旧 labeler 不认这个变量，照旧返回 0。
-    r = subprocess.run(LABELER_CMD, cwd=str(DIR), env={**os.environ, IDLE_EXIT_ENV: '1'})
+    r = subprocess.run(LABELER_CMD, cwd=str(DIR),
+                       env={**os.environ, IDLE_EXIT_ENV: '1', DETAIL_EXIT_ENV: '1'})
     mins = (time.time() - t0) / 60
     print(f'labeler 退出: code={r.returncode} 用时 {mins:.0f} 分钟', flush=True)
     return r.returncode
+
+
+def standby_after(code: int) -> tuple[int, str] | None:
+    """labeler 退出码 → (待机秒数, 日志标签)：待机后直接试跑、不探测。None = 不待机（2 回等窗口，异常走恢复分支）。
+
+    srcfail1105 设计原则：labeler 自己跑的一轮就是最真实的探测。只有它报出模型链耗尽（2）或异常退出，
+    门卫才回去做整链 25 万字段探测；跑完/部分失败（本轮已证渠道可用）、书源失败（模型未失败）、
+    空队列都直接待机后再跑。坏窗口由 labeler 的连续耗尽熔断（LLM_FAIL_BREAK）兜住。
+    两处启动点共用本函数，理由同 launch_labeler。"""
+    if code == EXIT_IDLE:
+        print('本轮无待打标条目', flush=True)
+        return IDLE_SLEEP, '空队列'
+    if code == EXIT_SOURCE_ONLY:
+        print('整轮零成功，但失败全在书源/取文、模型链未失败：不判渠道坏', flush=True)
+        return IDLE_SLEEP, '书源失败'
+    if code in (0, EXIT_PARTIAL):
+        print('一轮跑完（本轮已证渠道可用），下一轮不探测', flush=True)
+        return PROBE_INTERVAL, '一轮跑完'
+    return None
 
 
 def stop_on_companion_mismatch() -> int:
@@ -239,16 +263,17 @@ def main() -> int:
     print(f'探测模型链来源: {src_key} -> {",".join(models)}', flush=True)
     consecutive_ok = 0
     round_no = 0
-    idle = False
+    standby: tuple[int, str] | None = None
     while True:
         round_no += 1
-        if idle:
-            # 上轮空队列：待机后直接试跑、不探测。有书而渠道坏时 labeler 自己以 2 退出，
-            # 下一圈照常回到等窗口；名单源抽干期间每圈省 PASS_N 次整链探测。
-            idle = False
-            print(f'== 空队列待机 {IDLE_SLEEP // 60} 分钟后直接试跑（round {round_no}，不探测）==',
+        if standby is not None:
+            # 上轮无需判渠道（见 standby_after）：待机后直接试跑、不探测。渠道真坏时 labeler 自己以 2 退出，
+            # 下一圈照常回到等窗口。
+            secs, tag = standby
+            standby = None
+            print(f'== {tag}待机 {secs // 60} 分钟后直接试跑（round {round_no}，不探测）==',
                   flush=True)
-            time.sleep(IDLE_SLEEP)
+            time.sleep(secs)
         else:
             print(f'== 等待好窗口（round {round_no}）==', flush=True)
             consecutive_ok = 0
@@ -267,18 +292,12 @@ def main() -> int:
         code = launch_labeler()
         if code == EXIT_COMPANION_TOO_OLD:
             return stop_on_companion_mismatch()
-        if code == EXIT_IDLE:
-            print('本轮无待打标条目', flush=True)
-            idle = True
-            continue
-        if code == 0:
-            # 正常跑完一轮；继续下一轮（断点续传会跳过已完成的）
-            print('一轮跑完，10 分钟后探测下一轮', flush=True)
-            time.sleep(PROBE_INTERVAL)
+        standby = standby_after(code)
+        if standby is not None:
             continue
         if code == 2:
-            # 整轮零成功：渠道已转坏，不空转，直接回等待窗口
-            print('整轮零成功（渠道转坏），回到等待窗口', flush=True)
+            # 模型链耗尽（整轮零成功或连续耗尽熔断）：渠道已转坏，不空转，直接回等待窗口
+            print('模型链耗尽（渠道转坏），回到等待窗口', flush=True)
             continue
         # 异常退出：渠道活着就真的重启 labeler（再异常则继续本循环处理），
         # 连挂 FAIL_M 次探测才回等待窗口
@@ -296,9 +315,8 @@ def main() -> int:
             code = launch_labeler()
             if code == EXIT_COMPANION_TOO_OLD:
                 return stop_on_companion_mismatch()
-            if code == EXIT_IDLE:
-                idle = True
-            if code in (0, 2, EXIT_IDLE):
+            standby = standby_after(code)
+            if standby is not None or code == 2:
                 break
 
 

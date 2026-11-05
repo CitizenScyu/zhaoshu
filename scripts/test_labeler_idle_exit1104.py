@@ -96,12 +96,13 @@ class GatekeeperIdleTest(unittest.TestCase):
         self.assertEqual(events, self.window() + ['run', idle, 'run', idle])
         self.assertIn('空队列待机', out)
 
-    def test_work_after_idle_goes_back_to_probing(self):
+    def test_work_after_idle_reruns_without_probing(self):
+        # srcfail1105：跑完一轮（0）已证渠道可用，下一轮不再探测（旧口径回到探测，见 test_labeler_srcfail1105）
         events, _ = self._main([gatekeeper.EXIT_IDLE, 0])
         self.assertEqual(
             events,
             self.window() + ['run', f'sleep:{gatekeeper.IDLE_SLEEP}', 'run',
-                             f'sleep:{gatekeeper.PROBE_INTERVAL}'] + self.window())
+                             f'sleep:{gatekeeper.PROBE_INTERVAL}'])
 
     def test_idle_in_recovery_branch_also_idles(self):
         events, _ = self._main([1, gatekeeper.EXIT_IDLE])
