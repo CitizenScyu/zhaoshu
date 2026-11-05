@@ -1,6 +1,6 @@
 // 共用选源器单元层（不连库、不联网）：扫描上限与早停、排除口径（URL 精确 / host 快照）、
 // 身份判据与每源详情上限、停止语义（caller abort / 预算耗尽 / 池失败）、无持久化入口与日志脱敏。
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createSourceSelector, type SourceSelectionRequest } from './source-selector';
 import type { ScanMissMemo } from './scan-miss-memo';
 
@@ -14,7 +14,8 @@ type Detail = { title?: string; author?: string };
 function harness(opts: {
   pool?: string[];
   poolThrows?: 'sync' | 'async';
-  search?: (url: string, key: string) => Hit[] | Promise<Hit[]>;
+  search?: (url: string, key: string, ctx: { page(u: string): Promise<unknown> }) => Hit[] | Promise<Hit[]>;
+  transport?: (url: string) => Promise<{ url: string; text: string }>;
   detail?: (bookUrl: string) => Detail;
   suspect?: string[];
   builtinHosts?: string[];
@@ -44,10 +45,10 @@ function harness(opts: {
       supported: { BUILTIN_SOURCE_HOSTS: opts.builtinHosts ?? ['book15.net', 'www.book15.net'] },
       api: {
         // 非 async：让 search 能同步 throw（穿透到 sourceHasBook 成 rejection）。
-        engineSearchBook: (engine: { url: string }, key: string) => {
+        engineSearchBook: (engine: { url: string }, key: string, ctx: { page(u: string): Promise<unknown> }) => {
           searchedUrls.push(engine.url);
           searchKeys.push(key);
-          return opts.search?.(engine.url, key) ?? [{ title: TASK.title, author: TASK.author, bookUrl: `${engine.url}b/1` }];
+          return opts.search?.(engine.url, key, ctx) ?? [{ title: TASK.title, author: TASK.author, bookUrl: `${engine.url}b/1` }];
         },
         engineFetchDetail: (_engine: unknown, bookUrl: string) => {
           detailUrls.push(bookUrl);
@@ -55,7 +56,7 @@ function harness(opts: {
         },
       },
     },
-    transport: async () => { throw new Error('unused'); },
+    transport: opts.transport ?? (async () => { throw new Error('unused'); }),
     loadPool: () => {
       poolLoads.push(1);
       if (opts.poolThrows === 'sync') throw new Error('pool sync down');
@@ -941,5 +942,37 @@ describe('共用选源器', () => {
       expect(result.picked).toEqual(['https://a.example/']);
       expect(result.scanned).toBe(3);
     });
+  });
+});
+
+describe('searchredir1105：搜索跳转落地页', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const pool = ['https://r.example/'];
+  const landed = 'https://r.example/59_1/';
+  const redirecting = async () => ({ url: landed, text: '' });
+  const search = async (url: string, _key: string, ctx: { page(u: string): Promise<unknown> }) => { await ctx.page(`${url}index.php?k=1`); return []; };
+
+  it('开：落地页详情身份对上 ⇒ 选中；详情只核落地页', async () => {
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    const h = harness({ pool, search, transport: redirecting });
+    const result = await h.selector(request(), freshSignal());
+    expect(result.picked).toHaveLength(1);
+    expect(h.detailUrls).toEqual([landed]);
+  });
+
+  it('开：落地页对不上 ⇒ 回到 response_path_mismatch，不走作者轮、不算没书', async () => {
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    const h = harness({ pool, search, transport: redirecting, detail: () => ({ title: '首页', author: '' }) });
+    const result = await h.selector(request(), freshSignal());
+    expect(result.picked).toEqual([]);
+    expect(h.searchKeys).toHaveLength(1);
+    expect(JSON.stringify(h.logs.find(l => l.message === '选源完成')?.fields)).toContain('response_path_mismatch');
+  });
+
+  it('关：照旧 response_path_mismatch，不取详情', async () => {
+    const h = harness({ pool, search, transport: redirecting });
+    const result = await h.selector(request(), freshSignal());
+    expect(result.picked).toEqual([]);
+    expect(h.detailUrls).toEqual([]);
   });
 });

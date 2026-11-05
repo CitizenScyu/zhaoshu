@@ -17,7 +17,7 @@
 // - 其余（源解析失败、未归类错误、4xx、逐请求超时、预检墙钟用尽、候选超过
 //   MAX_PRECHECK_CANDIDATES 且前面的都对不上）⇒ { ok: true, reason: 'identity_unverified' }，放行，由下载器按原路径处理。
 
-import { identityMatches, isSourceUnavailableError, pageFetchOptions, postRedirectAllowed } from '../scripts/engine-download.mjs';
+import { checkPagePath, identityMatches, isSourceUnavailableError, pageFetchOptions, rejectLanding, withLanding } from '../scripts/engine-download.mjs';
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
 import { sourceBookMatches } from '../src/lib/source-parser';
 import { sourceAbortable, type SourcePageRequest } from '../src/lib/source-fetch';
@@ -72,8 +72,9 @@ export const MAX_PRECHECK_CANDIDATES = 50;
 /**
  * 搜索/详情请求用的最小请求上下文（{ signal, page }）：走执行器共享 transport。与下载器 operation() 同口径：
  * 逐请求超时以 operation_timeout 中止（不算书源不可达），响应路径被改写视为失败。builtin-fallback 选源共用。
+ * landing（searchredir1105）：只有引擎搜索传；DOWNLOAD_SEARCH_REDIRECT=1 时跳转落地页记在这里放行（见 checkPagePath）。
  */
-export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs: number) {
+export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs: number, landing?: { url?: string }) {
   return {
     signal,
     page: async (url: string, pageOptions?: PageOptions) => {
@@ -81,7 +82,7 @@ export function pageContext(transport: Transport, signal: AbortSignal, timeoutMs
       const timer = setTimeout(() => local.abort(new Error('operation_timeout')), timeoutMs);
       try {
         const page = await transport(url, { ...pageFetchOptions(pageOptions), signal: AbortSignal.any([signal, local.signal]), timeoutMs });
-        if (!postRedirectAllowed(pageOptions) && new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
+        checkPagePath(page, url, pageOptions, landing);
         return page;
       } finally {
         clearTimeout(timer);
@@ -122,13 +123,16 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
 
     progress.stage = 'search';
     let candidates: Candidate[];
+    const titleLanding: { url?: string } = {};
     if (builtin) {
       const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, keys.title, source.url));
       candidates = m.parser.parseSourceSearch(page.text, page.url, keys.title).map(bookUrl => ({ bookUrl }));
     } else {
-      candidates = await m.api.engineSearchBook(engine, keys.title, ctx);
+      candidates = withLanding(await m.api.engineSearchBook(engine, keys.title, pageContext(transport, signal, timeoutMs, titleLanding)), titleLanding);
     }
     if (await matchesAny(candidates)) return true;
+    progress.stage = 'search';
+    rejectLanding(titleLanding);
     // 超过上限没看完就不下结论，也不再补搜：搜索本来就不完整时加一轮作者，只会把「没看完」伪装成
     // 「都看过且都对不上」，把放行变成错拦。
     if (candidates.length > MAX_PRECHECK_CANDIDATES) return null;
@@ -146,6 +150,7 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
     if (titleMatched) return false;
     progress.stage = 'search';
     let authorCandidates: Candidate[];
+    const authorLanding: { url?: string } = {};
     if (builtin) {
       const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, keys.author, source.url));
       const urls = /^\/books\/details\d+\.html$/.test(new URL(page.url).pathname)
@@ -153,14 +158,18 @@ export function createIdentityPrecheck(options: IdentityPrecheckOptions): Preche
         : m.parser.parseSourceDetailLinks(page.text, page.url, keys.title);
       authorCandidates = urls.map(bookUrl => ({ bookUrl }));
     } else {
-      authorCandidates = await m.api.engineSearchBook(engine, keys.author, ctx);
+      authorCandidates = withLanding(await m.api.engineSearchBook(engine, keys.author, pageContext(transport, signal, timeoutMs, authorLanding)), authorLanding);
     }
     // B′ 门（与选源器、下载腿共用 authorBridgeAccepts）：候选按 bookUrl 去重后须恰好 1 条，
     // 且该条详情页作者门逐字对上。候选 >1（同作者多本）判不命中——没有书名证据时认哪一本都是猜。
     const authorHits = authorBridgeCandidates(authorCandidates);
-    if (authorHits.length !== 1) return false;
-    progress.stage = 'detail';
-    return authorBridgeAccepts(authorHits, await detailOf(authorHits[0]), task);
+    if (authorHits.length === 1) {
+      progress.stage = 'detail';
+      if (authorBridgeAccepts(authorHits, await detailOf(authorHits[0]), task)) return true;
+    }
+    progress.stage = 'search';
+    rejectLanding(authorLanding);
+    return false;
   };
 
   return async (task, signal): Promise<PrecheckResult> => {

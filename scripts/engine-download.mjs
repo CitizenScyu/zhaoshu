@@ -360,6 +360,30 @@ export function postRedirectAllowed(opts, env = process.env) {
   return env.DOWNLOAD_POST_REDIRECT?.trim() === '1' && pageFetchOptions(opts, env).request?.method === 'POST';
 }
 
+// searchredir1105：DOWNLOAD_SEARCH_REDIRECT=1 时，引擎书名/作者搜索的 GET 取页跳到同站别的路径先不判 response_path_mismatch，记下落地页。
+// 笔趣阁系站点搜索唯一命中时直接 302 到该书详情页（legado 搜索列表为空时按详情页处理；2026-11-05 pc-linux 实网：www.biqusan.com 搜
+// 「北派盗墓笔记」/index.php → /59_59848/，详情解析出书名/作者），B 线原先整源判失败——丢的恰是「站里有且只有这本」的命中。
+// 解析出列表 = 落地页是结果列表，照常用；列表为空 = 落地页当一条候选交详情身份门。只认正向结果：本轮没选中书（跳到首页/风控页/别的书）
+// 由 rejectLanding 回到原判 response_path_mismatch，不落成「这个源没书」的记忆。只有传了 landing 记录器的搜索取页放行；
+// 详情/目录/正文的路径绑定（page-book binding）不变，每跳 Location 照旧过 host/HTTPS 锁。
+const searchRedirectEnabled = (env = process.env) => env.DOWNLOAD_SEARCH_REDIRECT?.trim() === '1';
+
+/** 取页路径检查（下载腿 operation 与 pageContext 共用）：路径被改写即 response_path_mismatch，POST 搜索落地页与搜索跳转落地页除外。 */
+export function checkPagePath(page, url, pageOptions, landing) {
+  if (postRedirectAllowed(pageOptions) || new URL(page.url).pathname === new URL(url).pathname) return;
+  if (!landing || !searchRedirectEnabled()) throw new Error('response_path_mismatch');
+  landing.url = page.url;
+}
+
+/** 搜索结果为空且发生过跳转：落地页作为唯一候选（landed 标记免书名过滤）。 */
+export const withLanding = (candidates, landing) =>
+  landing?.url && !candidates.length ? [{ bookUrl: landing.url, landed: true }] : candidates;
+
+/** 本轮搜索发生过跳转、却没选中书：回到原判。 */
+export function rejectLanding(landing) {
+  if (landing?.url) throw new Error('response_path_mismatch');
+}
+
 export async function downloadBook(m, args, resolveSource, transport = fetchSourceText, hooks = {}) {
   const dir = resolve(args.out ?? 'engine-download', hash(args.source + canonicalBookKey(args.title, args.author)).slice(0, 24));
   mkdirSync(dir, { recursive: true });
@@ -419,7 +443,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     }
     await hooks.onProgress?.({ chaptersDone: manifest.chapters_done, chaptersTotal: manifest.chapters_total ?? manifest.chapters.length, charsTotal: manifest.chars });
   };
-  const operation = async fn => {
+  const operation = async (fn, landing) => {
     const local = new AbortController();
     const timeout = setTimeout(() => local.abort(new Error('operation_timeout')), args['timeout-ms']);
     const signal = AbortSignal.any([controller.signal, local.signal]);
@@ -433,7 +457,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       nextAt = Math.max(nextAt, Date.now() + args['rate-ms']);
       burstCount++;
       } });
-      if (!postRedirectAllowed(pageOptions) && new URL(page.url).pathname !== new URL(url).pathname) throw new Error('response_path_mismatch');
+      checkPagePath(page, url, pageOptions, landing);
       return page;
     } };
     try { signal.throwIfAborted(); return await sourceAbortable(Promise.resolve().then(() => fn(context)), signal); }
@@ -451,11 +475,12 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // identityMatches 仍用任务原值（args.title/args.author）——搜索词是「怎么找候选」，比对是「是不是这本书」。
     const searchKeys = searchKeysOf({ title: args.title, author: args.author });
     stage = 'search';
-    const candidates = await operation(async ctx => {
+    const titleLanding = builtin ? undefined : {};
+    const candidates = withLanding(await operation(async ctx => {
       if (!builtin) return m.api.engineSearchBook(engine, searchKeys.title, ctx);
       const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, searchKeys.title, source.url));
       return m.parser.parseSourceSearch(page.text, page.url, searchKeys.title).map(bookUrl => ({ bookUrl }));
-    });
+    }, titleLanding), titleLanding);
     let selected;
     stage = 'detail';
     for (const candidate of candidates) {
@@ -467,6 +492,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       });
       if (identityMatches(detail, candidate, args)) { selected = { ...candidate, ...detail }; break; }
     }
+    if (!selected) { stage = 'search'; rejectLanding(titleLanding); }
     // authbridge42：书名候选全被拒后的作者名回退轮。QQ 系书在镜像站按通行书名收录（队列名「少年羽皇」
     // vs 站名「帝临鸿蒙」），书名搜索天然失配 → 下载腿会把选源已命中的源又判成 0 候选
     // （identity_mismatch_or_no_candidate → markFailure 淘汰），选源/预检的改动就白烧出网。
@@ -475,14 +501,15 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     // 候选 >1（同作者多本，如 shidaxiaoshuo「魏风华」3 本诡事录系列）判不命中——没有书名证据时认哪一本都是猜。
     if (!selected && authorSearchKey(args.title, args.author)) {
       stage = 'search';
-      const authorHits = authorBridgeCandidates(await operation(async ctx => {
+      const authorLanding = builtin ? undefined : {};
+      const authorHits = authorBridgeCandidates(withLanding(await operation(async ctx => {
         if (!builtin) return m.api.engineSearchBook(engine, searchKeys.author, ctx);
         const page = await ctx.page(m.parser.sourceSearchUrl(source.searchUrl, searchKeys.author, source.url));
         const urls = /^\/books\/details\d+\.html$/.test(new URL(page.url).pathname)
           ? [page.url]
           : m.parser.parseSourceDetailLinks(page.text, page.url, searchKeys.title);
         return urls.map(bookUrl => ({ bookUrl }));
-      }));
+      }, authorLanding), authorLanding));
       if (authorHits.length === 1) {
         stage = 'detail';
         const detail = await operation(async ctx => {
@@ -491,6 +518,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         });
         if (authorBridgeAccepts(authorHits, detail, args)) selected = { ...authorHits[0], ...detail };
       }
+      if (!selected) { stage = 'search'; rejectLanding(authorLanding); }
     }
     if (!selected) throw new Error('identity_mismatch_or_no_candidate');
     manifest.bookUrl = selected.bookUrl;

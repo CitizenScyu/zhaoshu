@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, checkPagePath, rejectLanding, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -1679,5 +1679,74 @@ describe('postredir1105：POST 搜索跳转落地页不判路径改写', () => {
       (async (url: string) => ({ url: url.replace(/\/(e\/search\/index\.php|search\?k=1)$/, '/search/result-1-0.html'), text: '' })) as never);
     expect(outcomes).toEqual([allowed ? 'ok' : 'response_path_mismatch', 'response_path_mismatch']);
     vi.unstubAllEnvs();
+  });
+});
+
+describe('searchredir1105：搜索跳转落地页交详情身份门', () => {
+  const landed = 'https://book15.net/59_59848/';
+  const searchUrl = 'https://book15.net/index.php?k=1';
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('checkPagePath：只有开关开且传了 landing 才放行并记落地页；同路径恒放行', () => {
+    const landing: { url?: string } = {};
+    expect(() => checkPagePath({ url: landed }, searchUrl, undefined, landing)).toThrow('response_path_mismatch');
+    expect(landing.url).toBeUndefined();
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    expect(() => checkPagePath({ url: landed }, searchUrl, undefined, undefined)).toThrow('response_path_mismatch');
+    checkPagePath({ url: landed }, searchUrl, undefined, landing);
+    expect(landing.url).toBe(landed);
+    const untouched: { url?: string } = {};
+    checkPagePath({ url: searchUrl }, searchUrl, undefined, untouched);
+    expect(untouched.url).toBeUndefined();
+  });
+
+  it('withLanding / rejectLanding：列表为空才用落地页；有落地才回原判', () => {
+    const list = [{ bookUrl: 'https://a/1' }];
+    expect(withLanding(list, { url: landed })).toBe(list);
+    expect(withLanding(list, {})).toBe(list);
+    expect(withLanding([], undefined)).toEqual([]);
+    expect(withLanding([], { url: landed })).toEqual([{ bookUrl: landed, landed: true }]);
+    expect(() => rejectLanding({})).not.toThrow();
+    expect(() => rejectLanding(undefined)).not.toThrow();
+    expect(() => rejectLanding({ url: landed })).toThrow('response_path_mismatch');
+  });
+
+  // 书名搜索 /search?q= 直跳详情；详情页身份由 fixture 决定（failure='identity' 时作者不对）。
+  const redirecting = (f: ReturnType<typeof setup>) => (async (url: string, opts: never) => {
+    const page = await (f.transport as (u: string, o: never) => Promise<{ url: string; text: string }>)(url.includes('/search') ? 'https://book15.net/books/details1.html' : url, opts);
+    return { ...page, url: url.includes('/search') ? 'https://book15.net/books/details1.html' : page.url };
+  }) as never;
+
+  it('开：直跳详情且身份对上 ⇒ 选中落地页跑完全书', async () => {
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    const f = setup(0);
+    const result = await downloadBook({ api, compile, parser }, f.options, async () => ({ source: f.source, builtin: false }), redirecting(f));
+    expect(result.code).toBe(0);
+    expect((result.manifest as Record<string, unknown>).bookUrl).toBe('https://book15.net/books/details1.html');
+    expect(result.manifest.chapters.every((c: { status: string }) => c.status === 'done')).toBe(true);
+  });
+
+  it('开：落地页身份对不上 ⇒ 回到原判 response_path_mismatch；关：照旧', async () => {
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    const wrong = setup(0, 'identity');
+    const onResult = await downloadBook({ api, compile, parser }, wrong.options, async () => ({ source: wrong.source, builtin: false }), redirecting(wrong));
+    // response_path_mismatch 不在下载腿白名单：落 download_failed + 阶段 search（与关开关同形）。
+    expect(onResult.manifest).toMatchObject({ errors: ['download_failed'], failure_phase: 'search' });
+    vi.unstubAllEnvs();
+    const off = setup(0);
+    const offResult = await downloadBook({ api, compile, parser }, off.options, async () => ({ source: off.source, builtin: false }), redirecting(off));
+    expect(offResult.manifest).toMatchObject({ errors: ['download_failed'], failure_phase: 'search' });
+    expect((offResult.manifest as Record<string, unknown>).bookUrl).toBeUndefined();
+  });
+
+  it('详情阶段的跳转不放行（记录器只给搜索）', async () => {
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    const f = setup(0);
+    const moved = (async (url: string, opts: never) => {
+      const page = await (f.transport as (u: string, o: never) => Promise<{ url: string; text: string }>)(url, opts);
+      return url.endsWith('details1.html') ? { ...page, url: landed } : page;
+    }) as never;
+    const result = await downloadBook({ api, compile, parser }, f.options, async () => ({ source: f.source, builtin: false }), moved);
+    expect(result.manifest).toMatchObject({ errors: ['download_failed'], failure_phase: 'detail' });
   });
 });

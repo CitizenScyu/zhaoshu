@@ -1,4 +1,4 @@
-import { errorKindOf, identityMatches } from '../scripts/engine-download.mjs';
+import { errorKindOf, identityMatches, rejectLanding, withLanding } from '../scripts/engine-download.mjs';
 import { normalizeBookTitle } from '../src/lib/book-identity';
 import { authorBridgeAccepts, authorBridgeCandidates, authorSearchKey } from '../src/lib/source-author-bridge';
 import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
@@ -8,7 +8,7 @@ import { pageContext, type Transport } from './identity-precheck';
 import type { ScanMissMemo } from './scan-miss-memo';
 
 type Identity = { title?: string; author?: string };
-type SearchHit = { title?: string; author?: string; bookUrl: string; book?: unknown; vars?: unknown };
+type SearchHit = { title?: string; author?: string; bookUrl: string; book?: unknown; vars?: unknown; landed?: boolean };
 
 export type SourceSelectionTask = { id: number; title: string; author: string };
 export interface PoolSource { url: string; name: string; searchUrl: unknown; rules?: unknown }
@@ -204,24 +204,33 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
     // 后续身份比对（identityMatches → sourceBookMatches）仍吃任务原值，判等口径不变。
     const keys = searchKeysOf(task);
     const titleKeys = new Set([normalizeBookTitle(keys.title), normalizeBookTitle(task.title)]);
-    const hits = (await modules.api.engineSearchBook(engine, keys.title, context)).filter(hit =>
+    // searchredir1105：搜索跳转落地页（唯一命中直跳详情）不带书名，免书名直等过滤，交详情身份门；对不上回到原判。
+    const titleLanding: { url?: string } = {};
+    const found: SearchHit[] = withLanding(await modules.api.engineSearchBook(engine, keys.title, pageContext(transport, signal, timeoutMs, titleLanding)), titleLanding);
+    const hits = found.filter(hit => hit.landed || (
       typeof hit.title === 'string' && titleKeys.has(normalizeBookTitle(hit.title))
-      && (!hit.author?.trim() || identityMatches(hit, hit, task)));
+      && (!hit.author?.trim() || identityMatches(hit, hit, task))));
     for (const hit of hits.slice(0, 2)) {
       signal.throwIfAborted();
       if (identityMatches(await modules.api.engineFetchDetail(engine, hit.bookUrl, context, hit.book, hit.vars), hit, task)) return true;
     }
+    rejectLanding(titleLanding);
     if (hits.length) return false;
     if (!authorSearchKey(task.title, task.author)) return false;
     // 搜索本身不 catch：宿主占用门失效（HOST_OCCUPANCY_UNAVAILABLE）必须照旧上抛 fail-closed，
     // 被这里吞掉会变成「这个源没书」而继续扫全池。
-    const authorHits = authorBridgeCandidates(await modules.api.engineSearchBook(engine, keys.author, context));
+    const authorLanding: { url?: string } = {};
+    const authorFound: SearchHit[] = withLanding(await modules.api.engineSearchBook(engine, keys.author, pageContext(transport, signal, timeoutMs, authorLanding)), authorLanding);
+    const authorHits = authorBridgeCandidates(authorFound);
     // B′ 门要求候选唯一 ⇒ 至多核 1 条详情。候选 >1（同作者多本）直接判这个源没书：
     // 没有书名证据时认哪一本都是猜，错配一本比 0 命中坏得多。
-    if (authorHits.length !== 1) return false;
-    signal.throwIfAborted();
-    const detail = await modules.api.engineFetchDetail(engine, authorHits[0].bookUrl, context, authorHits[0].book, authorHits[0].vars);
-    return authorBridgeAccepts(authorHits, detail, task);
+    if (authorHits.length === 1) {
+      signal.throwIfAborted();
+      const detail = await modules.api.engineFetchDetail(engine, authorHits[0].bookUrl, context, authorHits[0].book, authorHits[0].vars);
+      if (authorBridgeAccepts(authorHits, detail, task)) return true;
+    }
+    rejectLanding(authorLanding);
+    return false;
   };
 
   return async (request, signal) => {

@@ -291,3 +291,44 @@ describe('pageopts1105：pageContext 透传取页覆写', () => {
     await expect(context.page('https://a.example/s?k=1', { responseCharset: 'auto' })).rejects.toThrow('response_path_mismatch');
   });
 });
+
+describe('searchredir1105：pageContext 搜索跳转落地', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const transport = async () => ({ url: 'https://a.example/59_59848/', text: '' });
+
+  it('开且传 landing：记落地页放行；不传 landing（详情/目录/正文）照旧拒', async () => {
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    const landing: { url?: string } = {};
+    await expect(pageContext(transport, new AbortController().signal, 1000, landing).page('https://a.example/index.php?k=1')).resolves.toBeDefined();
+    expect(landing.url).toBe('https://a.example/59_59848/');
+    await expect(pageContext(transport, new AbortController().signal, 1000).page('https://a.example/index.php?k=1')).rejects.toThrow('response_path_mismatch');
+  });
+
+  it('缺省关：传了 landing 也拒，不记录', async () => {
+    const landing: { url?: string } = {};
+    await expect(pageContext(transport, new AbortController().signal, 1000, landing).page('https://a.example/index.php?k=1')).rejects.toThrow('response_path_mismatch');
+    expect(landing.url).toBeUndefined();
+  });
+
+  const task = { id: 1, title: '测试书', author: '作者甲', source_url: 'https://a.example/' } as unknown as TaskRow;
+  const precheck = (detail: { title: string; author: string }) => createIdentityPrecheck({
+    modules: {
+      compile: { compileSource: () => ({}) },
+      parser: {},
+      api: {
+        engineSearchBook: async (_e: unknown, _k: string, ctx: { page(u: string): Promise<unknown> }) => { await ctx.page('https://a.example/index.php?k=1'); return []; },
+        engineFetchDetail: async () => detail,
+      },
+    },
+    resolveSource: async () => ({ source: { url: 'https://a.example/', name: 's', searchUrl: '/index.php?k={{key}}' }, builtin: false }),
+    transport,
+  });
+
+  it('预检：落地页身份对上 ⇒ 通过；对不上 ⇒ 回原判（identity_unverified 放行，同关开关）', async () => {
+    vi.stubEnv('DOWNLOAD_SEARCH_REDIRECT', '1');
+    expect(await precheck({ title: '测试书', author: '作者甲' })(task, new AbortController().signal)).toEqual(MATCH);
+    expect(await precheck({ title: '别的书', author: '别人' })(task, new AbortController().signal)).toEqual(UNVERIFIED);
+    vi.unstubAllEnvs();
+    expect(await precheck({ title: '测试书', author: '作者甲' })(task, new AbortController().signal)).toEqual(UNVERIFIED);
+  });
+});
