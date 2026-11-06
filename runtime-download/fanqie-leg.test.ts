@@ -29,7 +29,7 @@ function setup(options: { reply?: FanqieReply | Error; search?: unknown; dailyLi
     download: vi.fn(async () => ({ kind: 'failure' as const, code: 'inner' })),
   };
   const innerPrecheck = vi.fn(async () => ({ ok: true as const, reason: 'inner' }));
-  const fetchText = vi.fn(async () => JSON.stringify(options.search
+  const fetchText = vi.fn(async (_url: string, _signal: AbortSignal) => JSON.stringify(options.search
     ?? { code: 0, data: { ret_data: [{ book_id: ID, title: TASK.title, author: TASK.author, creation_status: 0 }] } }));
   const ask = vi.fn(async () => {
     if (options.reply instanceof Error) throw options.reply;
@@ -81,7 +81,7 @@ describe('rebuildFanqieTxt', () => {
     const book = rebuildFanqieTxt(raw('第1章 入学', '甲一\n\n甲二', '第2章 校规', '乙', '一封来自远方的信', '丙'), titles)!;
     expect(book.txt).toBe('第1章 入学\n\n甲一\n\n甲二\n\n第2章 校规\n\n乙\n\n一封来自远方的信\n\n丙\n\n');
     expect(book.txt).not.toContain('书籍信息');
-    expect(book.charsTotal).toBe(6);
+    expect(book.charsTotal).toBe(8); // 同引擎：正文按码点计，段间换行也算
     expect(book.chapterRanges.map(r => r.index)).toEqual([0, 1, 2]);
     expect(book.chapterRanges[0].startByte).toBe(0);
     book.chapterRanges.slice(1).forEach((r, i) => expect(r.startByte).toBe(book.chapterRanges[i].endByte));
@@ -247,7 +247,7 @@ describe('askFanqieChannel', () => {
   });
   it('中止即断开连接并抛出', async () => {
     const closed = new Promise<void>((resolve) => {
-      void serve((socket) => { socket.on('close', () => resolve()); socket.on('error', () => {}); }).then(({ path, close }) => {
+      void serve((socket) => { socket.resume(); socket.on('close', () => resolve()); socket.on('error', () => {}); }).then(({ path, close }) => {
         const controller = new AbortController();
         const pending = askFanqieChannel(path, ID, controller.signal);
         setTimeout(() => controller.abort(new Error('stop')), 20);
