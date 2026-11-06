@@ -97,10 +97,14 @@ function chineseNumber(text: string): number {
   return total + section + digit;
 }
 
-/** 章标题比对口径：下载器写 TXT 时把「第一章」改写成「第1章」（分隔符也会变），章号转数字后再去标点空白比。 */
+/** 下载器写 TXT 章首时把「第一章」改写成「第1章」，标题其余部分照抄目录（11-06 实测）。 */
+function digitChapterNumber(title: string): string {
+  return title.replace(/第([零〇一二两三四五六七八九十百千万]+)(?=[章节回卷集话部篇])/g, (_, n: string) => `第${chineseNumber(n)}`);
+}
+
+/** 章标题比对口径：章号转数字后再去标点空白比。 */
 export function titleKey(title: string): string {
-  return normalizeName(title.normalize('NFKC')
-    .replace(/第([零〇一二两三四五六七八九十百千万]+)(?=[章节回卷集话部篇])/g, (_, n: string) => `第${chineseNumber(n)}`));
+  return normalizeName(digitChapterNumber(title.normalize('NFKC')));
 }
 
 /**
@@ -132,9 +136,35 @@ function locateChapters(lineKeys: readonly string[], keys: readonly string[], lo
 }
 
 /**
+ * 同一目录标题独立成行的次数多于目录条数时，多出来的是作者写在正文里的标题（章首前后再写一遍、上一章末的预告），
+ * 归一化后同名但标点空白有出入（11-06 万古第一神 15 处，作者那行在章首前后都有）。下载器写的章首与目录逐字相同，
+ * 逐字相同的恰好够数就只认它们、其余清掉当正文；裁决不了的原样留给后面的匹配。
+ */
+function dropRepeatedHeads(lines: readonly string[], lineKeys: string[], titles: readonly string[], keys: readonly string[]) {
+  const toc = new Map<string, { count: number; heads: Set<string> }>();
+  titles.forEach((title, j) => {
+    const entry = toc.get(keys[j]) ?? { count: 0, heads: new Set<string>() };
+    entry.count++;
+    entry.heads.add(title.trim()).add(digitChapterNumber(title.trim()));
+    toc.set(keys[j], entry);
+  });
+  const found = new Map<string, number[]>();
+  lineKeys.forEach((key, i) => {
+    if (key) found.set(key, [...(found.get(key) ?? []), i]);
+  });
+  for (const [key, at] of found) {
+    const { count, heads } = toc.get(key)!;
+    if (at.length <= count) continue;
+    const exact = at.filter(i => heads.has(lines[i].trim()));
+    if (exact.length === count) for (const i of at) if (!exact.includes(i)) lineKeys[i] = '';
+  }
+}
+
+/**
  * 番茄 TXT → 引擎格式。文件头（书籍信息/简介）到分隔线为止；章节按目录标题找整行（前后都是空行），
- * 不靠「第N章」正则——番外、后记这类标题没有章号。先严格按目录顺序找；找不齐再容许局部错位，但此时要求
- * 独立成行的目录标题恰好与目录一一对应（多一行都不认）。章节按目录顺序输出、标题以目录为准；找不齐返回 null（不猜）。
+ * 不靠「第N章」正则——番外、后记这类标题没有章号。正文里重复的标题行先按逐字相同裁掉；再严格按目录顺序找；
+ * 找不齐再容许局部错位，但此时要求独立成行的目录标题恰好与目录一一对应（多一行都不认）。
+ * 章节按目录顺序输出、标题以目录为准；找不齐返回 null（不猜）。
  */
 export function rebuildFanqieTxt(raw: string, titles: readonly string[]): RebuiltBook | null {
   if (!titles.length) return null;
@@ -148,6 +178,7 @@ export function rebuildFanqieTxt(raw: string, titles: readonly string[]): Rebuil
     const key = titleKey(line);
     return key && keySet.has(key) ? key : '';
   });
+  dropRepeatedHeads(lines, lineKeys, titles, keys);
   const starts = locateChapters(lineKeys, keys, 0)
     ?? (lineKeys.filter(Boolean).length === keys.length ? locateChapters(lineKeys, keys, TOC_LOOKAHEAD) : null);
   if (!starts) return null;

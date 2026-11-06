@@ -129,7 +129,7 @@ describe('rebuildFanqieTxt', () => {
     expect(rebuildFanqieTxt(raw('第4427章 天罚', '一', '第4428章 一掌震世', '二', '第4315章 最后一劫', '三'), later)!.txt)
       .toBe('第4427章 天罚\n\n一\n\n第4315章 最后一劫\n\n三\n\n第4428章 一掌震世\n\n二\n\n');
   });
-  it('错位时多出一行同名独立标题、或错开超过窗口，都不认', () => {
+  it('错位时多出一行与目录逐字相同的同名标题（分不清哪行是章首）、或错开超过窗口，都不认', () => {
     const titles = ['第1章', '第2章', '第3章'];
     expect(rebuildFanqieTxt(raw('第1章', '甲', '第3章', '丙', '第2章', '乙'), titles)!.txt)
       .toBe('第1章\n\n甲\n\n第2章\n\n乙\n\n第3章\n\n丙\n\n');
@@ -137,6 +137,23 @@ describe('rebuildFanqieTxt', () => {
     const many = Array.from({ length: 13 }, (_, i) => `第${i + 1}章`);
     const far = [...many.slice(1, 12), many[0], many[12]].flatMap(title => [title, '正文']);
     expect(rebuildFanqieTxt(raw(...far), many)).toBeNull();
+  });
+  it('正文里重复的标题行（上一章末预告、章首前后再写一遍）只认与目录逐字相同的那行，其余算正文；与错位同时出现也能切', () => {
+    const titles = ['第149章 前夜', '第150章 小命劫', '第151章 老六？'];
+    const book = rebuildFanqieTxt(raw('第149章 前夜', '甲', '第150章，小命劫。', '预告',
+      '第150章 小命劫', '第150章　小命劫！', '乙', '第151章老六？', '第151章 老六？', '丙'), titles)!;
+    expect(book.txt).toBe('第149章 前夜\n\n甲\n\n第150章，小命劫。\n\n预告\n\n'
+      + '第150章 小命劫\n\n第150章　小命劫！\n\n乙\n\n第151章老六？\n\n第151章 老六？\n\n丙\n\n');
+    const swapped = ['第1章 甲', '第2章 乙', '第3章 丙', '第4章 丁'];
+    expect(rebuildFanqieTxt(raw('第1章 甲', '一', '第3章 丙', '三', '第2章 乙', '第2章　乙！', '二', '第4章 丁', '四'), swapped)!.txt)
+      .toBe('第1章 甲\n\n一\n\n第2章 乙\n\n第2章　乙！\n\n二\n\n第3章 丙\n\n三\n\n第4章 丁\n\n四\n\n');
+  });
+  it('中文章号目录：章号改成数字的章首和目录原文都算逐字相同，两行都在就不裁决、照目录顺序取先出现的', () => {
+    const titles = ['楔子', '第一章 入学', '第二章 校规'];
+    expect(rebuildFanqieTxt(raw('楔子', '零', '第一章：入学', '第1章 入学', '甲', '第2章 校规', '乙'), titles)!.txt)
+      .toBe('楔子\n\n零\n\n第一章：入学\n\n第一章 入学\n\n甲\n\n第二章 校规\n\n乙\n\n');
+    expect(rebuildFanqieTxt(raw('楔子', '零', '第1章 入学', '第一章 入学', '甲', '第2章 校规', '乙'), titles)!.txt)
+      .toBe('楔子\n\n零\n\n第一章 入学\n\n第一章 入学\n\n甲\n\n第二章 校规\n\n乙\n\n');
   });
 });
 
