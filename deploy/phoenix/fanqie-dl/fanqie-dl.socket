@@ -1,0 +1,13 @@
+[Unit]
+Description=fanqie-dl on-demand request socket (book download workers)
+
+[Socket]
+ListenStream=/run/fanqie-dl.sock
+Accept=yes
+SocketUser=root
+SocketGroup=zsdownload
+SocketMode=0660
+MaxConnections=24
+
+[Install]
+WantedBy=sockets.target

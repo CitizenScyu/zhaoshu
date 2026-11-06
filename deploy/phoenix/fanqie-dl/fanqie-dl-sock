@@ -1,0 +1,15 @@
+#!/bin/bash
+# One request per connection (fanqie-dl.socket, Accept=yes): stdin/stdout are the socket.
+# Request "<book_id>\n"; reply is fanqie-dl's JSON lines plus {"rc":N}. Client hangup stops the run.
+IFS= read -r -t 10 id || exit 0
+[[ $id =~ ^[0-9]{15,20}$ ]] || { echo '{"rc":2}'; exit 0; }
+export FQ_OUT=/var/lib/zhaoshu-download-b/fanqie/out FQ_NAME=fq-sock-$$ FQ_TITLES=1 FQ_CPUS=1 FQ_MEM=1500m
+mkdir -p "$FQ_OUT" && chown zsdownload:zsdownload "$FQ_OUT"
+exec 3<&0
+/usr/local/bin/fanqie-dl --wait "${FQ_WAIT:-60}" "$id" 2>/dev/null &
+pid=$!
+( while IFS= read -r -u 3 _; do :; done; docker rm -f "$FQ_NAME" >/dev/null 2>&1; kill "$pid" 2>/dev/null ) &
+watcher=$!
+wait "$pid"; rc=$?
+kill "$watcher" 2>/dev/null
+echo "{\"rc\":$rc}"

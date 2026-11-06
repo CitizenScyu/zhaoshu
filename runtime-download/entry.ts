@@ -24,6 +24,7 @@ import { withoutProcessSignals } from './without-process-signals';
 import { createBudgetRefund } from './budget-refund';
 import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
+import { createFanqieLeg, fanqieDailyLimit, fanqieDir, fanqieEnabled } from './fanqie-leg';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
 import { createHostPriority, dedupeVariantsEnabled, scanConcurrency, scanRotateEnabled, skipStrictTocEnabled, skipZeroYieldEnabled } from './host-priority';
 import { createScanMissMemo, scanMissDir, scanMissMemoEnabled } from './scan-miss-memo';
@@ -384,9 +385,20 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     : (adapter: SourceAdapter): SourceAdapter => adapter;
   const scopedEngine = scoped(engineAdapter);
   const scopedBuiltin = scoped(builtinAdapter);
+  // fanqie1106：番茄渠道包在最外层（见 fanqie-leg.ts）。缺省关。搜索走未包 host 占位的 transport：
+  // 占位是下载作用域的互斥，20 实例查同一个搜索接口只需要共享限速。
+  const fanqie = !options.adapters && fanqieEnabled(env)
+    ? createFanqieLeg({
+      dir: fanqieDir(options.workDir),
+      dailyLimit: fanqieDailyLimit(env),
+      fetchText: async (url, signal) => (await baseTransport(url, { signal, timeoutMs: 15_000 })).text,
+      log,
+    })
+    : undefined;
+  const withFanqie = (adapter: SourceAdapter): SourceAdapter => fanqie ? fanqie.wrapAdapter(adapter) : adapter;
   const adapters = options.adapters ?? [
-    fallback ? fallback.wrapAdapter(scopedEngine, scopedEngine, 'engine') : scopedEngine,
-    fallback ? fallback.wrapAdapter(scopedBuiltin, scopedEngine) : scopedBuiltin,
+    withFanqie(fallback ? fallback.wrapAdapter(scopedEngine, scopedEngine, 'engine') : scopedEngine),
+    withFanqie(fallback ? fallback.wrapAdapter(scopedBuiltin, scopedEngine) : scopedBuiltin),
   ];
 
   // 扣额度前的身份预检默认开；DOWNLOAD_IDENTITY_PRECHECK=0 关（回到引入前行为：书源不可达只在下载中判出、
@@ -396,7 +408,8 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     : createIdentityPrecheck({ modules, resolveSource, transport });
   // 回退开启时预检多一步：原始源不可达（book15/引擎源）就在扣额度前选好引擎候选，
   // 选不到仍按不可达退避（不扣额度）。927 复核点 3：engine 任务无候选时也先过原预检。
-  const precheck = identityPrecheck && fallback ? fallback.wrapPrecheck(identityPrecheck) : identityPrecheck;
+  const basePrecheck = identityPrecheck && fallback ? fallback.wrapPrecheck(identityPrecheck) : identityPrecheck;
+  const precheck = basePrecheck && fanqie ? fanqie.wrapPrecheck(basePrecheck) : basePrecheck;
 
   // shell 的 read() 只回 {date, used}：用打包注入的上限补齐 DailyBudgetLike 契约（缺省保持未知）。
   const budget: DailyBudgetLike = {

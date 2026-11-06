@@ -1,0 +1,11 @@
+[Unit]
+Description=fanqie-dl request %i
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fanqie-dl-sock
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=2400

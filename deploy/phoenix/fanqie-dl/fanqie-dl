@@ -1,0 +1,77 @@
+#!/bin/bash
+# fanqie-dl: on-demand Fanqie downloader (POf-L Tauri app in a throwaway container)
+set -euo pipefail
+BASE=/opt/fanqie-dl
+OUT=${FQ_OUT:-$BASE/out}
+REPO=POf-L/Fanqie-novel-Downloader
+LOCK=/run/fanqie-dl.lock
+
+usage() {
+  cat <<EOF
+usage: fanqie-dl <book_id>... [--force] [--wait SEC]   download (results: JSON lines on stdout)
+       fanqie-dl --update                 build image from latest arm64 release
+       fanqie-dl --version                show image version
+output dir: $OUT   log: $BASE/logs/
+EOF
+}
+
+current_tag() { docker images fanqie-dl --format '{{.Tag}}' | grep -v '<none>' | sort -V | tail -1; }
+
+update() {
+  local info tag url ver
+  info=$(curl -fsS -m 30 "https://api.github.com/repos/$REPO/releases?per_page=10" | python3 -c '
+import json,sys
+for r in json.load(sys.stdin):
+    if r["draft"]: continue
+    for a in r["assets"]:
+        if a["name"]=="FanqieNovelDownloader-tauri-linux-arm64.deb":
+            print(r["tag_name"], a["browser_download_url"]); sys.exit()')
+  tag=${info%% *}; url=${info#* }
+  [ -n "$tag" ] || { echo "no arm64 release found" >&2; exit 1; }
+  ver=$(echo "$tag" | sed -E 's/^unsigned-v//; s/-r[0-9]+$//')
+  if docker image inspect "fanqie-dl:$ver" >/dev/null 2>&1; then echo "already latest: $ver"; return; fi
+  local tmp; tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+  curl -fsSL -m 300 -o "$tmp/fq.deb" "$url"
+  [ "$(dpkg-deb -f "$tmp/fq.deb" Architecture)" = arm64 ]
+  cp "$BASE/Dockerfile" "$tmp/"
+  nice -n 10 docker build -q -t "fanqie-dl:$ver" "$tmp" >/dev/null
+  for old in $(docker images fanqie-dl --format '{{.Tag}}' | grep -vx "$ver"); do docker rmi "fanqie-dl:$old" >/dev/null || true; done
+  docker image prune -f >/dev/null
+  echo "updated to $ver"
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage; exit 0 ;;
+  --version) current_tag; exit 0 ;;
+  --update) exec 9>"$LOCK"; flock -n 9 || { echo "busy" >&2; exit 75; }; update; exit 0 ;;
+esac
+
+ids=(); force=(); wait_sec=0
+while [ $# -gt 0 ]; do
+  a=$1; shift
+  if [[ $a =~ ^[0-9]{15,20}$ ]]; then ids+=("$a")
+  elif [ "$a" = --force ]; then force=(--force)
+  elif [ "$a" = --wait ] && [[ ${1:-} =~ ^[0-9]+$ ]]; then wait_sec=$1; shift
+  else echo "bad arg: $a" >&2; usage >&2; exit 2; fi
+done
+[ ${#ids[@]} -gt 0 ] || { usage >&2; exit 2; }
+
+exec 9>"$LOCK"
+flock -w "$wait_sec" 9 || { echo "another fanqie-dl is running" >&2; exit 75; }
+
+tag=$(current_tag); [ -n "$tag" ] || { echo "no image; run fanqie-dl --update" >&2; exit 1; }
+mkdir -p "$OUT" "$BASE/logs"
+name=${FQ_NAME:-fq-run-$$}
+log=$BASE/logs/$(date +%Y%m%d-%H%M%S).log
+trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT INT TERM
+budget=$(( 300 + ${#ids[@]} * ${FQ_PER_BOOK_SEC:-1500} ))
+echo "image fanqie-dl:$tag  books ${#ids[@]}  log $log" >&2
+find "$BASE/logs" -name '*.log' -mtime +30 -delete
+find "$OUT" -maxdepth 1 \( -name '.debug-*.png' -o -name '*.failed' -o -name '*.bak' \) -mtime +7 -delete
+timeout -k 20 "$budget" docker run --rm --init --name "$name" \
+  --cpus "${FQ_CPUS:-1.5}" --memory "${FQ_MEM:-2g}" --shm-size 256m \
+  -e FQ_PER_BOOK_SEC -e FQ_STALL_SEC -e FQ_TITLES \
+  -v "$BASE/fq_run.py:/fq_run.py:ro" \
+  -v "$OUT:/root/.local/share/com.pofl.fanqienoveldownloader/downloads/FanqieNovels" \
+  "fanqie-dl:$tag" python3 /fq_run.py "${ids[@]}" "${force[@]}" 2> >(tee -a "$log" >&2) | tee -a "$log"
