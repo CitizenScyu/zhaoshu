@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SourceAdapter, TaskRow } from '../src/lib/download-worker';
 import {
   askFanqieChannel, createFanqieLeg, createFanqieSearchFetch, fanqieDailyLimit, fanqieDir, fanqieEnabled, FANQIE_BREAKER_FAILS,
-  FANQIE_BREAKER_PAUSE_MS, normalizeName, pickFanqieBook, rebuildFanqieTxt, type FanqieReply,
+  FANQIE_BREAKER_PAUSE_MS, normalizeName, pickFanqieBook, rebuildFanqieTxt, titleKey, type FanqieReply,
 } from './fanqie-leg';
 
 const ID = '7199341816770989095';
@@ -97,6 +97,21 @@ describe('rebuildFanqieTxt', () => {
   it('标题空白差异可容忍，以目录为准', () => {
     expect(rebuildFanqieTxt(raw('第1章  入学', '甲'), ['第1章 入学'])!.txt).toBe('第1章 入学\n\n甲\n\n');
   });
+  it('下载器把中文章号改写成数字、换了分隔符也认，标题以目录为准', () => {
+    const titles = ['第一章 入学', '第十二章：校规', '第三百零一章 尾声', '番外 信'];
+    const book = rebuildFanqieTxt(raw('第1章 入学', '甲', '第12章 校规', '乙', '第301章尾声', '丙', '番外 信', '丁'), titles)!;
+    expect(book.txt).toBe('第一章 入学\n\n甲\n\n第十二章：校规\n\n乙\n\n第三百零一章 尾声\n\n丙\n\n番外 信\n\n丁\n\n');
+  });
+  it('titleKey：章号转数字，非章号的「第一」不动', () => {
+    expect(titleKey('第一章 天上打开一扇门')).toBe(titleKey('第1章 天上打开一扇门'));
+    expect(titleKey('第一百零一章')).toBe('第101章');
+    expect(titleKey('第两千三百四十五章')).toBe('第2345章');
+    expect(titleKey('第一万零一章')).toBe('第10001章');
+    expect(titleKey('第十章')).toBe('第10章');
+    expect(titleKey('第一〇一章')).toBe('第101章');
+    expect(titleKey('第一卷 第三节')).toBe('第1卷第3节');
+    expect(titleKey('第一次见面')).toBe('第一次见面');
+  });
   it('缺章、无分隔线、空目录返回 null', () => {
     expect(rebuildFanqieTxt(raw('第1章', '甲'), ['第1章', '第2章'])).toBeNull();
     expect(rebuildFanqieTxt('第1章\n\n甲\n\n', ['第1章'])).toBeNull();
@@ -147,13 +162,15 @@ describe('下载腿', () => {
     expect(ask).not.toHaveBeenCalled();
     expect(inner.download).toHaveBeenCalledTimes(1);
   });
-  it('成功：complete 带 chapterRanges，产物读完即删，记 ok', async () => {
+  it('成功：complete 带 chapterRanges，任务行写入章数字数，产物读完即删，记 ok', async () => {
     const { dir, adapter, inner, precheck } = setup();
     writeFileSync(join(dir, 'out', 'a.txt'), raw('第1章 入学', LONG));
     await precheck(TASK);
-    const outcome = await adapter.download(TASK, context());
+    const progress = vi.fn(async () => {});
+    const outcome = await adapter.download(TASK, { ...context(), progress });
     expect(outcome).toMatchObject({ kind: 'complete', chaptersTotal: 1, chaptersDone: 1, charsTotal: LONG.length });
     expect(outcome.kind === 'complete' && outcome.chapterRanges?.length).toBe(1);
+    expect(progress).toHaveBeenCalledWith({ chaptersDone: 1, chaptersTotal: 1, charsTotal: LONG.length });
     expect(inner.download).not.toHaveBeenCalled();
     expect(existsSync(join(dir, 'out', 'a.txt'))).toBe(false);
     const day = new Date().toISOString().slice(0, 10);
@@ -193,6 +210,21 @@ describe('下载腿', () => {
     expect(inner.download).toHaveBeenCalledTimes(1);
     await precheck(TASK);
     expect(innerPrecheck).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['界面遮挡/自动化异常', { rc: 1, result: { status: 'error', reason: 'exception: POST element/x/click -> 400 element click intercepted' } }],
+    ['搜索框没出来', { rc: 1, result: { status: 'error', reason: 'no_search_input' } }],
+    ['容器没出结果', { rc: 1, result: null }],
+    ['产物读不到', { rc: 0, result: { status: 'done', file: 'gone.txt', titles: ['第1章 入学'] } }],
+  ])('通道故障退回原腿、计熔断，但不记坏这本书：%s', async (_name, reply) => {
+    const { dir, adapter, inner, precheck, innerPrecheck, fetchText } = setup({ reply: reply as FanqieReply });
+    await precheck(TASK);
+    expect(await adapter.download(TASK, context())).toEqual({ kind: 'failure', code: 'inner' });
+    expect(inner.download).toHaveBeenCalledTimes(1);
+    expect(readFileSync(join(dir, `events-${new Date().toISOString().slice(0, 10)}.log`), 'utf8')).toMatch(/^fail /);
+    expect(await precheck(TASK)).toEqual({ ok: true });
+    expect(innerPrecheck).not.toHaveBeenCalled();
+    expect(fetchText).toHaveBeenCalledTimes(1);
   });
 });
 

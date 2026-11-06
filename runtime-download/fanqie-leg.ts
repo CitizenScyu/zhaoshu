@@ -34,6 +34,8 @@ export const FANQIE_MISS_TTL_MS = 7 * 24 * 60 * 60_000;
 const MIN_BOOK_CHARS = 3000;
 /** 下载器被占用时 fanqie-dl 的退出码。 */
 const RC_BUSY = 75;
+/** 通道自身的故障（界面被遮挡、自动化异常、容器没出结果、产物读不到）不怪这本书：只计熔断，不落 failed memo。 */
+const CHANNEL_FAULT = /^(exception|no_search_input|no_result|unreadable)\b/;
 
 const SEARCH_URL = 'https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1/?device_platform=android&aid=1967&offset=0&q=';
 
@@ -73,7 +75,33 @@ export function pickFanqieBook(rows: readonly SearchRow[], title: string, author
 
 export interface RebuiltBook { txt: string; chapterRanges: TxtChapter[]; charsTotal: number }
 
-const squash = (text: string) => text.replace(/\s+/g, '');
+const CN_DIGIT: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+const CN_UNIT: Record<string, number> = { 十: 10, 百: 100, 千: 1000 };
+
+function chineseNumber(text: string): number {
+  if (!/[十百千万]/.test(text)) return Number([...text].map(c => CN_DIGIT[c]).join(''));
+  let total = 0;
+  let section = 0;
+  let digit = 0;
+  for (const c of text) {
+    if (c in CN_DIGIT) digit = CN_DIGIT[c];
+    else if (c === '万') {
+      total += (section + digit) * 10_000;
+      section = 0;
+      digit = 0;
+    } else {
+      section += (digit || 1) * CN_UNIT[c];
+      digit = 0;
+    }
+  }
+  return total + section + digit;
+}
+
+/** 章标题比对口径：下载器写 TXT 时把「第一章」改写成「第1章」（分隔符也会变），章号转数字后再去标点空白比。 */
+export function titleKey(title: string): string {
+  return normalizeName(title.normalize('NFKC')
+    .replace(/第([零〇一二两三四五六七八九十百千万]+)(?=[章节回卷集话部篇])/g, (_, n: string) => `第${chineseNumber(n)}`));
+}
 
 /**
  * 番茄 TXT → 引擎格式。文件头（书籍信息/简介）到分隔线为止；章节按目录标题顺序逐个找整行（前后都是空行），
@@ -84,10 +112,11 @@ export function rebuildFanqieTxt(raw: string, titles: readonly string[]): Rebuil
   const rule = /^—{20,}$/m.exec(raw);
   if (!rule) return null;
   const lines = raw.slice(rule.index + rule[0].length).replace(/\r\n/g, '\n').split('\n');
+  const keys = titles.map(titleKey);
   const starts: number[] = [];
   for (let i = 0; i < lines.length && starts.length < titles.length; i++) {
-    const line = squash(lines[i]);
-    if (line && line === squash(titles[starts.length]) && !lines[i - 1]?.trim() && !lines[i + 1]?.trim()) starts.push(i);
+    const line = titleKey(lines[i]);
+    if (line && line === keys[starts.length] && !lines[i - 1]?.trim() && !lines[i + 1]?.trim()) starts.push(i);
   }
   if (starts.length !== titles.length) return null;
   const parts: string[] = [];
@@ -339,13 +368,15 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
           const book = collect(reply.result);
           if (typeof book === 'string') {
             recordEvent('fail', bookId, book.replace(/\W+/g, '_').slice(0, 40));
-            writeMemo(task, { failed: true });
+            if (!CHANNEL_FAULT.test(book)) writeMemo(task, { failed: true });
             log('info', '番茄渠道下载', { taskId: task.id, bookId, outcome: 'failed', reason: book.slice(0, 80) });
             return inner.download(task, context);
           }
           recordEvent('ok', bookId, 'done');
           log('info', '番茄渠道下载', { taskId: task.id, bookId, outcome: 'done', chapters: book.chapters,
             chars: book.charsTotal, seconds: reply.result?.seconds });
+          // 任务行的章数/字数只经 progress 写入（下载列表与统计读它）。
+          await context.progress({ chaptersDone: book.chapters, chaptersTotal: book.chapters, charsTotal: book.charsTotal });
           return { kind: 'complete', txt: book.txt, chaptersTotal: book.chapters, chaptersDone: book.chapters,
             charsTotal: book.charsTotal, chapterRanges: book.chapterRanges };
         },

@@ -3,6 +3,13 @@
 # Request "<book_id>\n"; reply is fanqie-dl's JSON lines plus {"rc":N}. Client hangup stops the run.
 IFS= read -r -t 10 id || exit 0
 [[ $id =~ ^[0-9]{15,20}$ ]] || { echo '{"rc":2}'; exit 0; }
+# Once a newer release exists the old app shows a release-notes dialog over the UI that intercepts every click,
+# so check for a new release (at most every 5 min) before downloading. --update skips when a run holds the lock.
+stamp=/run/fanqie-dl.update-checked
+if [ -z "$(find "$stamp" -mmin -5 2>/dev/null)" ]; then
+  touch "$stamp"
+  echo "update check: $(/usr/local/bin/fanqie-dl --update 2>/dev/null || echo skipped)" >&2
+fi
 export FQ_OUT=/var/lib/zhaoshu-download-b/fanqie/out FQ_NAME=fq-sock-$$ FQ_TITLES=1 FQ_CPUS=1 FQ_MEM=1500m
 mkdir -p "$FQ_OUT" && chown zsdownload:zsdownload "$FQ_OUT"
 exec 3<&0

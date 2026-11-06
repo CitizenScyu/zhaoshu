@@ -1,4 +1,4 @@
-import base64, glob, json, os, re, subprocess, sys, time, urllib.request
+import base64, glob, json, os, re, subprocess, sys, time, unicodedata, urllib.request
 
 OUT = os.path.expanduser('~/.local/share/com.pofl.fanqienoveldownloader/downloads/FanqieNovels')
 EK = 'element-6066-11e4-a52e-4f735466cecf'
@@ -32,6 +32,31 @@ def book_files():
     return m
 
 
+CN_DIGIT = dict(zip('零〇一二两三四五六七八九', (0, 0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9)))
+CN_UNIT = {'十': 10, '百': 100, '千': 1000}
+
+
+def cn_num(s):
+    if not re.search('[十百千万]', s):
+        return int(''.join(str(CN_DIGIT[c]) for c in s))
+    total = section = digit = 0
+    for c in s:
+        if c in CN_DIGIT:
+            digit = CN_DIGIT[c]
+        elif c == '万':
+            total, section, digit = total + (section + digit) * 10000, 0, 0
+        else:
+            section, digit = section + (digit or 1) * CN_UNIT[c], 0
+    return total + section + digit
+
+
+def title_key(s):
+    # the app writes 第一章 as 第1章 (and may change the separator), so compare chapter numbers as digits, sans punctuation
+    s = re.sub('第([零〇一二两三四五六七八九十百千万]+)(?=[章节回卷集话部篇])', lambda m: '第%d' % cn_num(m.group(1)),
+               unicodedata.normalize('NFKC', s))
+    return re.sub(r'[\W_]+', '', s.lower())
+
+
 def toc_check(bid, path):
     req = urllib.request.Request('https://fanqienovel.com/api/reader/directory/detail?bookId=' + bid,
                                  headers={'Referer': 'https://fanqienovel.com/', 'User-Agent': 'Mozilla/5.0'})
@@ -39,9 +64,8 @@ def toc_check(bid, path):
     data = d.get('data') or {}
     titles = [(c.get('title') or '').strip() for v in data.get('chapterListWithVolume') or [] for c in v]
     t = open(path, encoding='utf-8').read()
-    norm = lambda s: re.sub(r'\s+', '', s)
-    lines = {norm(l) for l in t.splitlines()}
-    miss = [x for x in titles if norm(x) not in lines]
+    lines = {title_key(l) for l in t.splitlines()}
+    miss = [x for x in titles if title_key(x) not in lines]
     r = {'toc_code': d.get('code'), 'toc_chapters': len(titles), 'missing': len(miss), 'missing_sample': miss[:5],
          'pua': sum(1 for c in t if 0xE000 <= ord(c) <= 0xF8FF), 'replacement': t.count('�'),
          'cjk_ratio': round(sum(1 for c in t if 0x4E00 <= ord(c) <= 0x9FFF) / max(len(t), 1), 3)}
