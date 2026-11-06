@@ -32,6 +32,12 @@ export const FANQIE_HIT_TTL_MS = 30 * 24 * 60 * 60_000;
 export const FANQIE_MISS_TTL_MS = 7 * 24 * 60 * 60_000;
 /** 比照 stub1105：整本不足 3000 字不算拿到书。 */
 const MIN_BOOK_CHARS = 3000;
+/**
+ * 解不出的字（U+FFFD、PUA）每 5 万字至多 1 处仍收：同一本每次下载都一样（11-07 长生道 12 处「衡」、仙墓 1 处拟声词），
+ * 拒收只会让书永远落回免费源；常用字解不出则远超此数。
+ */
+const DAMAGED_CHAR = /[\uFFFD\uE000-\uF8FF]/g;
+const CHARS_PER_DAMAGED = 50_000;
 /** 下载器被占用时 fanqie-dl 的退出码。 */
 const RC_BUSY = 75;
 /** 通道自身的故障（界面被遮挡、自动化异常、容器没出结果、产物读不到）不怪这本书：只计熔断，不落 failed memo。 */
@@ -375,7 +381,7 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
   };
 
   /** 读回并重排；书在番茄拿不到时回失败原因码。下载产物读完即删（重试重新下）。 */
-  const collect = (result: FanqieResult | null): RebuiltBook & { chapters: number } | string => {
+  const collect = (result: FanqieResult | null): RebuiltBook & { chapters: number; damaged: number } | string => {
     const name = typeof result?.file === 'string' ? basename(result.file) : '';
     let raw: string | null = null;
     if (name) {
@@ -385,14 +391,19 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
         unlinkSync(path);
       } catch { /* 下面按 unreadable 收口 */ }
     }
-    if (result?.status !== 'done' && result?.status !== 'exists') return result?.reason ?? result?.status ?? 'no_result';
+    if (!result) return 'no_result';
+    // fq_run 把缺章和解不出的字都判 incomplete：不缺章的交给下面按字数裁。
+    const usable = result.status === 'done' || result.status === 'exists' || (result.status === 'incomplete' && !result.missing);
+    if (!usable) return result.reason ?? result.status ?? 'no_result';
     if (raw === null) return 'unreadable';
-    if (result.missing || result.pua || result.replacement) return 'text_damaged';
+    if (result.missing) return 'text_damaged';
     const titles = Array.isArray(result.titles) ? result.titles.filter((t): t is string => typeof t === 'string') : [];
     const book = rebuildFanqieTxt(raw, titles);
     if (!book) return 'rebuild_failed';
     if (book.charsTotal < MIN_BOOK_CHARS) return 'too_short';
-    return { ...book, chapters: titles.length };
+    const damaged = book.txt.match(DAMAGED_CHAR)?.length ?? 0;
+    if (damaged * CHARS_PER_DAMAGED > book.charsTotal) return 'text_damaged';
+    return { ...book, chapters: titles.length, damaged };
   };
 
   return {
@@ -440,7 +451,7 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
           }
           recordEvent('ok', bookId, 'done');
           log('info', '番茄渠道下载', { taskId: task.id, bookId, outcome: 'done', chapters: book.chapters,
-            chars: book.charsTotal, seconds: reply.result?.seconds });
+            chars: book.charsTotal, damaged: book.damaged, seconds: reply.result?.seconds });
           // 任务行的章数/字数只经 progress 写入（下载列表与统计读它）。
           await context.progress({ chaptersDone: book.chapters, chaptersTotal: book.chapters, charsTotal: book.charsTotal });
           return { kind: 'complete', txt: book.txt, chaptersTotal: book.chapters, chaptersDone: book.chapters,

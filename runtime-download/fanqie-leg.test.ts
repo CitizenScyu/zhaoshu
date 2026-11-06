@@ -18,6 +18,8 @@ const TASK: TaskRow = {
 };
 const HEADER = `书籍信息\n\n书名：规则怪谈：诡异学校\n作者：柒月July\n书籍 ID：${ID}\n\n【简介】\n第1章 入学\n\n————————————————————————————————\n\n`;
 const LONG = '正文'.repeat(2000);
+const FFFD = String.fromCodePoint(0xfffd);
+const PUA = String.fromCodePoint(0xe1d5);
 const raw = (...chapters: string[]) => HEADER + chapters.join('\n\n') + '\n\n';
 const context = () => ({ signal: new AbortController().signal, progress: async () => {} });
 
@@ -233,16 +235,29 @@ describe('下载腿', () => {
     await precheck(TASK);
     expect(fetchText).toHaveBeenCalledTimes(1);
   });
+  it('下载器只因零星解不出的字判 incomplete（不缺章）：每 5 万字至多 1 处照收', async () => {
+    const reply = { rc: 1, result: { status: 'incomplete', file: 'a.txt', titles: ['第1章 入学'], missing: 0, pua: 1, replacement: 1 } };
+    const { dir, adapter, inner, precheck } = setup({ reply });
+    const body = `${'正文'.repeat(50_000)}与之抗${FFFD}。\n\n${PUA}！`;
+    writeFileSync(join(dir, 'out', 'a.txt'), raw('第1章 入学', body));
+    await precheck(TASK);
+    expect(await adapter.download(TASK, context())).toMatchObject({ kind: 'complete', chaptersTotal: 1, charsTotal: [...body].length });
+    expect(inner.download).not.toHaveBeenCalled();
+    expect(readFileSync(join(dir, `events-${new Date().toISOString().slice(0, 10)}.log`), 'utf8')).toBe(`ok ${ID} done\n`);
+  });
   it.each([
     ['下载器报错', { rc: 1, result: { status: 'error', reason: 'stalled' } }],
     ['目录比对残缺', { rc: 1, result: { status: 'incomplete', file: 'a.txt', titles: ['第1章 入学'], missing: 3 } }],
     ['exists 但有缺章', { rc: 0, result: { status: 'exists', file: 'a.txt', titles: ['第1章 入学'], missing: 3 } }],
     ['切章失败', { rc: 0, result: { status: 'done', file: 'a.txt', titles: ['别的标题'] } }],
     ['太短', { rc: 0, result: { status: 'done', file: 'b.txt', titles: ['第1章 入学'] } }],
+    ['解不出的字超过每 5 万字 1 处', { rc: 1, result: { status: 'incomplete', file: 'c.txt', titles: ['第1章 入学'], missing: 0, replacement: 1 } }],
+    ['报 done 但正文自查有解不出的字', { rc: 0, result: { status: 'done', file: 'c.txt', titles: ['第1章 入学'] } }],
   ])('失败退回原腿并记住这本书：%s', async (_name, reply) => {
     const { dir, adapter, inner, precheck, innerPrecheck } = setup({ reply: reply as FanqieReply });
     writeFileSync(join(dir, 'out', 'a.txt'), raw('第1章 入学', LONG));
     writeFileSync(join(dir, 'out', 'b.txt'), raw('第1章 入学', '短'));
+    writeFileSync(join(dir, 'out', 'c.txt'), raw('第1章 入学', `${LONG}抗${FFFD}`));
     await precheck(TASK);
     expect(await adapter.download(TASK, context())).toEqual({ kind: 'failure', code: 'inner' });
     expect(inner.download).toHaveBeenCalledTimes(1);
