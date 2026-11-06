@@ -104,8 +104,37 @@ export function titleKey(title: string): string {
 }
 
 /**
- * 番茄 TXT → 引擎格式。文件头（书籍信息/简介）到分隔线为止；章节按目录标题顺序逐个找整行（前后都是空行），
- * 不靠「第N章」正则——番外、后记这类标题没有章号。目录标题有一个找不到就返回 null（不猜）。
+ * 下载器写 TXT 的章序与网页目录可能有局部出入（11-06 不灭武尊 6877 章里两处标错章号的章节各错开一位），
+ * 按目录顺序找不齐时，允许标题行对应到目录里向后这么多条以内。
+ */
+const TOC_LOOKAHEAD = 10;
+
+/**
+ * lineKeys[i] 非空 = 第 i 行是独立成行的目录标题。逐行对应到「最靠前的未用目录条目」起 lookahead 条以内的同名条目；
+ * lookahead=0 即严格按目录顺序。全部条目都对应上才算，回 [行号, 目录序号] 按 TXT 顺序。
+ */
+function locateChapters(lineKeys: readonly string[], keys: readonly string[], lookahead: number) {
+  const used = new Uint8Array(keys.length);
+  const starts: { line: number; toc: number }[] = [];
+  let next = 0;
+  for (let i = 0; i < lineKeys.length && next < keys.length; i++) {
+    if (!lineKeys[i]) continue;
+    for (let j = next; j <= Math.min(keys.length - 1, next + lookahead); j++) {
+      if (!used[j] && keys[j] === lineKeys[i]) {
+        used[j] = 1;
+        starts.push({ line: i, toc: j });
+        break;
+      }
+    }
+    while (next < keys.length && used[next]) next++;
+  }
+  return starts.length === keys.length ? starts : null;
+}
+
+/**
+ * 番茄 TXT → 引擎格式。文件头（书籍信息/简介）到分隔线为止；章节按目录标题找整行（前后都是空行），
+ * 不靠「第N章」正则——番外、后记这类标题没有章号。先严格按目录顺序找；找不齐再容许局部错位，但此时要求
+ * 独立成行的目录标题恰好与目录一一对应（多一行都不认）。章节按目录顺序输出、标题以目录为准；找不齐返回 null（不猜）。
  */
 export function rebuildFanqieTxt(raw: string, titles: readonly string[]): RebuiltBook | null {
   if (!titles.length) return null;
@@ -113,19 +142,25 @@ export function rebuildFanqieTxt(raw: string, titles: readonly string[]): Rebuil
   if (!rule) return null;
   const lines = raw.slice(rule.index + rule[0].length).replace(/\r\n/g, '\n').split('\n');
   const keys = titles.map(titleKey);
-  const starts: number[] = [];
-  for (let i = 0; i < lines.length && starts.length < titles.length; i++) {
-    const line = titleKey(lines[i]);
-    if (line && line === keys[starts.length] && !lines[i - 1]?.trim() && !lines[i + 1]?.trim()) starts.push(i);
-  }
-  if (starts.length !== titles.length) return null;
+  const keySet = new Set(keys);
+  const lineKeys = lines.map((line, i) => {
+    if (lines[i - 1]?.trim() || lines[i + 1]?.trim()) return '';
+    const key = titleKey(line);
+    return key && keySet.has(key) ? key : '';
+  });
+  const starts = locateChapters(lineKeys, keys, 0)
+    ?? (lineKeys.filter(Boolean).length === keys.length ? locateChapters(lineKeys, keys, TOC_LOOKAHEAD) : null);
+  if (!starts) return null;
+  const bodies: string[] = [];
+  starts.forEach(({ line, toc }, k) => {
+    bodies[toc] = lines.slice(line + 1, starts[k + 1]?.line ?? lines.length).join('\n').trim();
+  });
   const parts: string[] = [];
   const chapterRanges: TxtChapter[] = [];
   let charsTotal = 0;
   let byte = 0;
-  starts.forEach((start, index) => {
+  bodies.forEach((body, index) => {
     const title = titles[index].trim();
-    const body = lines.slice(start + 1, starts[index + 1] ?? lines.length).join('\n').trim();
     const part = `${title}\n\n${body}\n\n`;
     const size = Buffer.byteLength(part, 'utf8');
     parts.push(part);

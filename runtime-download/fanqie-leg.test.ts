@@ -117,6 +117,27 @@ describe('rebuildFanqieTxt', () => {
     expect(rebuildFanqieTxt('第1章\n\n甲\n\n', ['第1章'])).toBeNull();
     expect(rebuildFanqieTxt(raw('第1章', '甲'), [])).toBeNull();
   });
+  it('章序局部错位（实测：标错章号的同名章错开一位）：按目录顺序输出，正文跟着各自的标题行走', () => {
+    const titles = ['第三千九百九十五章 永恒天劫', '第三千九百九十七章 堕入轮回', '第三千九百九十八章 神龙山脉，武村',
+      '第三千九百九十五章 永恒天劫', '第三千九百九十九章 武村危机'];
+    const book = rebuildFanqieTxt(raw('第3995章 永恒天劫', '甲', '第3997章 堕入轮回', '乙', '第3995章 永恒天劫', '丙',
+      '第3998章 神龙山脉，武村', '丁', '第3999章 武村危机', '戊'), titles)!;
+    expect(book.txt).toBe('第三千九百九十五章 永恒天劫\n\n甲\n\n第三千九百九十七章 堕入轮回\n\n乙\n\n'
+      + '第三千九百九十八章 神龙山脉，武村\n\n丁\n\n第三千九百九十五章 永恒天劫\n\n丙\n\n第三千九百九十九章 武村危机\n\n戊\n\n');
+    expect(book.chapterRanges.map(r => r.title)).toEqual(titles);
+    const later = ['第4427章 天罚', '第4315章 最后一劫', '第4428章 一掌震世'];
+    expect(rebuildFanqieTxt(raw('第4427章 天罚', '一', '第4428章 一掌震世', '二', '第4315章 最后一劫', '三'), later)!.txt)
+      .toBe('第4427章 天罚\n\n一\n\n第4315章 最后一劫\n\n三\n\n第4428章 一掌震世\n\n二\n\n');
+  });
+  it('错位时多出一行同名独立标题、或错开超过窗口，都不认', () => {
+    const titles = ['第1章', '第2章', '第3章'];
+    expect(rebuildFanqieTxt(raw('第1章', '甲', '第3章', '丙', '第2章', '乙'), titles)!.txt)
+      .toBe('第1章\n\n甲\n\n第2章\n\n乙\n\n第3章\n\n丙\n\n');
+    expect(rebuildFanqieTxt(raw('第1章', '甲', '第3章', '丙', '第1章', '第2章', '乙'), titles)).toBeNull();
+    const many = Array.from({ length: 13 }, (_, i) => `第${i + 1}章`);
+    const far = [...many.slice(1, 12), many[0], many[12]].flatMap(title => [title, '正文']);
+    expect(rebuildFanqieTxt(raw(...far), many)).toBeNull();
+  });
 });
 
 describe('预检', () => {
