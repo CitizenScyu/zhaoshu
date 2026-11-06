@@ -24,7 +24,7 @@ import { withoutProcessSignals } from './without-process-signals';
 import { createBudgetRefund } from './budget-refund';
 import { createIdentityPrecheck } from './identity-precheck';
 import { createBuiltinFallback } from './builtin-fallback';
-import { createFanqieLeg, fanqieDailyLimit, fanqieDir, fanqieEnabled } from './fanqie-leg';
+import { createFanqieLeg, createFanqieSearchFetch, fanqieDailyLimit, fanqieDir, fanqieEnabled } from './fanqie-leg';
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
 import { createHostPriority, dedupeVariantsEnabled, scanConcurrency, scanRotateEnabled, skipStrictTocEnabled, skipZeroYieldEnabled } from './host-priority';
 import { createScanMissMemo, scanMissDir, scanMissMemoEnabled } from './scan-miss-memo';
@@ -385,13 +385,13 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     : (adapter: SourceAdapter): SourceAdapter => adapter;
   const scopedEngine = scoped(engineAdapter);
   const scopedBuiltin = scoped(builtinAdapter);
-  // fanqie1106：番茄渠道包在最外层（见 fanqie-leg.ts）。缺省关。搜索走未包 host 占位的 transport：
-  // 占位是下载作用域的互斥，20 实例查同一个搜索接口只需要共享限速。
+  // fanqie1106：番茄渠道包在最外层（见 fanqie-leg.ts）。缺省关。搜索接口不在书源 host 门里，不走书源
+  // transport，只借共享限速许可（不经 host 占位：占位是下载作用域的互斥）。
   const fanqie = !options.adapters && fanqieEnabled(env)
     ? createFanqieLeg({
       dir: fanqieDir(options.workDir),
       dailyLimit: fanqieDailyLimit(env),
-      fetchText: async (url, signal) => (await baseTransport(url, { signal, timeoutMs: 15_000 })).text,
+      fetchText: createFanqieSearchFetch(options.rateLimiter),
       log,
     })
     : undefined;

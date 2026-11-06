@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { SourceAdapter, TaskRow } from '../src/lib/download-worker';
 import {
-  askFanqieChannel, createFanqieLeg, fanqieDailyLimit, fanqieDir, fanqieEnabled, FANQIE_BREAKER_FAILS,
+  askFanqieChannel, createFanqieLeg, createFanqieSearchFetch, fanqieDailyLimit, fanqieDir, fanqieEnabled, FANQIE_BREAKER_FAILS,
   FANQIE_BREAKER_PAUSE_MS, normalizeName, pickFanqieBook, rebuildFanqieTxt, type FanqieReply,
 } from './fanqie-leg';
 
@@ -222,6 +222,31 @@ describe('额度与熔断', () => {
     writeFileSync(file, `${`fail 1 stalled\n`.repeat(FANQIE_BREAKER_FAILS)}ok 2 done\n`);
     t = Date.now();
     expect(await setup({ now: () => t }).precheck(TASK)).toEqual({ ok: true });
+  });
+});
+
+describe('createFanqieSearchFetch', () => {
+  const URL0 = 'https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1/?device_platform=android&aid=1967&offset=0&q=x';
+  const limiter = () => ({ acquire: vi.fn(async () => 'permit'), recordSuccess: vi.fn(), recordFailure: vi.fn() });
+  it('先取共享限速许可再发，成功回报', async () => {
+    const lim = limiter();
+    const fetchImpl = vi.fn(async () => new Response('{"code":0}'));
+    expect(await createFanqieSearchFetch(lim, fetchImpl as never)(URL0, new AbortController().signal)).toBe('{"code":0}');
+    expect(lim.acquire).toHaveBeenCalledWith('novel.snssdk.com', expect.anything());
+    expect(lim.recordSuccess).toHaveBeenCalledWith('novel.snssdk.com', { permit: 'permit' });
+    expect(fetchImpl.mock.calls[0]).toEqual([URL0, expect.objectContaining({ redirect: 'error' })]);
+  });
+  it('HTTP 失败回报并抛；429 带退避', async () => {
+    const lim = limiter();
+    const fetchImpl = vi.fn(async () => new Response('', { status: 429 }));
+    await expect(createFanqieSearchFetch(lim, fetchImpl as never)(URL0, new AbortController().signal)).rejects.toMatchObject({ code: 'HTTP_429' });
+    expect(lim.recordFailure).toHaveBeenCalledWith('novel.snssdk.com', { permit: 'permit', retryAfterMs: 60_000 });
+  });
+  it('没有限速器或地址不对就不发', async () => {
+    const fetchImpl = vi.fn();
+    await expect(createFanqieSearchFetch(undefined, fetchImpl as never)(URL0, new AbortController().signal)).rejects.toMatchObject({ code: 'NO_LIMITER' });
+    await expect(createFanqieSearchFetch(limiter(), fetchImpl as never)('https://evil.example/', new AbortController().signal)).rejects.toMatchObject({ code: 'BAD_URL' });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 

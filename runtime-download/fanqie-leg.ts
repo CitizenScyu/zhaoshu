@@ -18,6 +18,7 @@ import { connect } from 'node:net';
 import { basename, dirname, join } from 'node:path';
 import type { AdapterOutcome, SourceAdapter, TaskRow } from '../src/lib/download-worker';
 import type { TxtChapter } from '../src/lib/txt-chapters';
+import type { RateLimiterLike } from './engine';
 import type { PrecheckHook, PrecheckResult } from './executor';
 
 export const FANQIE_SOCKET = '/run/fanqie-dl.sock';
@@ -142,11 +143,45 @@ export function askFanqieChannel(socketPath: string, bookId: string, signal: Abo
   });
 }
 
+const SEARCH_TIMEOUT_MS = 15_000;
+const SEARCH_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 搜索接口的取文本。novel.snssdk.com 不在书源 host 门（内建 + 准入池）里，fetchSourceText 必拒
+ * （金丝雀实测 SourcePolicyError），故不走书源 transport，只借共享限速许可（同 host 20 实例合计 QPS≤1）。
+ * 没有限速器就不发请求（风控红线优先于命中率）。只连固定 https 地址、不跟跳转、限体积。
+ */
+export function createFanqieSearchFetch(limiter: RateLimiterLike | undefined,
+  fetchImpl: typeof fetch = fetch): (url: string, signal: AbortSignal) => Promise<string> {
+  return async (url, signal) => {
+    if (!limiter) throw Object.assign(new Error('FANQIE_SEARCH_NO_LIMITER'), { code: 'NO_LIMITER' });
+    if (!url.startsWith(SEARCH_URL)) throw Object.assign(new Error('FANQIE_SEARCH_URL'), { code: 'BAD_URL' });
+    const host = new URL(url).hostname;
+    const permit = await limiter.acquire(host, { signal });
+    let response: Response;
+    try {
+      response = await fetchImpl(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(SEARCH_TIMEOUT_MS)]), redirect: 'error' });
+    } catch (error) {
+      if (!signal.aborted) await limiter.recordFailure?.(host, { permit });
+      throw error;
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      await limiter.recordFailure?.(host, { permit, ...(response.status === 429 ? { retryAfterMs: 60_000 } : {}) });
+      throw Object.assign(new Error('FANQIE_SEARCH_HTTP'), { code: `HTTP_${response.status}` });
+    }
+    const text = await response.text();
+    if (text.length > SEARCH_MAX_BYTES) throw Object.assign(new Error('FANQIE_SEARCH_TOO_LARGE'), { code: 'TOO_LARGE' });
+    await limiter.recordSuccess?.(host, { permit });
+    return text;
+  };
+}
+
 export interface FanqieLegOptions {
   /** 共享状态目录（memo/、out/、events-*.log）。 */
   dir: string;
   socketPath?: string;
-  /** 走共享限速的取文本。 */
+  /** 走共享限速的取文本（生产 = createFanqieSearchFetch）。 */
   fetchText: (url: string, signal: AbortSignal) => Promise<string>;
   dailyLimit?: number;
   log?: (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => void;
