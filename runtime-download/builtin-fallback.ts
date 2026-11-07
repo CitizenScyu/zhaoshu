@@ -135,9 +135,16 @@ const isIdentityMiss = (outcome: AdapterOutcome): boolean =>
  * （付费墙恒定）——必须换源，不能像 missing_chapters 那样退避重试原源死循环 16 轮。
  * builtin 原源与引擎腿同判：原源 preview_truncated 触发引擎回退；引擎腿 preview_truncated
  * 标 temporary 失败记忆后换下一源（temporary 而非 permanent：该源此书在付费墙，同源其他书未必）。
+ * 引擎适配器（builtin/engine 两腿同为 createEngineAdapter）把它归 failure（download-worker 的 incomplete
+ * 白名单不含它），旧判据只认 incomplete ⇒ 原源预览直接 failed 终态、从不回退（2026-11-07 生产 hongxiu 等）。
  */
 const isPreviewTruncated = (outcome: AdapterOutcome) =>
-  outcome.kind === 'incomplete' && outcome.reason === 'preview_truncated';
+  (outcome.kind === 'incomplete' && outcome.reason === 'preview_truncated')
+  || (outcome.kind === 'failure' && outcome.code === 'preview_truncated');
+
+/** tocshape1107：原源目录形态缺陷（倒序/轮转/只剩尾段，engine-download tocShapeError）同源重试不变，同样换源。 */
+const isTocDefect = (outcome: AdapterOutcome) =>
+  outcome.kind === 'failure' && (outcome.code === 'toc_disordered' || outcome.code === 'toc_incomplete');
 
 /**
  * resolvemiss1104：原源 host 不在下载池（resolveSource code=1 no_engine_source_for_host，零出网）。
@@ -360,7 +367,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
      * - kind='failure' 或源级 incomplete（source_unavailable / missing_chapters / toc_changed /
      *   operation_timeout / preview_truncated）⇒ 标失败记忆（identity ⇒ permanent，其余 temporary）
      *   后换下一个源；白名单外的未知 incomplete 不标失败、不换源；未知异常按原语义上抛。
-     *   builtin 原源 preview_truncated 同样触发回退（见 isPreviewTruncated）。
+     *   builtin 原源 preview_truncated / 目录形态缺陷同样触发回退（见 isPreviewTruncated / isTocDefect）。
      * 全部候选失败回 book15 的 source_unavailable 退避语义（不落 failed）。
      */
     wrapAdapter(builtin: SourceAdapter, engine: SourceAdapter, kind: SourceAdapter['kind'] = 'builtin'): SourceAdapter {
@@ -403,7 +410,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               // preview_truncated（原源是付费墙预览）：不 return primary——同源重试无意义，改走引擎回退换免费源。
               // resolvemiss1104：原源 host 不在下载池同样回退（见 isUnresolvedHost）。
               if (!isSourceUnavailable(primary) && !isIdentityMiss(primary) && !isPreviewTruncated(primary)
-                && !isUnresolvedHost(primary)) return primary;
+                && !isTocDefect(primary) && !isUnresolvedHost(primary)) return primary;
               // 930 确认点 2：原源被物理门拒绝（host_occupied / host_occupancy_unavailable）按原
               // 可重试分类收口，不触发扫池——“host 正被占用”对选新源的出网请求同样生效。
               if (primary.kind === 'incomplete' && primary.retryCause) return primary;

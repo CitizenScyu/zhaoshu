@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, checkPagePath, rejectLanding, tocPageTimeout, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -750,6 +750,66 @@ describe('stub1105 极短残本识别', () => {
     const r = await run(f, 1, 392);
     expect(r.code).toBe(0);
     expect(r.manifest.status).toBe('done');
+  }, 60_000);
+});
+
+// tocshape1107：目录倒序/轮转/只剩尾段 ⇒ 抓正文前按源级失败换源（DOWNLOAD_TOC_SHAPE=0 关，缺省开）。
+describe('tocshape1107 目录形态闸门', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const titles = (ns: number[]) => ns.map(n => `第${n}章 标题`);
+  const range = (from: number, to: number) => Array.from({ length: Math.abs(to - from) + 1 }, (_, i) => from <= to ? from + i : from - i);
+  const run = (f: ReturnType<typeof setup>, list: string[], reads: string[]) => f.run(async (url, opts) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      const catalog = `<div class="d-chapter-list" id="full-catalog">${list.map((t, i) => `<dd><a href="/read/${i + 1}">${t}</a></dd>`).join('')}</div>`;
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog };
+    }
+    if (url.includes('/read/')) { reads.push(url); return { url, text: '<li class="chapter-content" id="article-content"><p>合成正文，离线测试。</p></li>' }; }
+    return f.transport(url, opts);
+  });
+  it('章号解析：阿拉伯/全角/中文数字（含十百千万），卷号不误取', () => {
+    expect(['第1章 开端', '第 12 章', '第１２３章', '第十章', '第十一章', '第二十章', '第一百零五章', '第一千二百三十四章', '第两百章',
+      '第一万零一章', '第三回 夜宴', '第五节', '第一卷 第七章', '楔子', '番外一', ''].map(chapterNumberOf))
+      .toEqual([1, 12, 123, 10, 11, 20, 105, 1234, 200, 10001, 3, 5, 7, null, null, null]);
+  });
+  it('判据：倒序/轮转 ⇒ toc_disordered；只剩尾段 ⇒ toc_incomplete', () => {
+    expect(tocShapeError(titles(range(1040, 1001)))).toBe('toc_disordered'); // m.bqg9：只给最新 40 章且倒序
+    expect(tocShapeError(titles([...range(51, 100), ...range(1, 50)]))).toBe('toc_disordered');
+    expect(tocShapeError(titles(range(500, 540)))).toBe('toc_incomplete');
+  });
+  it('不判：正常升序、少量错序、续作接着编号、分卷重编号、编号章不足', () => {
+    expect(tocShapeError(titles(range(1, 100)))).toBeNull();
+    const swapped = range(1, 100);
+    [swapped[10], swapped[11], swapped[50], swapped[51]] = [swapped[11], swapped[10], swapped[51], swapped[50]];
+    expect(tocShapeError(titles(swapped))).toBeNull();
+    expect(tocShapeError(titles(range(301, 600)))).toBeNull();
+    expect(tocShapeError(titles([...range(1, 20), ...range(1, 20), ...range(1, 20)]))).toBeNull();
+    expect(tocShapeError(titles(range(9, 1)))).toBeNull();
+    expect(tocShapeError([...titles(range(20, 11)), ...Array.from({ length: 10 }, (_, i) => `番外${i}`)])).toBeNull();
+  });
+  it('整本：倒序目录 ⇒ toc_disordered、零正文请求、零 book.txt', async () => {
+    const f = setup(); const reads: string[] = [];
+    const r = await run(f, titles(range(1040, 1001)), reads);
+    expect(r.code).toBe(1);
+    expect(r.manifest.status).toBe('partial');
+    expect(r.manifest.errors).toEqual(['toc_disordered']);
+    expect(reads).toEqual([]);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+  }, 60_000);
+  it('整本：只剩尾段 ⇒ toc_incomplete、零正文请求', async () => {
+    const f = setup(); const reads: string[] = [];
+    const r = await run(f, titles(range(500, 540)), reads);
+    expect(r.manifest.errors).toEqual(['toc_incomplete']);
+    expect(reads).toEqual([]);
+  }, 60_000);
+  it('DOWNLOAD_TOC_SHAPE=0 关：倒序目录照旧抓完全书 done', async () => {
+    expect(tocShape()).toBe(true);
+    vi.stubEnv('DOWNLOAD_TOC_SHAPE', '0');
+    expect(tocShape()).toBe(false);
+    const f = setup(); const reads: string[] = [];
+    const r = await run(f, titles(range(1040, 1001)), reads);
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+    expect(reads).toHaveLength(40);
   }, 60_000);
 });
 

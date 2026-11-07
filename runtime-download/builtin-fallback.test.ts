@@ -388,6 +388,40 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls).toEqual(['book15.net', 'a.example']);
   });
 
+  // tocshape1107：引擎适配器把 preview_truncated 与目录形态缺陷归 failure（不在 incomplete 白名单），
+  // 旧判据只认 incomplete ⇒ 原源预览/倒序目录直接 failed 终态、从不换源。
+  it.each(['preview_truncated', 'toc_disordered', 'toc_incomplete'])('tocshape1107：原源 failure %s ⇒ 改走引擎回退并成功', async code => {
+    const h = harness({ pool: ['https://a.example/', 'https://b.example/'] });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': { kind: 'failure', code } }, calls), adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task(), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['book15.net', 'a.example']);
+  });
+
+  it('tocshape1107：引擎腿 toc_disordered ⇒ 标 temporary 失败记忆并换下一候选源', async () => {
+    const state = {
+      usable: [
+        { source_url: 'https://engine-a.example/b1', host: 'engine-a.example' },
+        { source_url: 'https://engine-b.example/b1', host: 'engine-b.example' },
+      ],
+      stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
+    };
+    const h = candidatesHarness(state);
+    const engineTask = task({ source_kind: 'engine', source_url: 'https://origin.example/rules' });
+    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(engineTask, signal()))
+      .toEqual({ ok: true, reason: 'engine_source_candidates' });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({}, calls), adapter({
+      'engine-a.example': { kind: 'failure', code: 'toc_disordered' },
+      'engine-b.example': { kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1 },
+    }, calls), 'engine').download(engineTask, context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['engine-a.example', 'engine-b.example']);
+    expect(state.failures).toContainEqual([1, 'https://engine-a.example/b1', 'temporary', 'toc_disordered']);
+  });
+
   // paywall1026：原源 host 在 PAYWALL_HOSTS ⇒ 预检与下载腿都不碰原源，零出网直接走引擎回退。
   it('paywall1026：原源是付费墙 host ⇒ 预检不调原源、下载腿不抓预览，直接引擎回退', async () => {
     const h = harness({ pool: ['https://a.example/', 'https://b.example/'] });

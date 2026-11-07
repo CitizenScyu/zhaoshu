@@ -16,7 +16,7 @@ const atomic = (path, data) => {
   try { writeFileSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(temp, path);
 };
-const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|preview_truncated|interrupted|budget_exhausted|operation_timeout|empty_content)$/;
+const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|preview_truncated|interrupted|budget_exhausted|operation_timeout|empty_content|toc_disordered|toc_incomplete)$/;
 const isLimiterFeedbackError = error => error?.code === 'LIMITER_FEEDBACK_UNAVAILABLE'
   && error?.origin === 'limiter-feedback';
 const isHostGateError = error => error?.code === 'HOST_OCCUPIED'
@@ -214,6 +214,51 @@ export function noticeUnnumbered(env = process.env) {
 }
 export function numberedBook(titles) {
   return titles.length >= 20 && titles.filter(t => NUMBERED_TITLE.test(t)).length >= titles.length * 0.9;
+}
+
+// tocshape1107：目录形态闸门，抓正文前按章名编号（「第 N 章/节/回」，阿拉伯/全角/中文数字）判源站目录缺陷，
+// 按源级失败换源（零正文请求）。编号章 ≥ 10 且占目录 ≥ 60%、重复编号 < 5%（分卷重新编号的书不判）时：
+// - toc_disordered：相邻编号下降 > 30%（倒序），或最长非降子序列 < 80%（轮转/乱序）；
+// - toc_incomplete：最小编号 > 20 且章数 < 最大编号的一半（只剩尾段）。
+// 动机（2026-11-07 phoenix 只读，30 天 22882 份 manifest）：m.bqg9 目录只给最新 40 章且倒序，183 本被当整本发布 done；
+// 判据在 bqg9 命中 264/253/237 本，其余站只命中真实缺陷目录（itxtbook 轮转 3、ixdzs8 只剩尾段 1 等）。
+// DOWNLOAD_TOC_SHAPE=0 关（缺省开）。
+const TOC_SHAPE_NUMBER = /第\s*([0-9０-９]+|[零〇一二两三四五六七八九十百千万]+)\s*[章节回]/;
+const CN_DIGIT = new Map([['零', 0], ['〇', 0], ['一', 1], ['二', 2], ['两', 2], ['三', 3], ['四', 4], ['五', 5], ['六', 6], ['七', 7], ['八', 8], ['九', 9]]);
+const CN_UNIT = new Map([['十', 10], ['百', 100], ['千', 1000]]);
+export function tocShape(env = process.env) {
+  return env.DOWNLOAD_TOC_SHAPE?.trim() !== '0';
+}
+export function chapterNumberOf(title) {
+  const match = TOC_SHAPE_NUMBER.exec(title ?? '');
+  if (!match) return null;
+  const digits = match[1].replace(/[０-９]/g, d => String(d.charCodeAt(0) - 0xff10));
+  if (/^\d+$/.test(digits)) return Number(digits);
+  let total = 0, section = 0, num = 0;
+  for (const ch of digits) {
+    if (CN_DIGIT.has(ch)) num = CN_DIGIT.get(ch);
+    else if (CN_UNIT.has(ch)) { section += (num || 1) * CN_UNIT.get(ch); num = 0; }
+    else { total += (section + num) * 10000; section = 0; num = 0; } // 万
+  }
+  return total + section + num;
+}
+export function tocShapeError(titles) {
+  const nums = titles.map(chapterNumberOf).filter(n => n !== null);
+  if (nums.length < 10 || nums.length < titles.length * 0.6) return null;
+  if (1 - new Set(nums).size / nums.length >= 0.05) return null;
+  let descents = 0, min = Infinity, max = -Infinity;
+  const tails = []; // 最长非降子序列（耐心排序，取第一个 > x 的位置）
+  nums.forEach((x, i) => {
+    if (i > 0 && x < nums[i - 1]) descents += 1;
+    if (x < min) min = x;
+    if (x > max) max = x;
+    let lo = 0, hi = tails.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (tails[mid] <= x) lo = mid + 1; else hi = mid; }
+    tails[lo] = x;
+  });
+  if (descents / (nums.length - 1) > 0.3 || tails.length / nums.length < 0.8) return 'toc_disordered';
+  if (min > 20 && titles.length < max * 0.5) return 'toc_incomplete';
+  return null;
 }
 
 // chaperr1031：DOWNLOAD_CHAPTER_ERROR_KIND=1 时，白名单外的逐章失败（chapter.error='chapter_failed'）另记 chapter.error_kind =
@@ -542,6 +587,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     manifest.chapters = chapters.map((c, index) => ({ index, title: c.title, url: c.url, chars: 0, status: 'pending', file: `${index}.txt` }));
     await checkpoint();
     if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
+    const shapeError = tocShape() ? tocShapeError(manifest.chapters.map(c => c.title)) : null;
+    if (shapeError) throw new Error(shapeError);
     const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
     const sameBook = chapterResume() && previous?.sourceRevision === manifest.sourceRevision && previous?.bookUrl === manifest.bookUrl;
     stage = 'content';
