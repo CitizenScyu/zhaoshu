@@ -264,6 +264,11 @@ class TestSegmentUsable(unittest.TestCase):
             {'requested': 0, 'eff_chars': 0, 'stop': 'window_end', 'preview_skipped': 9}, 15_000),
             (False, 'no_request'))
 
+    def test_first_segment_zero_chars_window_end_not_usable(self):
+        self.assertEqual(labeler.segment_usable(
+            {'requested': 2, 'eff_chars': 0, 'stop': 'window_end'}, 15_000, first_segment=True),
+            (False, 'preview'))
+
 
 def _content_calls(cli, host=None):
     return [c for c in cli.calls if c[0] == 'content'
@@ -892,6 +897,12 @@ class TestFillIdentityEndToEnd(_NoSleep):
         self.assertEqual([segs[n]['source'] for n in (1, 2)], ['a.example.com'] * 2)
         self.assertTrue(segs[3]['missing'] and segs[4]['missing'])
         self.assertFalse([c for c in cli.calls if labeler._url_host(c[1]) == 'b.example.com'])
+
+    def test_numbered_short_toc_all_empty_gives_up(self):
+        """纯编号短目录（第 1 段窗口 < SEG_PROBE_CHAPTERS 章）正文全空 → 放弃该源，不得 NoneType+int 崩溃。"""
+        cli = make_cli({'a.example.com': {'n': 5, 'titles': _numbered_title, 'body': lambda i: None}})
+        with self.assertRaises(labeler.EngineSourceGaveUp):
+            _fetch(cli, _book())
 
 
 _AD_LINE = '本站永久域名请记住并推荐给书友多多支持正版订阅谢谢大家的厚爱与陪伴一路相随。'

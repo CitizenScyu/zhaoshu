@@ -2066,7 +2066,8 @@ def segment_usable(result: dict, target: int, first_segment: bool = False) -> tu
     eff = result.get('eff_chars', 0)
     if requested <= 0:
         return False, 'no_request'
-    if not first_segment and eff / requested < SEG_MIN_AVG_CHARS:
+    # 整段 0 有效字（含第 1 段短窗口自然抓完）同判 preview：否则无正文的结果被当可用，first/last 为 None
+    if eff <= 0 or (not first_segment and eff / requested < SEG_MIN_AVG_CHARS):
         return False, 'preview'
     natural_end = result.get('stop') == 'window_end' and not result.get('preview_skipped')
     if eff < target * SEG_MIN_FILL_RATIO and not natural_end:
