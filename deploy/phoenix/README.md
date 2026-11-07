@@ -24,6 +24,8 @@
 | `zhaoshu-pool-sync-copy.service` / `.timer` | 同名（每 5min 产物副本同步，OnUnitActiveSec 形态） |
 | `zhaoshu-repo-rollover.service` / `.timer` | 同名（每小时切仓探针 + ExecStartPost 台账/续期同步） |
 | `zhaoshu-download-b-reclaim.service` / `.timer` | 同名（B 线每 30min stale 任务回收，OnUnitActiveSec 形态） |
+| `zhaoshu-download-b-prune.service` / `.timer` | 同名（prune1108，B 线下载缓存每 6h 保留清理，OnUnitActiveSec 形态；见下文专节） |
+| `prune-protect.sh` | `/usr/local/lib/zhaoshu/prune-protect.sh`（prune 的 ExecStartPre，生成保护名单） |
 | `cron-call.sh` | `/usr/local/lib/zhaoshu/cron-call.sh` |
 | `nginx/book.conf` | `/etc/nginx/sites-enabled/`（生产站块，占位符版） |
 | `nginx-pool-artifact.conf`（在 shuyuan-refresh/deploy/） | vhost 443 块内 `/pool-artifact.json` location（41-poolimpl） |
@@ -54,10 +56,14 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 | `zhaoshu-repo-rollover.timer` | `*-*-* *:37:00` | 1h | `repo-auto-create.mjs` + ExecStartPost `sync-ledger-capacity.mjs` | `CRON_ALERT_HOURS` |
 | `zhaoshu-pool-sync-copy.timer` | 无 OnCalendar（`OnUnitActiveSec=5min`） | 5min | `cp pool-artifact.json → /var/lib/zhaoshu-sync/` | 不判龄（副本同步，非业务轮） |
 | `zhaoshu-download-b-reclaim.timer` | 无 OnCalendar（`OnUnitActiveSec=30min`） | 0.5h | `runtime/timer/reclaim.mjs`（B 线本机回收） | 不判龄（不写 cron_health） |
+| `zhaoshu-download-b-prune.timer` | 无 OnCalendar（`OnUnitActiveSec=6h`） | 6h | `ops/prune-download-out.mjs --apply`（B 线下载缓存保留） | 不判龄（不写 cron_health） |
 
 后三条是 2026-10-22 从现网取回补齐的（此前零登记、不受门禁覆盖）：
 - `admission-confirm` / `pool-artifact` / `repo-rollover` 已进 `src/lib/vercel-cron.test.ts` 的 TIMERS 表并做「阈值 > 间隔」断言；
 - `pool-sync-copy` / `download-b-reclaim` 是相对触发形态，只登记不做间隔断言（ExecStart 片段由 runnerFragments 钉住）。
+
+`download-b-prune` 是 2026-11-08 prune1108 新增的相对触发形态，同样只登记不做间隔断言；
+runnerFragments 钉住 `--apply` 与 `--protect`（少前者只是预演，少后者静默降级为只删 `book.txt`）。
 
 **不变量：告警阈值必须 > 实际触发间隔**，否则正常运行就会误报。该不变量由
 `src/lib/vercel-cron.test.ts` 从本目录的 timer/service 文件**真解析** `OnCalendar=` 与
@@ -83,6 +89,39 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 **为何保留**：主会话 2026-10-18 已核实它是唯一准入源、成功时写 `cron_health('admission')`、
 与路由共用 `admission_lease`。这是**有意为之的偏离**，不是遗留缺陷；要收敛到字面四约束需要
 另一次生产变更，不在本目录副本范围内。
+
+## B 线下载缓存保留（prune1108，2026-11-08）
+
+`/var/lib/zhaoshu-download-b/inst-N/download/out/<适配键>/<引擎键>/` 此前从不清理（11-08 现网 51G、
+日增约 10G，与 Postgres 同盘、根分区 0 保留块，盘满即全站停）。`zhaoshu-download-b-prune.timer`
+每 6h 跑一次 `prune-download-out.mjs --apply`，判龄只看 mtime 与 manifest 顶层 `status`：
+
+| 规则 | 条件 | 动作 |
+| --- | --- | --- |
+| 活锁 | `download.lock` 在，且 max(锁, manifest) 不足 6h（任务预算 5.5h） | 整目录不动 |
+| R1 | `book.txt` 与 manifest 都超 1h | 只删 `book.txt`（完成当刻已被读走，可由章文件重建） |
+| R2 | `status=done` 超 3d，且不在保护名单 | 整目录删 |
+| R3 | 其余（partial / 无 manifest 等）超 14d，且不在保护名单 | 整目录删 |
+
+- 保护名单 = 用户任务（`requested_by='user'`）及其候选源的适配键，由 `prune-protect.sh` 以 root 写到
+  `/run/zhaoshu-prune-protect/protect.txt`。生成失败、键数为 0 或超 2h 未更新时，本轮只做 R1。
+- 整目录先 rename 进 `<out>/.prune-trash/` 再删，worker 只会看到完整目录或没有目录；
+  改名后若发现判定时没有的新锁，就原样放回（计入 `raced`）。
+- 每轮在 journal 写一行 JSON 计数（`journalctl -u zhaoshu-download-b-prune -n 5`），不含路径与书名；
+  `freedBytes` 是 statfs 实测差值。
+
+| 仓内 | 现网 | 属主 / 权限 |
+| --- | --- | --- |
+| `scripts/prune-download-out.mjs` | `/opt/zhaoshu-download-b/ops/prune-download-out.mjs` | root:root 0644（zsdownload 只读） |
+| `deploy/phoenix/prune-protect.sh` | `/usr/local/lib/zhaoshu/prune-protect.sh` | root:root 0755 |
+
+root 执行的脚本必须由 root 持有、zsdownload 不可写；root 也只往 root 自建的目录写（防软链劫持）。
+
+- 预演（不带 `--apply` 即 dry-run，只读）：
+  `sudo -u zsdownload /opt/node24/bin/node /opt/zhaoshu-download-b/ops/prune-download-out.mjs --root /var/lib/zhaoshu-download-b --protect /run/zhaoshu-prune-protect/protect.txt`
+- 关停：`systemctl disable --now zhaoshu-download-b-prune.timer`；在跑的一轮用
+  `systemctl stop zhaoshu-download-b-prune.service` 中断，留下的回收目录下一轮自动清掉。
+- 回滚：关停 timer 即回到不清理状态。删掉的是本机下载缓存，不能恢复，只会在任务重跑时重新下载。
 
 ## release 目录布局 / 回滚
 

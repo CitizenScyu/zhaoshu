@@ -112,6 +112,8 @@ const TIMERS: TimerSpec[] = [
   // 但登记在此让目录完整性用例覆盖、runnerFragments 钉住 ExecStart 不会静默换目标。
   { timer: 'zhaoshu-pool-sync-copy.timer', alertHours: 0, runnerFragments: ['pool-artifact.json'] },
   { timer: 'zhaoshu-download-b-reclaim.timer', alertHours: 0, runnerFragments: ['reclaim.mjs'] },
+  // 少了 --protect 就静默降级为只删 book.txt，少了 --apply 就只是预演——两者都钉住。
+  { timer: 'zhaoshu-download-b-prune.timer', alertHours: 0, runnerFragments: ['prune-download-out.mjs', '--apply', '--protect'] },
 ];
 
 describe('vercel.json 不得再有 crons（调度唯一来源 = phoenix timer）', () => {

@@ -1,0 +1,20 @@
+[Unit]
+Description=zhaoshu B-line download cache retention (prune1108)
+Documentation=file:///opt/zhaoshu-download-b/ops/prune-download-out.mjs
+
+[Service]
+Type=oneshot
+User=zsdownload
+Group=zsdownload
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=2h
+# "-+": runs as root outside the sandbox (needs docker to read the DB); failure is ignored and prune falls back to book.txt-only.
+ExecStartPre=-+/usr/local/lib/zhaoshu/prune-protect.sh
+ExecStart=/opt/node24/bin/node /opt/zhaoshu-download-b/ops/prune-download-out.mjs --apply --root /var/lib/zhaoshu-download-b --protect /run/zhaoshu-prune-protect/protect.txt
+WorkingDirectory=/opt/zhaoshu-download-b
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zhaoshu-download-b

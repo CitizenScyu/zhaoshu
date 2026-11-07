@@ -1,0 +1,12 @@
+[Unit]
+Description=Run zhaoshu B-line download cache retention every 6 hours
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=6h
+AccuracySec=5min
+RandomizedDelaySec=10min
+Unit=zhaoshu-download-b-prune.service
+
+[Install]
+WantedBy=timers.target
