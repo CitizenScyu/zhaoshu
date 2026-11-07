@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // prune1108：B 线下载缓存保留。<root>/inst-N/download/out/<适配键>/<引擎键>/ 此前从不清理
 // （2026-11-08 现网 51G、日增约 10G，与 Postgres 同盘且根分区无保留块，盘满即全站停）。
 // 判龄只看 mtime 与 manifest 顶层 status（读前 512 字节），不解析整份 manifest：
