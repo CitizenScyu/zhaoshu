@@ -128,19 +128,24 @@ export async function prune({ root, protectFile, apply = false, doneDays = 3, pa
         const dir = join(adapterDir, engine.name);
         try {
           const verdict = decide(dir, adapter.name, ctx);
-          if (verdict.action === 'live') report.live += 1;
-          else if (verdict.action === 'keep') report.kept += 1;
-          else if (verdict.action === 'book') {
+          if (verdict.action === 'live') { report.live += 1; continue; }
+          if (verdict.action === 'keep') { report.kept += 1; continue; }
+          if (verdict.action === 'book') {
             if (apply) unlinkSync(join(dir, 'book.txt'));
             report.bookTxt += 1;
             report.bookTxtBytes += verdict.bytes;
-          } else {
-            if (!apply) report.dirBytesMin += exclusiveBytes(dir);
-            else if (!removeDir(dir, trash, `${adapter.name}.${engine.name}.${process.pid}`, verdict.lockMs)) { report.raced += 1; continue; }
-            else removedHere = true;
+          } else if (!apply) {
+            report.dirBytesMin += exclusiveBytes(dir);
             report[verdict.status === 'done' ? 'doneDirs' : 'otherDirs'] += 1;
-            if (apply && paceMs > 0) await sleep(paceMs);
+          } else if (removeDir(dir, trash, `${adapter.name}.${engine.name}.${process.pid}`, verdict.lockMs)) {
+            removedHere = true;
+            report[verdict.status === 'done' ? 'doneDirs' : 'otherDirs'] += 1;
+          } else {
+            report.raced += 1;
           }
+          // 根分区挂着 online discard（mq-deadline 下 ionice 也不生效），成批删会把 TRIM 堆进日志提交、
+          // 拖慢同盘 Postgres；每动一次盘歇 paceMs。
+          if (apply && paceMs > 0) await sleep(paceMs);
         } catch { report.errors += 1; }
       }
       if (removedHere) {
@@ -165,7 +170,7 @@ if (isMain) {
       apply: { type: 'boolean', default: false },
       'done-days': { type: 'string', default: '3' },
       'partial-days': { type: 'string', default: '14' },
-      'pace-ms': { type: 'string', default: '10' },
+      'pace-ms': { type: 'string', default: '50' },
     },
   });
   const atLeast = (name, min) => {

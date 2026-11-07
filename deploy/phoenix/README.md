@@ -107,6 +107,8 @@ runnerFragments 钉住 `--apply` 与 `--protect`（少前者只是预演，少�
   `/run/zhaoshu-prune-protect/protect.txt`。生成失败、键数为 0 或超 2h 未更新时，本轮只做 R1。
 - 整目录先 rename 进 `<out>/.prune-trash/` 再删，worker 只会看到完整目录或没有目录；
   改名后若发现判定时没有的新锁，就原样放回（计入 `raced`）。
+- 每删一个 `book.txt` 或整目录后歇 `--pace-ms`（默认 50ms）：根分区挂着 online `discard`、调度器是
+  mq-deadline（unit 里的 `IOSchedulingClass=idle` 不生效），成批删会把 TRIM 堆进日志提交、拖慢同盘 Postgres。
 - 每轮在 journal 写一行 JSON 计数（`journalctl -u zhaoshu-download-b-prune -n 5`），不含路径与书名；
   `freedBytes` 是 statfs 实测差值。
 
