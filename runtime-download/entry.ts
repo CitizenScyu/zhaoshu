@@ -349,6 +349,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       skipStrictToc: skipStrictTocEnabled(env),
       dedupeVariants: dedupeVariantsEnabled(env),
       skipZeroYield: skipZeroYieldEnabled(env),
+      recallPoolCheck: env.DOWNLOAD_RECALL_POOL_CHECK !== '0',
       missMemo: scanMissMemoEnabled(env) ? createScanMissMemo(scanMissDir(options.workDir)) : undefined,
       scanConcurrency: scanConcurrency(env),
       ...(sharedSuspect ? { isSuspect: (host: string) => isHostSuspect(host) || sharedSuspect.isSuspect(host) } : {}),

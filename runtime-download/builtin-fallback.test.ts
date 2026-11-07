@@ -653,6 +653,64 @@ describe('41-T8FB builtin-fallback', () => {
     expect(all.searched).toEqual(['b.example']);
   });
 
+  it('poolrecall1107：recallPoolCheck 开 ⇒ recall 剔池里已解析不到的旧候选（同站键/前缀照留）；关/池读失败 ⇒ 照取', async () => {
+    const usable = [
+      { source_url: 'https://gone.example/b1', host: 'gone.example' },
+      { source_url: 'https://m.twin.example/b1', host: 'm.twin.example' },
+      { source_url: 'https://a.example/b1', host: 'a.example' },
+    ];
+    const pool = ['https://www.twin.example/', 'https://a.example/', 'https://b.example/'];
+    const build = (recallPoolCheck: boolean, loadPool: () => Promise<string[]>, rows = usable) => {
+      const searched: string[] = [];
+      const logs: [string, Record<string, unknown> | undefined][] = [];
+      const fallback = createBuiltinFallback({
+        modules: {
+          compile: { compileSource: () => ({}) },
+          supported: { BUILTIN_SOURCE_HOSTS: ['book15.net'] },
+          api: {
+            engineSearchBook: async (engine: { url: string }) => {
+              searched.push(hostOf(engine.url));
+              return [{ title: '测试书', author: '佚名', bookUrl: `https://${hostOf(engine.url)}/b/1` }];
+            },
+            engineFetchDetail: async () => ({ title: '测试书', author: '佚名' }),
+          },
+        },
+        transport: async () => { throw new Error('unused'); },
+        loadPool: async () => (await loadPool()).map(url => ({ url, name: url, searchUrl: '/s' })),
+        candidates: {
+          usable: async () => rows,
+          failedSources: async () => new Set<string>(),
+          replace: async () => {},
+          markFailure: async () => {},
+          occupiedHosts: async () => new Set<string>(),
+        },
+        log: (_level, message, fields) => { logs.push([message, fields]); },
+        recallPoolCheck,
+      });
+      const recalled = async () => {
+        const calls: string[] = [];
+        await fallback.wrapAdapter(adapter({}, []), adapter({}, calls)).download(task(), context());
+        return calls.slice(0, 2);
+      };
+      return { fallback, searched, logs, recalled };
+    };
+    // 开：gone.example 出池不取；m.twin 与池里 www.twin 同站照取。
+    const on = build(true, async () => pool);
+    expect(await on.recalled()).toEqual(['m.twin.example', 'a.example']);
+    expect(on.logs).toContainEqual(['旧候选已出池跳过', { taskId: 7, hosts: ['gone.example'] }]);
+    // 与 resolveSource 最长前缀同口径：池 URL 是候选 URL 前缀即算解析得到（哪怕站键不同）。
+    const prefixed = [{ source_url: 'https://gone.example.mirror.net/b1', host: 'gone.example.mirror.net' }];
+    expect((await build(true, async () => ['https://gone.example'], prefixed).recalled())[0]).toBe('gone.example.mirror.net');
+    // 关 / 池读失败：照旧按库序取。
+    expect(await build(false, async () => pool).recalled()).toEqual(['gone.example', 'm.twin.example']);
+    expect(await build(true, async () => { throw new Error('db down'); }).recalled()).toEqual(['gone.example', 'm.twin.example']);
+    // 旧候选全出池 ⇒ recall 全空，预检走出网重选。
+    const all = build(true, async () => pool, [usable[0]]);
+    expect(await all.fallback.wrapPrecheck(async () => UNAVAILABLE)(task(), signal()))
+      .toEqual({ ok: true, reason: 'builtin_engine_fallback' });
+    expect(all.searched[0]).toBe('www.twin.example');
+  });
+
   // bsrcfix-41：候选源持久化接缝（无 DB 时缺省 = 内存单槽旧行为，上面用例已覆盖；这里钉接缝语义）。
   // recall 上限是 min(maxSources, hostTarget)（默认 2/2）：多源逐一下载的用例要显式放开两者。
   function candidatesHarness(state: {

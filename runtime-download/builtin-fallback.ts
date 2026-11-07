@@ -22,6 +22,7 @@
 // 下载腿（并发=1，同一时刻只有一本在跑）。预检关闭（DOWNLOAD_IDENTITY_PRECHECK=0）时由下载腿自己选源。
 
 import { isHostSuspect, isPaywallHost } from '../src/lib/source-host-health';
+import { stationKeyOfHost } from '../src/lib/source-policy';
 import {
   isBudgetExhausted, isLeaseLostError, TaskLeaseLostError,
   type AdapterOutcome, type SourceAdapter, type TaskRow,
@@ -105,6 +106,12 @@ export interface BuiltinFallbackOptions {
   dedupeVariants?: boolean;
   /** zeroskip1105：透传给 selector，零产出 host（hostPriority 负分）出池不扫；缺省关。 */
   skipZeroYield?: boolean;
+  /**
+   * poolrecall1107：recall 只取池里仍解析得到的旧候选（与 resolveSource 同口径：URL 前缀或同站键）；缺省关。
+   * 源被停用/出池后旧候选必落空 no_engine_source_for_host——2026-11-07 停用 bqg9/59wt 后 12h 仍被召回 195 次，
+   * 每次白扣一次日额度和一次 attempt。池读失败按不过滤（同改前）。
+   */
+  recallPoolCheck?: boolean;
   /** scanmiss1101：透传给 selector 的确认无书记忆；缺省无（逐字同改前）。 */
   missMemo?: ScanMissMemo;
   /** scanpar1104：透传给 selector 的同时探测源数；缺省 1（串行，逐字同改前）。 */
@@ -226,7 +233,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
    * min(maxSources, hostTarget) 个；过滤后为空 ⇒ 返回 null（走出网选源——已失败候选不重试，重扫补新源）。
    * 读库失败返回空数组，停止本轮，不盲扫。
    * zeroskip1105b：skipZeroYield 开时零产出 host（hostPriority 负分）的旧候选同样不取（与出网选源同口径；
-   * 优先分读失败按空表，不剔）。
+   * 优先分读失败按空表，不剔）。poolrecall1107：recallPoolCheck 开时池里已解析不到的旧候选不取（见选项注释）。
    */
   const recallSources = async (task: TaskRow, signal: AbortSignal): Promise<string[] | null> => {
     if (!candidates) return null;
@@ -240,15 +247,29 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     if (options.skipZeroYield && options.hostPriority && rows.length) {
       try { priority = await options.hostPriority(signal); } catch { signal.throwIfAborted(); }
     }
+    let inPool: ((url: string) => boolean) | null = null;
+    if (options.recallPoolCheck && rows.length) {
+      try {
+        const pool = await options.loadPool(signal);
+        const stations = new Set(pool.map(source => stationKeyOfHost(hostOf(source.url))).filter(Boolean));
+        inPool = url => stations.has(stationKeyOfHost(hostOf(url))) || pool.some(source => Boolean(source.url) && url.startsWith(source.url));
+      } catch { signal.throwIfAborted(); }
+    }
+    const outOfPool: string[] = [];
     const picked: string[] = [];
     for (const row of rows) {
       const host = hostOf(row.source_url);
       if (!/^https:\/\//i.test(row.source_url) || !host || builtinHosts.has(host) || isSuspect(host) || isPaywallHost(host)) continue;
       if ((priority.get(host) ?? 0) < 0) continue;
+      if (inPool && !inPool(row.source_url)) {
+        if (!outOfPool.includes(host)) outOfPool.push(host);
+        continue;
+      }
       if (picked.some(url => hostOf(url) === host)) continue;
       picked.push(row.source_url);
       if (picked.length >= Math.min(maxSources, hostTarget)) break;
     }
+    if (outOfPool.length) log('info', '旧候选已出池跳过', { taskId: task.id, hosts: outOfPool });
     return picked.length ? picked : null;
   };
 
