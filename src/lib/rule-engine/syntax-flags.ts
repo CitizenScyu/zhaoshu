@@ -976,6 +976,16 @@ export function engineJsPreludeGraceEnabled(env: OrEnv = process.env): boolean {
 }
 
 /**
+ * ENGINE_JS_LIST_DEADLINE_MS（listdeadline1107，默认 0 = 关）：列表 JS（runJsItems / runJsoupItems）的中断时限毫秒数，上限 5000；
+ * 沙箱取它与 250ms 的较大者。列表 JS 整页只求值一次，宿主 getString 解析整页 DOM、逐章拼条目、沙箱内序列化都算在时限里：
+ * ixdzs8 两千章的书页在生产 2 核 20 实例满载下约半数被挤过 250ms（InternalError: interrupted）。非数字按 0；预算计账不变。
+ */
+export function engineJsListDeadlineMs(env: OrEnv = process.env): number {
+  const raw = Number(env.ENGINE_JS_LIST_DEADLINE_MS?.trim() || NaN);
+  return Number.isFinite(raw) ? Math.min(Math.max(Math.floor(raw), 0), 5_000) : 0;
+}
+
+/**
  * ENGINE_JS_PURE_MEMO 独立开关（purememo1031，默认 off，口径同 ENGINE_SYNTAX_OR）。规则级 makeUp 的 `{{JS}}` 只读 baseUrl、只用纯字符串
  * 方法时（如 kuwo 目录 chapterUrl `{{baseUrl.replace('?paging=0','')}}`），同页每条结果相同，却逐条进沙箱：千章目录在生产 2 核满载下
  * 每条超出免计账额度，撞「JS 执行预算耗尽（该段代码）」。on = 这类代码按（代码, baseUrl）记忆结果，同值只进一次沙箱。off = 逐字不变。

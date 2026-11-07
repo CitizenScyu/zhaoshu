@@ -19,7 +19,7 @@ import {
   decodeJsoupInit, decodeJsoupItems, decodeJsoupValue, exportJsoup, installJsoupHost, JSOUP_PRELUDE, type JsoupListItem, type JsoupMode,
   JsoupSession,
 } from './jsoup-shim';
-import { engineJsPreludeGraceEnabled } from './syntax-flags';
+import { engineJsListDeadlineMs, engineJsPreludeGraceEnabled } from './syntax-flags';
 import { RuleEngineError } from './types';
 
 const WASM_INITIAL_PAGES = 256; // 16MB
@@ -314,7 +314,12 @@ export function runJs(code: string, bindings: JsBindings, budgetKey = code): JsV
  * 沙箱里只做序列化，形状由宿主逐项校验，不信任沙箱产出。资源上限、预算与 runJs 同一套。
  */
 export function runJsItems(code: string, bindings: JsBindings): JsListItem[] | null {
-  return execute(code, bindings, exportItems);
+  return execute(code, bindings, exportItems, code, undefined, listDeadlineMs());
+}
+
+/** listdeadline1107：列表 JS 整页一次求值，时限按 ENGINE_JS_LIST_DEADLINE_MS 放宽（缺省 = EVAL_DEADLINE_MS）。 */
+function listDeadlineMs(): number {
+  return Math.max(EVAL_DEADLINE_MS, engineJsListDeadlineMs());
 }
 
 /**
@@ -347,13 +352,13 @@ export function runJsoupInit(code: string, bindings: JsBindings, budgetKey = cod
 /** jsoup1028 列表字段末段 JS：Elements 与数组里的 Element 逐个成为条目，其余口径同 runJsItems。 */
 export function runJsoupItems(code: string, bindings: JsBindings): JsoupListItem[] | null {
   const session = new JsoupSession(bindings.jsoup?.getElements);
-  return execute(code, bindings, (context, handle) => decodeJsoupItems(exportJsoup(context, handle, session, 'items'), session), code, session);
+  return execute(code, bindings, (context, handle) => decodeJsoupItems(exportJsoup(context, handle, session, 'items'), session), code, session, listDeadlineMs());
 }
 
 /** `budgetKey`：按哪段代码记预算（jsext1028 makeUp 后的代码随占位值变，按段原文记，免得每次换键绕过单段预算）。 */
 function execute<T>(
   code: string, bindings: JsBindings, exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null,
-  budgetKey = code, session?: JsoupSession,
+  budgetKey = code, session?: JsoupSession, deadlineMs = EVAL_DEADLINE_MS,
 ): T | null {
   const wasm = ready;
   // 异常丢弃（discardModule）后的未就绪单独标出：页内装饰字段吞掉的「沙箱异常」会让随后的核心字段报未就绪（rulehint 分类用）。
@@ -371,7 +376,7 @@ function execute<T>(
   const startedPrecise = performance.now();
   checkBudget(budgetKey, started);
   try {
-    return runInFreshRuntime(wasm, code, bindings, started + EVAL_DEADLINE_MS, exporter, session);
+    return runInFreshRuntime(wasm, code, bindings, started, deadlineMs, exporter, session);
   } catch (error) {
     if (error instanceof RuleEngineError) throw error;
     discardModule();
@@ -382,13 +387,13 @@ function execute<T>(
 }
 
 function runInFreshRuntime<T>(
-  module: QuickJSWASMModule, code: string, bindings: JsBindings, deadline: number,
+  module: QuickJSWASMModule, code: string, bindings: JsBindings, started: number, deadlineMs: number,
   exporter: (context: QuickJSContext, handle: QuickJSHandle) => T | null, session?: JsoupSession,
 ): T | null {
   const runtime = module.newRuntime();
-  // preludegrace1031：on 时宿主装配 + prelude（自家固定代码）另给 PRELUDE_DEADLINE_MS，规则代码（jsLib + code）从 prelude 后起算 250ms。
+  // preludegrace1031：on 时宿主装配 + prelude（自家固定代码）另给 PRELUDE_DEADLINE_MS，规则代码（jsLib + code）从 prelude 后起算 deadlineMs。
   const grace = engineJsPreludeGraceEnabled();
-  let limit = grace ? Date.now() + PRELUDE_DEADLINE_MS : deadline;
+  let limit = grace ? Date.now() + PRELUDE_DEADLINE_MS : started + deadlineMs;
   try {
     runtime.setMemoryLimit(RUNTIME_MEMORY_LIMIT);
     runtime.setMaxStackSize(RUNTIME_STACK_LIMIT);
@@ -406,7 +411,7 @@ function runInFreshRuntime<T>(
         return evalFailed(`JS 沙箱初始化失败：${message}`);
       }
       prelude.value.dispose();
-      if (grace) limit = Date.now() + EVAL_DEADLINE_MS;
+      if (grace) limit = Date.now() + deadlineMs;
       if (bindings.jsLib !== undefined) {
         const lib = context.evalCode(bindings.jsLib, 'lib.js');
         if (lib.error) {
