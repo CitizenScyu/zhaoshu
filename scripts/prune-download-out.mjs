@@ -142,8 +142,7 @@ export async function prune({ root, protectFile, apply = false, doneDays = 3, pa
           } else {
             report.raced += 1;
           }
-          // 根分区挂着 online discard（mq-deadline 下 ionice 也不生效），成批删会把 TRIM 堆进日志提交、
-          // 拖慢同盘 Postgres；每动一次盘歇 paceMs。
+          // mq-deadline 下 ionice 不生效，成批删的元数据写会拖慢同盘 Postgres；每动一次盘歇 paceMs。
           if (apply && paceMs > 0) await sleep(paceMs);
         } catch { report.errors += 1; }
       }

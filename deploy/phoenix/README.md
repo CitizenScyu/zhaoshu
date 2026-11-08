@@ -107,8 +107,9 @@ runnerFragments 钉住 `--apply` 与 `--protect`（少前者只是预演，少�
   `/run/zhaoshu-prune-protect/protect.txt`。生成失败、键数为 0 或超 2h 未更新时，本轮只做 R1。
 - 整目录先 rename 进 `<out>/.prune-trash/` 再删，worker 只会看到完整目录或没有目录；
   改名后若发现判定时没有的新锁，就原样放回（计入 `raced`）。
-- 每删一个 `book.txt` 或整目录后歇 `--pace-ms`（默认 50ms）：根分区挂着 online `discard`、调度器是
-  mq-deadline（unit 里的 `IOSchedulingClass=idle` 不生效），成批删会把 TRIM 堆进日志提交、拖慢同盘 Postgres。
+- 每删一个 `book.txt` 或整目录后歇 `--pace-ms`（默认 50ms）：调度器是 mq-deadline（unit 里的
+  `IOSchedulingClass=idle` 不生效），成批删的元数据写会和同盘 Postgres 抢 IO。根分区原先还挂着 online
+  `discard`，删除会再排出一长串 TRIM；11-08 已去掉，见下节。
 - 每轮在 journal 写一行 JSON 计数（`journalctl -u zhaoshu-download-b-prune -n 5`），不含路径与书名；
   `freedBytes` 是 statfs 实测差值。
 
@@ -124,6 +125,21 @@ root 执行的脚本必须由 root 持有、zsdownload 不可写；root 也只�
 - 关停：`systemctl disable --now zhaoshu-download-b-prune.timer`；在跑的一轮用
   `systemctl stop zhaoshu-download-b-prune.service` 中断，留下的回收目录下一轮自动清掉。
 - 回滚：关停 timer 即回到不清理状态。删掉的是本机下载缓存，不能恢复，只会在任务重跑时重新下载。
+
+## 根分区去掉 online discard（2026-11-08）
+
+`/`（ext4，`LABEL=cloudimg-rootfs`，与 Postgres、B 线缓存同盘）原先以 `discard,errors=remount-ro` 挂载。
+prune 首轮成批删除后，ext4 把释放的区间排进后台 discard 队列逐段下发，积压持续了几个小时：
+IO PSI（some avg60）约 52%、盘忙 59–96%、load 约 5.2，同盘 Postgres 一起变慢。
+
+- `/etc/fstab` 根分区去掉 `discard`（默认即不在线 TRIM；原文件备份在 `/root/zs-backup/fstab-20261108-091732`），
+  并 remount 生效。TRIM 交给系统自带的每周 `fstrim.timer`。
+- remount 只挡住新的排队，已经排进去的仍按原速下发。清掉积压的办法：把
+  `/sys/block/sda/queue/discard_max_bytes` 临时写 0，块层对 discard 直接返回 `EOPNOTSUPP`，ext4 跳过剩余区间，
+  几秒内清空；随后写回原值 `2147483648`。原值与恢复命令记在 `/root/zs-backup/sda-discard-20261108-112012.txt`。
+  跳过的区间只是少发了一次 TRIM，不影响数据。
+- 处置后 IO PSI 降到约 8%、盘忙约 16%、load 约 1.5。
+- 回滚：换回 fstab 备份并 `mount -o remount,discard /`。不建议，批量删除会再次堆出 TRIM 积压。
 
 ## release 目录布局 / 回滚
 
