@@ -26,6 +26,10 @@
 | `zhaoshu-download-b-reclaim.service` / `.timer` | 同名（B 线每 30min stale 任务回收，OnUnitActiveSec 形态） |
 | `zhaoshu-download-b-prune.service` / `.timer` | 同名（prune1108，B 线下载缓存每 6h 保留清理，OnUnitActiveSec 形态；见下文专节） |
 | `prune-protect.sh` | `/usr/local/lib/zhaoshu/prune-protect.sh`（prune 的 ExecStartPre，生成保护名单） |
+| `zhaoshu-maint-window.service` / `.timer` | 同名（每天 07:40、19:40 维护窗口；见下文专节） |
+| `maint-window.sh` / `pool-unregistered.mjs` | `/usr/local/lib/zhaoshu/` 同名（维护窗口脚本与只读选 host） |
+| `nosrc-tool.sh` | `/root/zs-backup/nosrc-tool.sh`（无源书清理工具；见下文专节） |
+| `zs-nosrc-p2.service` / `.timer` | 同名（临时，每天 10:30；清理收尾后自行 disable） |
 | `cron-call.sh` | `/usr/local/lib/zhaoshu/cron-call.sh` |
 | `nginx/book.conf` | `/etc/nginx/sites-enabled/`（生产站块，占位符版） |
 | `nginx-pool-artifact.conf`（在 shuyuan-refresh/deploy/） | vhost 443 块内 `/pool-artifact.json` location（41-poolimpl） |
@@ -57,6 +61,7 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 | `zhaoshu-pool-sync-copy.timer` | 无 OnCalendar（`OnUnitActiveSec=5min`） | 5min | `cp pool-artifact.json → /var/lib/zhaoshu-sync/` | 不判龄（副本同步，非业务轮） |
 | `zhaoshu-download-b-reclaim.timer` | 无 OnCalendar（`OnUnitActiveSec=30min`） | 0.5h | `runtime/timer/reclaim.mjs`（B 线本机回收） | 不判龄（不写 cron_health） |
 | `zhaoshu-download-b-prune.timer` | 无 OnCalendar（`OnUnitActiveSec=6h`） | 6h | `ops/prune-download-out.mjs --apply`（B 线下载缓存保留） | 不判龄（不写 cron_health） |
+| `zhaoshu-maint-window.timer` | `*-*-* 07:40:00` + `*-*-* 19:40:00` | 12h | `/usr/local/lib/zhaoshu/maint-window.sh` | 不判龄（不写 cron_health） |
 
 后三条是 2026-10-22 从现网取回补齐的（此前零登记、不受门禁覆盖）：
 - `admission-confirm` / `pool-artifact` / `repo-rollover` 已进 `src/lib/vercel-cron.test.ts` 的 TIMERS 表并做「阈值 > 间隔」断言；
@@ -64,6 +69,8 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 
 `download-b-prune` 是 2026-11-08 prune1108 新增的相对触发形态，同样只登记不做间隔断言；
 runnerFragments 钉住 `--apply` 与 `--protect`（少前者只是预演，少后者静默降级为只删 `book.txt`）。
+`maint-window`（2026-11-09）有 OnCalendar，但不写 cron_health，也登记为 `alertHours: 0`。
+`zs-nosrc-p2.timer` 是一次性清理的临时 timer，不以 `zhaoshu-` 开头，不进 TIMERS 表。
 
 **不变量：告警阈值必须 > 实际触发间隔**，否则正常运行就会误报。该不变量由
 `src/lib/vercel-cron.test.ts` 从本目录的 timer/service 文件**真解析** `OnCalendar=` 与
@@ -140,6 +147,67 @@ IO PSI（some avg60）约 52%、盘忙 59–96%、load 约 5.2，同盘 Postgres
   跳过的区间只是少发了一次 TRIM，不影响数据。
 - 处置后 IO PSI 降到约 8%、盘忙约 16%、load 约 1.5。
 - 回滚：换回 fstab 备份并 `mount -o remount,discard /`。不建议，批量删除会再次堆出 TRIM 积压。
+
+## 维护窗口（maint-window，2026-11-09）
+
+两件事都要先停全部 B 线 worker，合并到一个窗口里做：
+
+- **登记新 host**：准入每天会往源池加新 host，但共享限速登记表不会自动跟进，没登记的 host
+  worker 拿不到锁（`HOST_LOCK_MISSING`），等于白进池。
+- **释放 worker 内存**：11-08 16:00 到 11-09 01:45，20 个 worker 的 RSS 合计稳定在约 8.2G，
+  swap 却从 733M 涨到 1528M，其中约 1G 在 B 线 slice（匿名页被慢慢换出）。01:46 重启一次后，
+  slice 的 swap 归零，整机 swap 降到 496M，可用内存从 2.9G 回到 4.9G。
+
+`zhaoshu-maint-window.timer` 每天 07:40、19:40（北京时间）跑 `maint-window.sh`：
+
+1. 拿 `/run/zs-maint.lock`；校验脚本与 `/usr/local/lib/zhaoshu/` 都是 root 持有且组/他人不可写；
+   记下当前在跑的实例号。
+2. 以 zsdownload 只读运行 `pool-unregistered.mjs 5`，挑最多 5 个 host。条件：在源池产物 `hosts[]` 里，
+   也是某条启用中的引擎源 `source_url` 的 host；登记表里没有，数据根下也没有它的目录；不在拒绝名单
+   （`PAYWALL_HOSTS` 加 `m.yuedu.163.com`、`www.ciweimao.com`、`so.html.qq.com`）；host 名过正则。
+3. 停全部 worker（SIGTERM，在跑的任务先存进度）。有待登记的 host 就先把登记表备份到
+   `/root/zhaoshu-backfill/poolreg-window-<ts>/`，再用 `register-hosts.mjs` 登记。
+4. 把第 1 步记下的实例原样拉起。任何一步失败都由 trap 拉起 worker。
+
+11-09 01:46 首次运行登记了 `jyapi.jyacg.com`，worker 停机约 10 秒。07:40 落在每日 08:00
+（UTC 零点）按 host 预算重置之前。
+
+- 日志：`journalctl -u zhaoshu-maint-window`（只有 host 名与计数，不含 authority/epoch/rootId）。
+- 关停：`systemctl disable --now zhaoshu-maint-window.timer`。
+- 撤销某次登记：停全部 worker；以 zsdownload 把备份里的 `registry.json` 拷回
+  `/var/lib/zhaoshu-download-b/control/`；以 zsdownload 删掉 `registered.tsv` 列出的 host 目录；
+  再起 worker。
+- 20 个实例 `zhaoshu-download-b@1..20` 都必须 enable（11-09 发现 1–12 未 enable，重启后不会自启，已补）。
+
+B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，drop-in 在
+`/etc/systemd/system.control/system-zhaoshu\x2ddownload\x2db.slice.d/50-MemoryMax.conf`）。
+11-09 前的峰值是 9.6G。到上限时只在 slice 内回收或 OOM，不会挤占 Postgres、web 和其它容器。
+回滚：`systemctl set-property 'system-zhaoshu\x2ddownload\x2db.slice' MemoryMax=infinity`。
+
+维护类脚本（`maint-window.sh`、`nosrc-tool.sh p2run`）都用 `flock` 拿 `/run/zs-maint.lock`，互不重叠。
+
+## 无源书清理（nosrc，2026-11-09）
+
+清理对象：`source_url` 是 QQ 付费墙 host（`PAYWALL_HOSTS`）的书，没有 done/pending/running 任务，
+最新任务以 `no_candidates`（搜遍源池没有免费源）失败，候选表里也没有可用的免费候选。
+工具是 `nosrc-tool.sh`（phoenix 上 `/root/zs-backup/nosrc-tool.sh`，root 0700）。
+
+- **备份**（`backup`）：全库 `pg_dump -Fc`，涉及的 7 张表（书、产物、任务、候选、预取、追更、
+  容量预留）按书 id 导出 CSV，生成单事务的 `restore.sh`。
+- **删除**（`delete`）在一个事务里先做这些检查，任一不符就整体回滚：
+  - 外键白名单、无用户触发器；
+  - 锁住这些书，逐本复核仍符合清理条件；
+  - 没有集合外的任务或追更指向这些行；
+  - 每张表删除的行数等于备份行数。
+- **第一阶段**（11-09 01:01）：删除最终判定在 11-07 之后的 311 本。备份在
+  `/root/zs-backup/nosrc-p1-20261109-010126/`，回滚跑其中的 `restore.sh`。
+- **第二阶段**：其余 1504 本先各排一次末次搜索（`source_revision=lastcall-20261109`）。
+  `zs-nosrc-p2.timer` 每天 10:30 跑 `p2run`：先备份，再删末次搜索仍是 `no_candidates` 的书，
+  有用户请求或有免费候选的书不删。末次任务全部跑完，或日期过了 11-25，就自行 disable。
+  回滚步骤见 `/root/zs-backup/nosrc-lastcall-20261109/rollback.txt`。
+- **不清理的部分**：
+  - 被删产物在 GitHub 仓库里的文件不动（第一阶段约 216.9MB）。容量台账是增量记账，不受影响。
+  - `import_labels.mjs` 重新导入名单时，这些书会以新 id 回到书库。
 
 ## release 目录布局 / 回滚
 

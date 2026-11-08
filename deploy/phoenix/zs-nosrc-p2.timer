@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily nosrc lastcall cleanup; nosrc-tool.sh disables this timer once the cohort settles
+
+[Timer]
+OnCalendar=*-*-* 10:30:00
+
+[Install]
+WantedBy=timers.target

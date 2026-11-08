@@ -1,0 +1,8 @@
+[Unit]
+Description=zhaoshu maintenance window: restart B-line workers, register new free pool hosts
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/zhaoshu/maint-window.sh
+TimeoutStartSec=30min

@@ -114,6 +114,8 @@ const TIMERS: TimerSpec[] = [
   { timer: 'zhaoshu-download-b-reclaim.timer', alertHours: 0, runnerFragments: ['reclaim.mjs'] },
   // 少了 --protect 就静默降级为只删 book.txt，少了 --apply 就只是预演——两者都钉住。
   { timer: 'zhaoshu-download-b-prune.timer', alertHours: 0, runnerFragments: ['prune-download-out.mjs', '--apply', '--protect'] },
+  // 维护窗口有 OnCalendar 但不写 cron_health，同样不判龄，只钉 ExecStart。
+  { timer: 'zhaoshu-maint-window.timer', alertHours: 0, runnerFragments: ['maint-window.sh'] },
 ];
 
 describe('vercel.json 不得再有 crons（调度唯一来源 = phoenix timer）', () => {
