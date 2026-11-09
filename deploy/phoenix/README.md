@@ -221,6 +221,15 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   - 被删产物在 GitHub 仓库里的文件不动（第一阶段约 216.9MB）。容量台账是增量记账，不受影响。
   - `import_labels.mjs` 重新导入名单时，这些书会以新 id 回到书库。
 
+## 少量缺章占位发布（gappub1109，2026-11-09）
+
+- drop-in `zhaoshu-download-b@.service.d/89-gappub.conf`：`DOWNLOAD_GAP_PUBLISH=1`。整本只缺 ≤3 章且 ≤2% 时，
+  缺的章写「（本章源站下载失败，暂缺正文。）」照常发布；清单记 `chapters_missing`，任务行与 book_artifacts 的
+  `chapters_done` 只算实有正文的章，书库显示「完成（缺 N 章）」。
+- 晋升保护：带缺章的新版本实有章数少于已发布版本时不晋升（`superseded_by_incomplete`）。
+- 不会自动补缺：占位章不进续传缓存，书再被重下（requeue/追更）时会重抓，抓到就换成正文。
+- 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`；已发布的缺章书不受影响。
+
 ## release 目录布局 / 回滚
 
 ```
