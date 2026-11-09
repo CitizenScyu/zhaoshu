@@ -913,6 +913,7 @@ describe('noticeskip1031 公告章占位', () => {
 
 // gappub1109：少量缺章（≤3 且 ≤2%）写占位整本发布（DOWNLOAD_GAP_PUBLISH，缺省关）。
 describe('gappub1109 少量缺章占位发布', () => {
+  type GapManifest = { status: string; chapters: { status: string; gap?: boolean; chars: number }[]; chapters_missing?: number; chapters_done?: number; chars?: number };
   afterEach(() => { vi.unstubAllEnvs(); });
   /** n 章书；empty 里的章（1 起）正文为空 → empty_content_page 逐章失败。 */
   const wrap = (f: ReturnType<typeof setup>, n: number, empty: Set<number>) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
@@ -952,22 +953,24 @@ describe('gappub1109 少量缺章占位发布', () => {
     const f = setup();
     const empty = new Set([7]);
     const r = await f.run(wrap(f, 50, empty));
+    const m = r.manifest as GapManifest;
     expect(r.code).toBe(0);
-    expect(r.manifest.status).toBe('done');
-    expect(r.manifest.chapters_missing).toBe(1);
-    expect(r.manifest.chapters_done).toBe(49);
-    expect(r.manifest.chapters[6]).toMatchObject({ status: 'done', gap: true });
-    expect(r.manifest.chars).toBe(r.manifest.chapters.filter((c: { gap?: boolean }) => !c.gap).reduce((n: number, c: { chars: number }) => n + c.chars, 0));
+    expect(m.status).toBe('done');
+    expect(m.chapters_missing).toBe(1);
+    expect(m.chapters_done).toBe(49);
+    expect(m.chapters[6]).toMatchObject({ status: 'done', gap: true });
+    expect(m.chars).toBe(m.chapters.filter((c: { gap?: boolean }) => !c.gap).reduce((n: number, c: { chars: number }) => n + c.chars, 0));
     const book = readFileSync(join(dirname(r.manifestPath), 'book.txt'), 'utf8');
     expect(book).toContain('第7章\n\n（本章源站下载失败，暂缺正文。）\n\n');
-    expect(r.manifest.chapters).toHaveLength(50);
+    expect(m.chapters).toHaveLength(50);
 
     empty.clear();
     const again = await f.run(wrap(f, 50, empty));
+    const m2 = again.manifest as GapManifest;
     expect(again.code).toBe(0);
-    expect(again.manifest.chapters_missing).toBeUndefined();
-    expect(again.manifest.chapters_done).toBe(50);
-    expect(again.manifest.chapters[6].gap).toBeUndefined();
+    expect(m2.chapters_missing).toBeUndefined();
+    expect(m2.chapters_done).toBe(50);
+    expect(m2.chapters[6].gap).toBeUndefined();
     expect(readFileSync(join(dirname(again.manifestPath), '6.txt'), 'utf8')).toContain('合成正文');
   }, 60_000);
 
@@ -977,7 +980,7 @@ describe('gappub1109 少量缺章占位发布', () => {
       const f = setup();
       const r = await f.run(wrap(f, n, new Set(empty)));
       expect(r.manifest.errors).toEqual(['missing_chapters']);
-      expect(r.manifest.chapters_missing).toBeUndefined();
+      expect((r.manifest as GapManifest).chapters_missing).toBeUndefined();
     }
   }, 120_000);
 });
