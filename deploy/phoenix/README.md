@@ -242,6 +242,18 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
     `source_revision LIKE 'gapfill-%' AND status='pending'` 删除。
 - 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`；已发布的缺章书不受影响。
 
+## 发布 409 重试与重领复用整本（pub409 / pubreplay1110，2026-11-10）
+
+- contents API 的 PUT 遇 409（20 个 worker 往同一分支提交，分支头在读 sha 与写之间被推进）就地重读 sha 重写，
+  最多 4 次、抖动退避约 1/2/4/8s；其余状态码不重试。仍失败才走原「发布失败，自动退避重试」放回 pending。
+- drop-in `zhaoshu-download-b@.service.d/90-pubreplay.conf`：`DOWNLOAD_PUBLISH_REPLAY=1`。整本下完后在引擎目录写
+  `publish-replay.json`（任务 id + 整本 sha）；同一任务再领时在本实例和兄弟实例同适配键下找它，逐章核 sha256、
+  拼回整本且 sha 与 manifest 相符才直接发布，不再重跑 search/toc（源熔断时整本也能发出）。追更、补缺、重排都是
+  新任务行，照常联网；目录持锁、被别的任务重跑或任一校验不过都按不命中照常下载。标记随引擎目录被 prune 删除。
+- 日志：「发布失败，已退避放回」{taskId, stage, retryAt}、「重领复用本地整本，跳过联网」{taskId, chapters, peer}、
+  「任务失租约，交回收器」{taskId}。
+- 关闭复用：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
+
 ## release 目录布局 / 回滚
 
 ```
