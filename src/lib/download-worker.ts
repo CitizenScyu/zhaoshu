@@ -732,6 +732,8 @@ export interface EngineDownloadLike {
     }>;
 }
 
+export type EngineManifest = Awaited<ReturnType<EngineDownloadLike>>['manifest'];
+
 export interface EngineAdapterOptions {
   downloadBook: EngineDownloadLike;
   modules: unknown;
@@ -742,6 +744,11 @@ export interface EngineAdapterOptions {
   outRoot: string;
   /** resumeseed1031：开跑前整理本任务 out 目录（跨实例续传种子/清残留锁）；尽力而为，抛错不影响下载。 */
   prepareOut?: (out: string) => void;
+  /** pubreplay1110：同一任务再领时复用它上次的完整缓存（见 runtime-download/publish-replay.ts）；尽力而为，抛错按不命中。 */
+  replay?: {
+    find: (out: string, taskId: number) => { manifest: EngineManifest; txt: string } | null;
+    record: (out: string, taskId: number, artifactSha256: string) => void;
+  };
   /** 引擎腿固定参数（与 CLI 契约一致的有界值）。 */
   maxChapters?: number;
   rateMs?: number;
@@ -798,10 +805,37 @@ export function engineChapterRanges(txt: string, chapters: readonly EngineChapte
 /** engine-download → SourceAdapter 的桥：code=0 完整；其余按 manifest.errors 分类。 */
 export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapter {
   const kind = options.sourceKind ?? 'engine';
+  const completeOutcome = (manifest: EngineManifest, txt: string): AdapterOutcome => {
+    const chaptersTotal = manifest.chapters_total ?? 0;
+    const chaptersDone = manifest.chapters_done ?? 0;
+    const charsTotal = manifest.chars ?? 0;
+    // 章节边界取引擎拼接时的真实偏移：发布器若按标题二次解析，源站标题不规整（「13.第13章」
+    // 「完本感言」）就会并章/拆章，清单 chapter_index 与 chapters 对不上，读端判清单无效（生产 502）。
+    // 还原不出或章数对不上就不给，发布器退回解析（行为同旧）。
+    const chapterRanges = engineChapterRanges(txt, manifest.chapters);
+    const missing = manifest.chapters_missing;
+    const chaptersMissing = typeof missing === 'number' && Number.isSafeInteger(missing) && missing > 0 ? missing : 0;
+    const rangesOk = chapterRanges !== null && chapterRanges.length === chaptersDone + chaptersMissing;
+    // 缺章本必须带引擎边界：退回标题解析时章数对不上，占位章也无从计数，宁可按缺章不发布。
+    if (chaptersMissing > 0 && !rangesOk) {
+      return { kind: 'incomplete', reason: 'missing_chapters', chaptersTotal, chaptersDone, charsTotal };
+    }
+    return {
+      kind: 'complete', txt, chaptersTotal, chaptersDone, charsTotal,
+      ...(rangesOk ? { chapterRanges } : {}),
+      ...(chaptersMissing > 0 ? { chaptersMissing } : {}),
+    };
+  };
   return {
     kind,
     async download(task, context) {
       const out = `${options.outRoot}/${createHash('sha256').update(`${task.source_url}|${task.title}|${task.author}`).digest('hex').slice(0, 24)}`;
+      let replayed: { manifest: EngineManifest; txt: string } | null = null;
+      try { replayed = options.replay?.find(out, task.id) ?? null; } catch { /* 按不命中 */ }
+      if (replayed) {
+        const outcome = completeOutcome(replayed.manifest, replayed.txt);
+        if (outcome.kind === 'complete') return outcome;
+      }
       try { options.prepareOut?.(out); } catch { /* 种子失败照常从头抓 */ }
       let result;
       try {
@@ -857,22 +891,11 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
       if (result.code === 0 && manifest.status === 'done' && manifest.artifact) {
         // 读回整本：book.txt 由 engine-download 在完整校验通过后原子写入。
         const txt = await options.readBookText({ artifact: manifest.artifact }, { out });
-        // 章节边界取引擎拼接时的真实偏移：发布器若按标题二次解析，源站标题不规整（「13.第13章」
-        // 「完本感言」）就会并章/拆章，清单 chapter_index 与 chapters 对不上，读端判清单无效（生产 502）。
-        // 还原不出或章数对不上就不给，发布器退回解析（行为同旧）。
-        const chapterRanges = engineChapterRanges(txt, manifest.chapters);
-        const missing = manifest.chapters_missing;
-        const chaptersMissing = typeof missing === 'number' && Number.isSafeInteger(missing) && missing > 0 ? missing : 0;
-        const rangesOk = chapterRanges !== null && chapterRanges.length === chaptersDone + chaptersMissing;
-        // 缺章本必须带引擎边界：退回标题解析时章数对不上，占位章也无从计数，宁可按缺章不发布。
-        if (chaptersMissing > 0 && !rangesOk) {
-          return { kind: 'incomplete', reason: 'missing_chapters', chaptersTotal, chaptersDone, charsTotal };
+        const outcome = completeOutcome(manifest, txt);
+        if (outcome.kind === 'complete') {
+          try { options.replay?.record(out, task.id, manifest.artifact.sha256); } catch { /* 只影响重领能否复用 */ }
         }
-        return {
-          kind: 'complete', txt, chaptersTotal, chaptersDone, charsTotal,
-          ...(rangesOk ? { chapterRanges } : {}),
-          ...(chaptersMissing > 0 ? { chaptersMissing } : {}),
-        };
+        return outcome;
       }
       const reason = manifest.errors[0] ?? 'incomplete';
       // downloadBook 正常返回但外部租约信号已触发：抓取是被任务层中止的，属失权停止，

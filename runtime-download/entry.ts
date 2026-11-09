@@ -31,6 +31,7 @@ import { createScanMissMemo, scanMissDir, scanMissMemoEnabled } from './scan-mis
 import { createSharedHostSuspect, hostSuspectDir, sharedHostSuspectEnabled } from './shared-host-suspect';
 import { isHostSuspect, setHostHealthListener, sourceHostSuspectMs } from '../src/lib/source-host-health';
 import { peerOutRoots, resumePeersEnabled, resumeStaleLocksEnabled, seedFromPeers } from './resume-seed';
+import { findReplay, publishReplayEnabled, recordReplay } from './publish-replay';
 import {
   failedCandidateSources, markCandidateDone, markCandidateFailure, occupiedHosts, replaceSourceCandidates,
   usableSourceCandidates,
@@ -324,6 +325,17 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       if (seeded.chapters || seeded.unlocked) log('info', '跨实例续传种子', { ...seeded });
     }
     : undefined;
+  // pubreplay1110：发布退避重领复用本任务上次的完整缓存（见 publish-replay.ts）；缺省关。
+  const replay = publishReplayEnabled(env)
+    ? {
+      find: (out: string, taskId: number) => {
+        const hit = findReplay(out, peerOutRoots(outRoot), taskId);
+        if (hit) log('info', '重领复用本地整本，跳过联网', { taskId, chapters: hit.manifest.chapters_total ?? 0, peer: hit.peer });
+        return hit;
+      },
+      record: recordReplay,
+    }
+    : undefined;
   // 常驻 drain：包一层去掉 downloadBook 对 process 的 SIGINT/SIGTERM 注册（外部停机由 hooks.signal
   // 覆盖）；不然每本调用累积进程监听。并发=1，同一时刻只有一次 downloadBook 在跑。
   const engineDownload = withoutProcessSignals(
@@ -366,12 +378,12 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     });
   const engineAdapter = createEngineAdapter({
     downloadBook: engineDownload,
-    modules, resolveSource, transport, readBookText, outRoot, prepareOut, sourceKind: 'engine',
+    modules, resolveSource, transport, readBookText, outRoot, prepareOut, sourceKind: 'engine', ...(replay ? { replay } : {}),
   });
   // builtin book15 任务（source_kind='builtin'）走同一 downloadBook 的 source-parser 分支。
   const builtinAdapter = createEngineAdapter({
     downloadBook: engineDownload,
-    modules, resolveSource, transport, readBookText, outRoot, prepareOut, sourceKind: 'builtin',
+    modules, resolveSource, transport, readBookText, outRoot, prepareOut, sourceKind: 'builtin', ...(replay ? { replay } : {}),
   });
   // 每次引擎 download 各自一个物理占用作用域：fallback 换源调用的是已包装的 engine 腿，
   // 上一个源的作用域已在 engine.download 返回（finally 释放）后才进下一个源——没有整个
