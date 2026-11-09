@@ -117,6 +117,7 @@ const TIMERS: TimerSpec[] = [
   // 维护窗口有 OnCalendar 但不写 cron_health，同样不判龄，只钉 ExecStart。
   { timer: 'zhaoshu-maint-window.timer', alertHours: 0, runnerFragments: ['maint-window.sh'] },
   { timer: 'zhaoshu-nosrc-gc.timer', alertHours: 0, runnerFragments: ['nosrc-tool.sh', 'gcrun'] },
+  { timer: 'zhaoshu-gapfill.timer', alertHours: 0, runnerFragments: ['nosrc-tool.sh', 'gapfill'] },
 ];
 
 describe('vercel.json 不得再有 crons（调度唯一来源 = phoenix timer）', () => {

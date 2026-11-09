@@ -1,0 +1,9 @@
+[Unit]
+Description=zhaoshu daily gap refill: re-download books published with placeholder chapters (exponential backoff, capped tries)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/zhaoshu/nosrc-tool.sh gapfill
+Nice=10
+TimeoutStartSec=30min

@@ -30,6 +30,7 @@
 | `maint-window.sh` / `pool-unregistered.mjs` | `/usr/local/lib/zhaoshu/` 同名（维护窗口脚本与只读选 host） |
 | `nosrc-tool.sh` | `/usr/local/lib/zhaoshu/nosrc-tool.sh`（root 0755；`/root/zs-backup/nosrc-tool.sh` 是指向它的软链；见下文专节） |
 | `zhaoshu-nosrc-gc.service` / `.timer` | 同名（每天 10:30 书库清理 gcrun；见下文专节） |
+| `zhaoshu-gapfill.service` / `.timer` | 同名（每天 11:00 缺章补抓 gapfill；见「少量缺章占位发布」专节） |
 | `cron-call.sh` | `/usr/local/lib/zhaoshu/cron-call.sh` |
 | `nginx/book.conf` | `/etc/nginx/sites-enabled/`（生产站块，占位符版） |
 | `nginx-pool-artifact.conf`（在 shuyuan-refresh/deploy/） | vhost 443 块内 `/pool-artifact.json` location（41-poolimpl） |
@@ -63,6 +64,7 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 | `zhaoshu-download-b-prune.timer` | 无 OnCalendar（`OnUnitActiveSec=6h`） | 6h | `ops/prune-download-out.mjs --apply`（B 线下载缓存保留） | 不判龄（不写 cron_health） |
 | `zhaoshu-maint-window.timer` | `*-*-* 07:40:00` + `*-*-* 19:40:00` | 12h | `/usr/local/lib/zhaoshu/maint-window.sh` | 不判龄（不写 cron_health） |
 | `zhaoshu-nosrc-gc.timer` | `*-*-* 10:30:00` | 24h | `/usr/local/lib/zhaoshu/nosrc-tool.sh gcrun` | 不判龄（不写 cron_health） |
+| `zhaoshu-gapfill.timer` | `*-*-* 11:00:00` | 24h | `/usr/local/lib/zhaoshu/nosrc-tool.sh gapfill` | 不判龄（不写 cron_health） |
 
 后三条是 2026-10-22 从现网取回补齐的（此前零登记、不受门禁覆盖）：
 - `admission-confirm` / `pool-artifact` / `repo-rollover` 已进 `src/lib/vercel-cron.test.ts` 的 TIMERS 表并做「阈值 > 间隔」断言；
@@ -70,7 +72,7 @@ crons5 删除，见下）。阈值常量在 `src/lib/source-health.ts`，**不�
 
 `download-b-prune` 是 2026-11-08 prune1108 新增的相对触发形态，同样只登记不做间隔断言；
 runnerFragments 钉住 `--apply` 与 `--protect`（少前者只是预演，少后者静默降级为只删 `book.txt`）。
-`maint-window` 与 `nosrc-gc`（2026-11-09）有 OnCalendar，但不写 cron_health，也登记为 `alertHours: 0`。
+`maint-window`、`nosrc-gc`（2026-11-09）与 `gapfill`（同日）有 OnCalendar，但不写 cron_health，也登记为 `alertHours: 0`。
 临时的 `zs-nosrc-p2.timer` 已于 11-09 由 `zhaoshu-nosrc-gc.timer` 取代并 disable，单元副本已从本目录删除。
 
 **不变量：告警阈值必须 > 实际触发间隔**，否则正常运行就会误报。该不变量由
@@ -227,7 +229,15 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   缺的章写「（本章源站下载失败，暂缺正文。）」照常发布；清单记 `chapters_missing`，任务行与 book_artifacts 的
   `chapters_done` 只算实有正文的章，书库显示「完成（缺 N 章）」。
 - 晋升保护：带缺章的新版本实有章数少于已发布版本时不晋升（`superseded_by_incomplete`）。
-- 不会自动补缺：占位章不进续传缓存，书再被重下（requeue/追更）时会重抓，抓到就换成正文。
+- 自动补缺（`zhaoshu-gapfill.timer` 每天 11:00 跑 `nosrc-tool.sh gapfill`）：最新 done 任务仍有占位章
+  （`chapters_done < chapters_total`）且没有 pending/running 任务的书，插一条新系统任务重下
+  （`source_revision=gapfill-YYYYMMDD`）。第 k 次（从 0 起）要等「缺章发布与上次补抓中较晚者」之后
+  24h × 2^k，即 1、2、4、8、16、32 天；每本最多 6 次，每天最多 100 本。重下会重新选源，抓到正文就以更全的版本晋升；
+  仍缺的照旧保留已发布版本。缓存目录按实例分，又被 prune 3 天清，所以补抓基本是整本重下，费用由退避与日上限兜住。
+  - `gapfill --dry-run` 在事务里照实插入后回滚，打印分桶（`gap_due`/`gap_waiting`/`gap_capped`）与「会插入」数。
+  - 可调：`ZS_GAP_MAX_TRIES`（6）、`ZS_GAP_MAX_ENQUEUE`（100）、`ZS_GAP_BASE_HOURS`（24）。
+  - 日志 `journalctl -u zhaoshu-gapfill`；关停 `systemctl disable --now zhaoshu-gapfill.timer`；已插的任务可按
+    `source_revision LIKE 'gapfill-%' AND status='pending'` 删除。
 - 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`；已发布的缺章书不受影响。
 
 ## release 目录布局 / 回滚

@@ -1,0 +1,9 @@
+[Unit]
+Description=zhaoshu daily gap refill at 11:00 Beijing
+
+[Timer]
+OnCalendar=*-*-* 11:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

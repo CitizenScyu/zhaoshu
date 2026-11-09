@@ -1,6 +1,6 @@
 #!/bin/bash
 # nosrc-tool.sh: back up and delete books that cannot be downloaded (see deploy/phoenix/README.md).
-# usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [mode] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run]
+# usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [mode] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run] | gapfill [--dry-run]
 # ZS_DB / ZS_BASE override the database and backup root (scratch-copy tests only).
 set -euo pipefail
 umask 077
@@ -12,6 +12,10 @@ BASE=${ZS_BASE:-/root/zs-backup}
 GC_MAX_DELETE=${ZS_GC_MAX_DELETE:-2000}
 GC_MAX_ENQUEUE=${ZS_GC_MAX_ENQUEUE:-300}
 [[ $GC_MAX_DELETE =~ ^[0-9]+$ && $GC_MAX_ENQUEUE =~ ^[0-9]+$ ]] || { echo "bad ZS_GC_MAX_*" >&2; exit 3; }
+GAP_MAX_TRIES=${ZS_GAP_MAX_TRIES:-6}
+GAP_MAX_ENQUEUE=${ZS_GAP_MAX_ENQUEUE:-100}
+GAP_BASE_HOURS=${ZS_GAP_BASE_HOURS:-24}
+[[ $GAP_MAX_TRIES =~ ^[0-9]+$ && $GAP_MAX_ENQUEUE =~ ^[0-9]+$ && $GAP_BASE_HOURS =~ ^[0-9]+$ ]] || { echo "bad ZS_GAP_*" >&2; exit 3; }
 GC_DELETE_WHERE="delkind AND final AND NOT freeok"
 GC_LAST_WHERE="NOT ($GC_DELETE_WHERE) AND NOT had_last"
 REV=lastcall-20261109
@@ -370,6 +374,51 @@ cmd_gcrun() {
   fi
 }
 
+# Gap refill: a book whose latest done task still has placeholder chapters (chapters_done < chapters_total,
+# gappub1109) gets a fresh system task. Retry k waits base * 2^k after the later of the gap publish and the
+# previous try; at most GAP_MAX_TRIES tries per book. The publisher never promotes a version with fewer real chapters.
+cmd_gapfill() {
+  local dry=0 end=COMMIT
+  case $1 in '') ;; --dry-run) dry=1; end=ROLLBACK ;; *) die "usage: gapfill [--dry-run]" ;; esac
+  exec 9> /run/zs-maint.lock
+  flock -w 900 9 || die "maintenance lock busy"
+  { echo 'BEGIN;'; cat <<'SQL'
+CREATE TEMP TABLE gf ON COMMIT DROP AS
+WITH d AS (
+  SELECT DISTINCT ON (book_id) book_id, chapters_done, chapters_total, updated_at
+  FROM download_tasks WHERE status = 'done' ORDER BY book_id, id DESC
+), t AS (
+  SELECT book_id, count(*)::int AS tries, max(created_at) AS last_try
+  FROM download_tasks WHERE source_revision LIKE 'gapfill-%' GROUP BY book_id
+)
+SELECT d.book_id AS id, d.chapters_total - d.chapters_done AS missing, COALESCE(t.tries, 0) AS tries,
+  GREATEST(d.updated_at, COALESCE(t.last_try, d.updated_at))
+    + interval '1 hour' * :base * power(2, COALESCE(t.tries, 0)) <= now() AS due
+FROM d LEFT JOIN t ON t.book_id = d.book_id
+WHERE d.chapters_done < d.chapters_total
+  AND NOT EXISTS (SELECT 1 FROM download_tasks a WHERE a.book_id = d.book_id AND a.status IN ('pending', 'running'));
+SELECT bucket || ' ' || count(*) || ' books ' || sum(missing) || ' chapters' FROM (
+  SELECT missing, CASE WHEN tries >= :max THEN 'gap_capped' WHEN due THEN 'gap_due' ELSE 'gap_waiting' END AS bucket FROM gf) s
+GROUP BY bucket ORDER BY bucket;
+WITH p AS (
+  SELECT id FROM gf WHERE due AND tries < :max ORDER BY tries, id LIMIT :cap
+), i AS (
+  INSERT INTO download_tasks (user_id, book_id, title, author, source_url, status, requested_by,
+                              source_kind, source_id, source_revision, policy_version, enqueue_key)
+  SELECT NULL, lb.id, lb.title, lb.author, lb.source_url, 'pending', 'system', 'builtin', NULL, :'rev', 't5-backfill-v1',
+         lb.id::text || ':t5-backfill-v1:' || :'rev'
+  FROM labeled_books lb JOIN p ON p.id = lb.id
+  WHERE NOT EXISTS (SELECT 1 FROM download_tasks a WHERE a.book_id = lb.id AND a.status IN ('pending', 'running'))
+  ON CONFLICT (enqueue_key) WHERE requested_by = 'system' AND enqueue_key IS NOT NULL DO NOTHING
+  RETURNING id)
+SELECT 'gapfill ' || :'rev' || ' selected ' || (SELECT count(*) FROM p) || ' enqueued ' || (SELECT count(*) FROM i);
+SQL
+    echo "$end;"; } | "${PSQL[@]}" -v base="$GAP_BASE_HOURS" -v max="$GAP_MAX_TRIES" -v cap="$GAP_MAX_ENQUEUE" \
+      -v rev="gapfill-$(date +%Y%m%d)"
+  [ "$dry" = 1 ] && echo "dry run: rolled back"
+  return 0
+}
+
 case ${1:-} in
   select) cmd_select "$2" "$3" ;;
   backup) cmd_backup "$2" "$3" "${4:-nosrc}" ;;
@@ -378,5 +427,6 @@ case ${1:-} in
   status) cmd_status ;;
   p2run) cmd_p2run ;;
   gcrun) cmd_gcrun "${2:-}" ;;
-  *) die "usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [nosrc|gc] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run]" ;;
+  gapfill) cmd_gapfill "${2:-}" ;;
+  *) die "usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [nosrc|gc] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run] | gapfill [--dry-run]" ;;
 esac
