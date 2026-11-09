@@ -148,7 +148,11 @@ function downloadStatusText(t: DownloadTask): string {
     case 'running': return t.leaseExpired
       ? `下载已中断（worker 无心跳），已存 ${t.chaptersDone}/${t.chaptersTotal} 章，可重试`
       : `下载中 ${t.chaptersDone}/${t.chaptersTotal} 章`;
-    case 'done': return `完成，共 ${t.charsTotal} 字`;
+    case 'done': {
+      // gappub1109：少量缺章本照常上架，缺的章是占位文本。
+      const missing = Math.max(0, t.chaptersTotal - t.chaptersDone);
+      return `完成${missing > 0 ? `（缺 ${missing} 章）` : ''}，共 ${t.charsTotal} 字`;
+    }
     case 'partial': {
       const missing = Math.max(0, t.chaptersTotal - t.chaptersDone);
       return `未完成：已存 ${t.chaptersDone}/${t.chaptersTotal} 章${missing > 0 ? `，缺 ${missing} 章` : ''}，可重试补齐`;

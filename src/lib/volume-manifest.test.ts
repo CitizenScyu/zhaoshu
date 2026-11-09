@@ -96,6 +96,17 @@ describe('parseVolumeManifest 正例', () => {
     expect(manifest!.version).toBe(HEX40.slice(0, 8));
   });
 
+  it('gappub1109 chapters_missing:缺省不出现;1..chapters 往返保留;0/负数/小数/超 chapters/非数字一律 null', () => {
+    expect(parseVolumeManifest(encode(baseManifest()))).not.toHaveProperty('chapters_missing');
+    expect(stringifyVolumeManifest(baseManifest())).not.toContain('chapters_missing');
+    const gapped = { ...baseManifest(), chapters_missing: 1 };
+    expect(parseVolumeManifest(encode(stringifyVolumeManifest(gapped)))?.chapters_missing).toBe(1);
+    expect(parseMutated(raw => { raw.chapters_missing = 2; })?.chapters_missing).toBe(2);
+    for (const bad of [0, -1, 1.5, 3, '1', null]) {
+      expect(parseMutated(raw => { raw.chapters_missing = bad; }), String(bad)).toBeNull();
+    }
+  });
+
   it('stringify 往返后仍能解析(每章一行紧凑)', () => {
     const text = stringifyVolumeManifest(baseManifest());
     expect(text).toContain('"chapter_index": [');

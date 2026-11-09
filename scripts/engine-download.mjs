@@ -216,6 +216,20 @@ export function numberedBook(titles) {
   return titles.length >= 20 && titles.filter(t => NUMBERED_TITLE.test(t)).length >= titles.length * 0.9;
 }
 
+// gappub1109：DOWNLOAD_GAP_PUBLISH=1 时，正文与补抓轮跑完、目录复核一致后，仍失败的章 ≤ 3 且 ≤ 全书 2% 就写占位文本按
+// done 收口（chapter.gap=true，manifest.chapters_missing 计数，chapters_done/chars 不含占位章），整本照常发布并在书库标「缺 N 章」。
+// 缺省/其他值 = 关（零行为变化：任一章失败 → missing_chapters 不发布）。占位章不进续传缓存，下次重下会重抓。
+// 动机（2026-11-09 phoenix 只读）：209 本 partial 里 92 本只缺 ≤3 章且 ≤2%，整本因零星坏章永不上架。
+const GAP_MAX_CHAPTERS = 3;
+const GAP_MAX_RATIO = 0.02;
+const GAP_TEXT = '（本章源站下载失败，暂缺正文。）';
+export function gapPublish(env = process.env) {
+  return env.DOWNLOAD_GAP_PUBLISH?.trim() === '1';
+}
+export function gapEligible(missing, total) {
+  return missing > 0 && missing <= GAP_MAX_CHAPTERS && missing <= total * GAP_MAX_RATIO;
+}
+
 // tocshape1107：目录形态闸门，抓正文前按章名编号（「第 N 章/节/回」，阿拉伯/全角/中文数字）判源站目录缺陷，
 // 按源级失败换源（零正文请求）。编号章 ≥ 10 且占目录 ≥ 60%、重复编号 < 5%（分卷重新编号的书不判）时：
 // - toc_disordered：相邻编号下降 > 30%（倒序），或最长非降子序列 < 80%（轮转/乱序）；
@@ -444,7 +458,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   try { previous = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { /* first attempt */ }
   // 正文格式不同（缺字段按 1）的检查点当作不存在：不续传、不沿用章节记录，全量重抓（见 ENGINE_CONTENT_FORMAT）。
   if ((previous?.contentFormat ?? 1) !== ENGINE_CONTENT_FORMAT) previous = undefined;
-  const previousDone = Array.isArray(previous?.chapters) ? previous.chapters.filter(c => c?.status === 'done').length : 0;
+  const previousDone = Array.isArray(previous?.chapters) ? previous.chapters.filter(c => c?.status === 'done' && !c.gap).length : 0;
   const manifest = { schemaVersion: 1, contentFormat: ENGINE_CONTENT_FORMAT, status: 'partial', title: args.title, author: args.author, source: args.source, chapters: previous?.chapters ?? [], errors: [], generated_at: new Date().toISOString() };
   // chapterresume1031：沿用的章节记录连同续传判据一起带上——本轮在目录前（解析/搜索/详情）就失败时，
   // 落盘的检查点仍可被下一轮续传（关时这三项缺失，下一轮必然从头抓）。走到对应阶段即被本轮值覆盖。
@@ -485,8 +499,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
   // T3×P2 reconcile：两个节拍解耦——manifest 落盘按 5s 节流（P2-4 写放大修复），
   // onProgress 每次调用必发（T3 租约数据通道，每章上报；失权发现延迟不随写盘节流放大）。
   const checkpoint = async (force = true) => {
-    manifest.chapters_done = manifest.chapters.filter(c => c.status === 'done').length;
-    manifest.chars = manifest.chapters.reduce((n, c) => n + c.chars, 0);
+    manifest.chapters_done = manifest.chapters.filter(c => c.status === 'done' && !c.gap).length;
+    manifest.chars = manifest.chapters.reduce((n, c) => n + (c.gap ? 0 : c.chars), 0);
     if (force || Date.now() - lastCheckpoint >= 5000) {
       atomic(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
       lastCheckpoint = Date.now();
@@ -611,7 +625,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         const before = previous?.chapters?.[chapter.index];
         const prior = (resume || (sameBook && before?.url === chapter.url && before?.title === chapter.title)) && before;
         let text;
-        if (prior?.status === 'done' && existsSync(path)) {
+        if (prior?.status === 'done' && !prior.gap && existsSync(path)) {
           const cached = readFileSync(path, 'utf8');
           if (hash(cached) === prior.sha256 && cached.trim()) text = cached;
         }
@@ -639,12 +653,14 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
         Object.assign(chapter, { status: 'done', chars: [...text].length, sha256: hash(text) });
         delete chapter.error; // 补抓成功的章不留上一轮的失败码
         delete chapter.error_kind;
+        delete chapter.gap;
         failStreak = 0;
         if (fresh) fetchedThisRun += 1;
       } catch (error) {
         if (isLimiterFeedbackError(error) || isHostGateError(error)) throw error;
         if (isBreakerYield(error)) throw error; // breakeryield1031：熔断不算本章失败，整本让出
         chapter.status = 'failed';
+        delete chapter.gap;
         failedThisRun += 1;
         // Do not persist upstream messages, URLs or credentials in diagnostics.
         chapter.error = knownError.test(error.message) ? error.message : 'chapter_failed';
@@ -682,7 +698,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     rechecking = true;
     await burstGate();
     if (hash(JSON.stringify(await toc())) !== manifest.tocHash) throw new Error('toc_changed');
-    if (manifest.chapters.some(c => c.status !== 'done')) throw new Error('missing_chapters');
+    const missing = manifest.chapters.filter(c => c.status !== 'done');
+    if (missing.length && !(gapPublish() && gapEligible(missing.length, manifest.chapters.length))) throw new Error('missing_chapters');
     // vipwall42：付费墙预览识别（4393 实证：阅文系 chuangshi/yunqi 对 VIP 章返回 ~250-350 字预览文本，
     // 引擎当正常章存为 done，全书 done 后晋升发布——448 本 done 里 75 本章均 <500 字、书仓已发布 96 本）。
     // 判据：done 章字符数中位数 < 500 且章数 ≥ 50（免费章 2000+ 字、预览 ~250；小书短章不判，免误伤）。
@@ -690,8 +707,16 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     {
       const doneChars = manifest.chapters.filter(c => c.status === 'done').map(c => c.chars).sort((a, b) => a - b);
       if (doneChars.length >= PREVIEW_MIN_CHAPTERS && doneChars[Math.floor(doneChars.length / 2)] < PREVIEW_MAX_CHARS) throw new Error('preview_truncated');
-      if (previewTail() && previewTailRun(manifest.chapters)) throw new Error('preview_truncated');
+      if (previewTail() && previewTailRun(manifest.chapters.filter(c => c.status === 'done'))) throw new Error('preview_truncated');
       if (previewStub() && doneChars.reduce((sum, n) => sum + n, 0) < PREVIEW_STUB_MAX_TOTAL_CHARS) throw new Error('preview_truncated');
+    }
+    if (missing.length) {
+      for (const chapter of missing) {
+        atomic(join(dir, chapter.file), GAP_TEXT);
+        Object.assign(chapter, { status: 'done', gap: true, chars: [...GAP_TEXT].length, sha256: hash(GAP_TEXT) });
+      }
+      manifest.chapters_missing = missing.length;
+      await checkpoint();
     }
     const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
     atomic(join(dir, 'book.txt'), txt);
@@ -713,7 +738,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       failureCode = 2; manifest.retry_cause = 'host_breaker';
       // breakerprogress1102：本轮净增的已抓章（对比开跑时检查点里的 done 数；目录变了重抓的不算）。只写正数，
       // 供任务层判「让出前有实进展」（WorkerOptions.hostWaitProgress）；纯诊断字段，引擎自身不读。
-      const gain = manifest.chapters.filter(c => c.status === 'done').length - previousDone;
+      const gain = manifest.chapters.filter(c => c.status === 'done' && !c.gap).length - previousDone;
       if (gain > 0) manifest.progress_gain = gain;
     }
     else if (failureCode === 2 && rechecking && recheckYield()

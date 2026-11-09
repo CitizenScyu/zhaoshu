@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -909,6 +909,77 @@ describe('noticeskip1031 公告章占位', () => {
     expect(r.manifest.errors).toEqual(['missing_chapters']);
     expect(r.manifest.chapters[1].error).toBe('empty_content_page');
   });
+});
+
+// gappub1109：少量缺章（≤3 且 ≤2%）写占位整本发布（DOWNLOAD_GAP_PUBLISH，缺省关）。
+describe('gappub1109 少量缺章占位发布', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  /** n 章书；empty 里的章（1 起）正文为空 → empty_content_page 逐章失败。 */
+  const wrap = (f: ReturnType<typeof setup>, n: number, empty: Set<number>) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      const titles = Array.from({ length: n }, (_, i) => `第${i + 1}章`);
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲"><div class="d-chapter-list" id="full-catalog">${titles.map((t, i) => `<dd><a href="/read/${i + 1}">${t}</a></dd>`).join('')}</div>` };
+    }
+    if (url.includes('/read/')) {
+      const index = Number(url.split('/read/')[1]);
+      return { url, text: `<li class="chapter-content" id="article-content">${empty.has(index) ? '' : `<p>合成正文${'甲'.repeat(600)}</p>`}</li>` };
+    }
+    return f.transport(url, opts);
+  };
+
+  it('开关与阈值：缺 ≤3 章且 ≤2%', () => {
+    expect(gapPublish()).toBe(false);
+    vi.stubEnv('DOWNLOAD_GAP_PUBLISH', '1');
+    expect(gapPublish()).toBe(true);
+    vi.stubEnv('DOWNLOAD_GAP_PUBLISH', 'on');
+    expect(gapPublish()).toBe(false);
+    expect(gapEligible(0, 100)).toBe(false);
+    expect(gapEligible(1, 50)).toBe(true);
+    expect(gapEligible(1, 49)).toBe(false);
+    expect(gapEligible(3, 150)).toBe(true);
+    expect(gapEligible(4, 1000)).toBe(false);
+  });
+
+  it('缺省关：缺 1/50 章照旧 missing_chapters、零 book.txt', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, 50, new Set([7])));
+    expect(r.manifest.errors).toEqual(['missing_chapters']);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+  }, 60_000);
+
+  it('开：缺 1/50 章写占位整本 done；chapters_done/chars 不含占位，重下时占位章重抓', async () => {
+    vi.stubEnv('DOWNLOAD_GAP_PUBLISH', '1');
+    const f = setup();
+    const empty = new Set([7]);
+    const r = await f.run(wrap(f, 50, empty));
+    expect(r.code).toBe(0);
+    expect(r.manifest.status).toBe('done');
+    expect(r.manifest.chapters_missing).toBe(1);
+    expect(r.manifest.chapters_done).toBe(49);
+    expect(r.manifest.chapters[6]).toMatchObject({ status: 'done', gap: true });
+    expect(r.manifest.chars).toBe(r.manifest.chapters.filter((c: { gap?: boolean }) => !c.gap).reduce((n: number, c: { chars: number }) => n + c.chars, 0));
+    const book = readFileSync(join(dirname(r.manifestPath), 'book.txt'), 'utf8');
+    expect(book).toContain('第7章\n\n（本章源站下载失败，暂缺正文。）\n\n');
+    expect(r.manifest.chapters).toHaveLength(50);
+
+    empty.clear();
+    const again = await f.run(wrap(f, 50, empty));
+    expect(again.code).toBe(0);
+    expect(again.manifest.chapters_missing).toBeUndefined();
+    expect(again.manifest.chapters_done).toBe(50);
+    expect(again.manifest.chapters[6].gap).toBeUndefined();
+    expect(readFileSync(join(dirname(again.manifestPath), '6.txt'), 'utf8')).toContain('合成正文');
+  }, 60_000);
+
+  it('开：超阈值（缺 2/50、缺 4/200）照旧 missing_chapters', async () => {
+    vi.stubEnv('DOWNLOAD_GAP_PUBLISH', '1');
+    for (const [n, empty] of [[50, [3, 9]], [200, [3, 9, 27, 81]]] as const) {
+      const f = setup();
+      const r = await f.run(wrap(f, n, new Set(empty)));
+      expect(r.manifest.errors).toEqual(['missing_chapters']);
+      expect(r.manifest.chapters_missing).toBeUndefined();
+    }
+  }, 120_000);
 });
 
 // noticeaside1031：编号书里非编号章正文取空写占位（DOWNLOAD_NOTICE_UNNUMBERED，缺省关）。

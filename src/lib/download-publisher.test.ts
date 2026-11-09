@@ -287,6 +287,16 @@ describe('T3 发布器:五阶段与合成 HTTP 故障', () => {
     expect(manifestIsWorse({ version: 'v', blob_sha: 'x', chapters: 0, chars: 0 } as SnapshotManifest, current)).toBe(false);
     expect(manifestIsWorse({ version: 'v', blob_sha: 'x', chapters: 10, chars: 1000 } as SnapshotManifest, { chaptersDone: 10, charsTotal: 699 })).toBe(true);
   });
+
+  it('gappub1109 manifestIsWorse:旧本实有章 = chapters - chapters_missing;带缺章的候选实有章少于旧本即不晋升', () => {
+    const full = { version: 'v', blob_sha: 'x', chapters: 100, chars: 100_000 } as SnapshotManifest;
+    const gapped = { ...full, chapters_missing: 2 } as SnapshotManifest;
+    expect(manifestIsWorse(full, { chaptersDone: 99, charsTotal: 99_000, chaptersMissing: 1 })).toBe(true);
+    expect(manifestIsWorse(full, { chaptersDone: 99, charsTotal: 99_000 })).toBe(false);
+    expect(manifestIsWorse(gapped, { chaptersDone: 98, charsTotal: 98_000, chaptersMissing: 2 })).toBe(false);
+    expect(manifestIsWorse(gapped, { chaptersDone: 99, charsTotal: 99_000, chaptersMissing: 1 })).toBe(false);
+    expect(manifestIsWorse(gapped, { chaptersDone: 97, charsTotal: 97_000, chaptersMissing: 3 })).toBe(true);
+  });
 });
 
 describe('分卷切分(splitBookVolumes;设计 v2 §六)', () => {

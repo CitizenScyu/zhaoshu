@@ -103,6 +103,7 @@ export interface SnapshotManifest {
   blob_sha: string;
   chapters: number;
   chapters_total?: number;
+  chapters_missing?: number;
   chars: number;
   generated_at?: string;
   task_id?: number | string;
@@ -164,13 +165,21 @@ export function snapshotPaths(title: string, author: string): SnapshotPaths {
   };
 }
 
-/** 新候选是否显著差于旧 manifest(章数 < 旧×0.9 或字数 < 旧×0.7)。 */
+/**
+ * 新候选是否显著差于旧 manifest(章数 < 旧×0.9 或字数 < 旧×0.7)。章数按实有正文计(清单 chapters 减
+ * 占位缺章 chapters_missing)。gappub1109:候选自身带缺章时更严——实有章数少于旧版就不晋升,免得
+ * 缺章重下把同书完整版(或缺得更少的版)换下来;不带缺章的候选口径不变。
+ */
 export function manifestIsWorse(
   oldManifest: SnapshotManifest | null,
-  candidate: { chaptersDone: number; charsTotal: number },
+  candidate: { chaptersDone: number; charsTotal: number; chaptersMissing?: number },
 ): boolean {
   if (!oldManifest || typeof oldManifest.chapters !== 'number' || typeof oldManifest.chars !== 'number') return false;
-  const chapterRatio = oldManifest.chapters > 0 ? candidate.chaptersDone / oldManifest.chapters : Infinity;
+  const oldMissing = oldManifest.chapters_missing;
+  const oldChapters = oldManifest.chapters
+    - (typeof oldMissing === 'number' && Number.isSafeInteger(oldMissing) && oldMissing > 0 ? oldMissing : 0);
+  if ((candidate.chaptersMissing ?? 0) > 0 && candidate.chaptersDone < oldChapters) return true;
+  const chapterRatio = oldChapters > 0 ? candidate.chaptersDone / oldChapters : Infinity;
   const charsRatio = oldManifest.chars > 0 ? candidate.charsTotal / oldManifest.chars : Infinity;
   return chapterRatio < CHAPTER_PROMOTION_RATIO || charsRatio < CHARS_PROMOTION_RATIO;
 }
@@ -180,9 +189,12 @@ export interface PublishCandidate {
   title: string;
   author: string;
   txt: string;
+  /** 实有正文的章数;txt 章数 = chaptersDone + chaptersMissing。 */
   chaptersDone: number;
   chaptersTotal: number;
   charsTotal: number;
+  /** gappub1109:txt 里写占位文本的缺章数(只随 chapterRanges 一起给)。 */
+  chaptersMissing?: number;
   llmSummary?: string;
   /**
    * 章节边界(txt 的 UTF-8 字节偏移,首尾相接铺满全书)。引擎腿给的是拼接时的真实边界
@@ -492,11 +504,13 @@ export async function publishBookVersion(
   const paths = snapshotPaths(candidate.title, candidate.author);
   const { canonicalPath, dir } = paths;
   const label = `${candidate.title} - ${candidate.author}(${candidate.chaptersDone} 章 / ${candidate.charsTotal} 字)`;
+  // 占位缺章只认引擎边界:退回标题解析时章数本就不与 chaptersDone 绑定,不叠加。
+  const missing = candidate.chapterRanges ? candidate.chaptersMissing ?? 0 : 0;
 
   // 章节边界:引擎腿给了拼接时的真实边界就直接用(逐项核对后),chapter_index 与 chapters 逐章
   // 对应、不并章不拆章;没给才退回与阅读侧同函数同字节的 parseTxtChapters(非引擎来源,行为同旧)。
   const chapters = candidate.chapterRanges
-    ? checkedChapterRanges(candidate.chapterRanges, buf, candidate.chaptersDone)
+    ? checkedChapterRanges(candidate.chapterRanges, buf, candidate.chaptersDone + missing)
     : parseTxtChapters(buf, maxBookBytes);
   const ranges = splitBookVolumes(buf, chapters, maxVolumeBytes);
   const volumes = ranges.map((range, index) => {
@@ -537,8 +551,9 @@ export async function publishBookVersion(
     blob_sha: blobSha,
     bytes,
     chars: candidate.charsTotal,
-    chapters: candidate.chaptersDone,
+    chapters: candidate.chaptersDone + missing,
     chapters_total: candidate.chaptersTotal,
+    ...(missing > 0 ? { chapters_missing: missing } : {}),
     title: candidate.title,
     author: candidate.author,
     generated_at: new Date().toISOString(),
@@ -623,6 +638,7 @@ function summaryManifest(manifest: VolumeManifest): SnapshotManifest {
     blob_sha: manifest.blob_sha,
     chapters: manifest.chapters,
     chapters_total: manifest.chapters_total,
+    ...(manifest.chapters_missing ? { chapters_missing: manifest.chapters_missing } : {}),
     chars: manifest.chars,
     generated_at: manifest.generated_at,
     task_id: manifest.task_id,

@@ -55,6 +55,8 @@ export type AdapterOutcome =
       kind: 'complete'; txt: string; chaptersTotal: number; chaptersDone: number; charsTotal: number;
       /** 引擎章节边界（txt 的 UTF-8 字节偏移，首尾相接铺满全书）；给了发布器就不再按标题二次解析。 */
       chapterRanges?: TxtChapter[];
+      /** gappub1109：txt 里写占位文本的缺章数（chaptersDone 不含它们；txt 章数 = chaptersDone + chaptersMissing）。 */
+      chaptersMissing?: number;
     }
   // stage：source_unavailable 时判定所在阶段（resolve/search/detail/toc），只作日志用的固定枚举。
   // progressed（breakerprogress1102）：host_breaker 让出前本轮有净增已抓章（manifest.progress_gain>0）。
@@ -618,6 +620,7 @@ export async function runDownloadTask(
         chaptersTotal: outcome.chaptersTotal,
         charsTotal: outcome.charsTotal,
         chapterRanges: outcome.chapterRanges,
+        ...(outcome.chaptersMissing ? { chaptersMissing: outcome.chaptersMissing } : {}),
       });
     } catch (error) {
       if (isRetryablePublicationError(error)) {
@@ -715,6 +718,7 @@ export interface EngineDownloadLike {
         errors: string[];
         chapters_total?: number;
         chapters_done?: number;
+        chapters_missing?: number;
         chars?: number;
         failure_stage?: string;
         failure_name?: string;
@@ -857,9 +861,17 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
         // 「完本感言」）就会并章/拆章，清单 chapter_index 与 chapters 对不上，读端判清单无效（生产 502）。
         // 还原不出或章数对不上就不给，发布器退回解析（行为同旧）。
         const chapterRanges = engineChapterRanges(txt, manifest.chapters);
+        const missing = manifest.chapters_missing;
+        const chaptersMissing = typeof missing === 'number' && Number.isSafeInteger(missing) && missing > 0 ? missing : 0;
+        const rangesOk = chapterRanges !== null && chapterRanges.length === chaptersDone + chaptersMissing;
+        // 缺章本必须带引擎边界：退回标题解析时章数对不上，占位章也无从计数，宁可按缺章不发布。
+        if (chaptersMissing > 0 && !rangesOk) {
+          return { kind: 'incomplete', reason: 'missing_chapters', chaptersTotal, chaptersDone, charsTotal };
+        }
         return {
           kind: 'complete', txt, chaptersTotal, chaptersDone, charsTotal,
-          ...(chapterRanges && chapterRanges.length === chaptersDone ? { chapterRanges } : {}),
+          ...(rangesOk ? { chapterRanges } : {}),
+          ...(chaptersMissing > 0 ? { chaptersMissing } : {}),
         };
       }
       const reason = manifest.errors[0] ?? 'incomplete';

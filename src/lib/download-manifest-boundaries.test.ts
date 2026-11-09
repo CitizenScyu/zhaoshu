@@ -75,10 +75,11 @@ class MemoryGitHub implements GitHubContents {
 const dirs: string[] = [];
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function engineAdapter() {
+function engineAdapter(pages: typeof transport = transport) {
   vi.stubGlobal('fetch', () => { throw new Error('network forbidden'); });
   const outRoot = mkdtempSync(join(tmpdir(), 'manifestfix-'));
   dirs.push(outRoot);
@@ -86,7 +87,7 @@ function engineAdapter() {
     downloadBook: downloadBook as unknown as EngineDownloadLike,
     modules: { api, compile, parser },
     resolveSource: async () => ({ source, builtin: true }),
-    transport,
+    transport: pages,
     readBookText,
     outRoot,
     rateMs: 0,
@@ -198,4 +199,49 @@ describe('v2 清单 chapter_index 用引擎章节边界(41-MANIFESTFIX)', () => 
       expect(parts.length).toBe(entry.p);
     }
   });
+});
+
+// gappub1109：少量缺章占位整本发布，清单章数含占位章、chapters_missing 记缺章数，读端照常解析。
+describe('gappub1109 少量缺章端到端', () => {
+  const N = 50;
+  const EMPTY = 7;
+  const gapCatalog = Array.from({ length: N }, (_, i) => `<dd><a href="/chapter/index1-${i + 1}.html">第${i + 1}章</a></dd>`).join('');
+  async function gapTransport(url: string, options: { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> }) {
+    await options.beforeRequest?.(options.signal);
+    if (url.includes('/search')) return { url, text: `<a href="${BOOK_URL}">${TITLE}</a>` };
+    if (url === BOOK_URL) return { url, text: identity + gapCatalog };
+    const matched = /\/chapter\/index1-(\d+)\.html$/.exec(url);
+    if (matched) {
+      const body = Number(matched[1]) === EMPTY ? '' : `<p>第${matched[1]}章合成正文${'甲'.repeat(600)}</p>`;
+      return { url, text: `<li class="chapter-content" id="article-content">${body}</li>` };
+    }
+    throw new Error(`unexpected url ${url}`);
+  }
+
+  it('缺 1/50:adapter 给 chaptersDone=49 + chaptersMissing=1,清单 chapters=50、chapters_missing=1,占位章可读', async () => {
+    vi.stubEnv('DOWNLOAD_GAP_PUBLISH', '1');
+    const github = new MemoryGitHub();
+    const registered: unknown[] = [];
+    const { storage, state } = memoryStorage();
+    storage.registerArtifact = async (...args: unknown[]) => { registered.push(args); return 'registered' as const; };
+    const result = await runDownloadTask({ storage, github, adapters: [engineAdapter(gapTransport)], repositoryId: 1, branch: 'main' }, lease);
+    expect(result).toMatchObject({ processed: true, terminal: 'done' });
+    expect(state.finished).toEqual({ status: 'done', error: '' });
+    const manifest = readManifest(github);
+    expect(manifest).not.toBeNull();
+    expect(manifest!.chapters).toBe(N);
+    expect(manifest!.chapters_missing).toBe(1);
+    expect(manifest!.chapter_index).toHaveLength(N);
+    const book = concatVolumes(github, manifest!);
+    const gap = manifest!.chapter_index[EMPTY - 1];
+    expect(book.toString('utf8', gap.s, gap.e)).toBe(`第${EMPTY}章\n\n（本章源站下载失败，暂缺正文。）\n\n`);
+    expect(JSON.stringify(registered)).toContain('"chaptersDone":49');
+  }, 60_000);
+
+  it('缺省关:同一本缺 1 章 ⇒ 不发布', async () => {
+    const github = new MemoryGitHub();
+    const outcome = await engineAdapter(gapTransport).download(task, { signal: new AbortController().signal, progress: async () => {} });
+    expect(outcome).toMatchObject({ kind: 'incomplete', reason: 'missing_chapters' });
+    expect(github.files.size).toBe(0);
+  }, 60_000);
 });

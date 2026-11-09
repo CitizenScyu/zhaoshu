@@ -60,6 +60,8 @@ export interface VolumeManifest {
   chars: number;
   chapters: number;
   chapters_total: number;
+  /** gappub1109:chapter_index 里写占位文本的缺章数(只在 > 0 时出现;chapters 含这些章)。 */
+  chapters_missing?: number;
   title: string;
   author: string;
   generated_at: string;
@@ -157,6 +159,7 @@ export function parseVolumeManifest(bytes: Uint8Array): VolumeManifest | null {
   if (raw.blob_sha.slice(0, 8) !== raw.version) return null;
   if (!isPositiveInteger(raw.bytes) || !isNonNegativeInteger(raw.chars)) return null;
   if (!isNonNegativeInteger(raw.chapters) || !isNonNegativeInteger(raw.chapters_total)) return null;
+  if (raw.chapters_missing !== undefined && (!isPositiveInteger(raw.chapters_missing) || raw.chapters_missing > raw.chapters)) return null;
   if (typeof raw.title !== 'string' || typeof raw.author !== 'string') return null;
   if (typeof raw.generated_at !== 'string') return null;
   if (typeof raw.task_id !== 'number' && typeof raw.task_id !== 'string') return null;
@@ -205,6 +208,7 @@ export function parseVolumeManifest(bytes: Uint8Array): VolumeManifest | null {
     chars: raw.chars,
     chapters: raw.chapters,
     chapters_total: raw.chapters_total,
+    ...(raw.chapters_missing !== undefined ? { chapters_missing: raw.chapters_missing } : {}),
     title: raw.title,
     author: raw.author,
     generated_at: raw.generated_at,
@@ -231,6 +235,7 @@ export function stringifyVolumeManifest(manifest: VolumeManifest): string {
   lines.push(`  "chars": ${JSON.stringify(manifest.chars)},`);
   lines.push(`  "chapters": ${JSON.stringify(manifest.chapters)},`);
   lines.push(`  "chapters_total": ${JSON.stringify(manifest.chapters_total)},`);
+  if (manifest.chapters_missing) lines.push(`  "chapters_missing": ${JSON.stringify(manifest.chapters_missing)},`);
   lines.push(`  "title": ${JSON.stringify(manifest.title)},`);
   lines.push(`  "author": ${JSON.stringify(manifest.author)},`);
   lines.push(`  "generated_at": ${JSON.stringify(manifest.generated_at)},`);
