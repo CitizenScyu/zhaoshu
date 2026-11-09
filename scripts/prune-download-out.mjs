@@ -4,10 +4,11 @@
 //   活锁：download.lock 在且 max(锁, manifest) 不足 6h（任务预算 5.5h）→ 整目录不动；
 //   R1：book.txt 只在完成当刻被 readBookText 读一次、可由章文件重建 → max(book.txt, manifest) 超 1h 即删；
 //   R2：done 超 --done-days（默认 3）、R3：其余超 --partial-days（默认 14）→ 不在保护名单则整目录删；
+//   带占位章的 done（尾部 chapters_missing ≥1）按 R3 判龄：gapfill 第 1/2/4/8 天补抓靠它续传；
 //   保护名单（--protect，用户书的适配键）缺失/格式不对/超 2h 未更新 → 只做 R1。
 // 整目录先 rename 进 <out>/.prune-trash 再删：worker 只会看到「完整目录」或「没有目录」。
 // 默认 dry-run，--apply 才动盘；只输出计数，不输出路径与书名。
-import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, statfsSync, unlinkSync } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, statfsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +23,9 @@ const KEY = /^[0-9a-f]{24}$/;
 const TRASH = '.prune-trash';
 // 引擎以 JSON.stringify(manifest, null, 2) 落盘，顶层键恰两格缩进；章节里的 status 缩进更深，不会误中。
 const STATUS = /^ {2}"status": "([a-z_]+)"/m;
+// chapters_missing 在 chapters 数组之后才写入，落在文件尾部；只读末 4KB。
+const GAPPED = /^ {2}"chapters_missing": [1-9]/m;
+const TAIL_BYTES = 4096;
 
 const statOf = path => lstatSync(path, { throwIfNoEntry: false });
 const freeBytes = path => { const s = statfsSync(path); return s.bavail * s.bsize; };
@@ -37,6 +41,18 @@ export function manifestStatus(path) {
     const buf = Buffer.alloc(512);
     const n = readSync(fd, buf, 0, buf.length, 0);
     return STATUS.exec(buf.toString('utf8', 0, n))?.[1] ?? 'unknown';
+  } finally { closeSync(fd); }
+}
+
+/** done manifest 是否带占位章（末 4KB 里有 chapters_missing ≥1）；读不到按否。 */
+export function manifestGapped(path) {
+  let fd;
+  try { fd = openSync(path, 'r'); } catch { return false; }
+  try {
+    const size = fstatSync(fd).size;
+    const buf = Buffer.alloc(Math.min(TAIL_BYTES, size));
+    const n = readSync(fd, buf, 0, buf.length, size - buf.length);
+    return GAPPED.test(buf.toString('utf8', 0, n));
   } finally { closeSync(fd); }
 }
 
@@ -61,7 +77,8 @@ export function decide(dir, adapterKey, { now, protect, doneMs, partialMs }) {
   const status = manifest ? manifestStatus(join(dir, 'manifest.json')) : null;
   // 有 manifest 时不看目录 mtime：R1 删 book.txt 会刷新它，把 R2 的判龄整体推后。
   const last = Math.max(manifestMs, lock?.mtimeMs ?? 0, manifest ? 0 : statOf(dir)?.mtimeMs ?? now);
-  if (protect && !protect.has(adapterKey) && now - last > (status === 'done' ? doneMs : partialMs)) {
+  const ageLimit = status === 'done' && !manifestGapped(join(dir, 'manifest.json')) ? doneMs : partialMs;
+  if (protect && !protect.has(adapterKey) && now - last > ageLimit) {
     return { action: 'dir', status, lockMs: lock?.mtimeMs };
   }
   const book = statOf(join(dir, 'book.txt'));

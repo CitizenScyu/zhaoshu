@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, write
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadProtect, manifestStatus, prune, removeDir } from './prune-download-out.mjs';
+import { loadProtect, manifestGapped, manifestStatus, prune, removeDir } from './prune-download-out.mjs';
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -35,6 +35,8 @@ interface DirSpec {
   bookAge?: number;
   lockAge?: number;
   dirAge?: number;
+  /** done 带占位章数（写 chapters_missing，落在 chapters 之后） */
+  gap?: number;
 }
 
 function engineDir(spec: DirSpec): string {
@@ -45,6 +47,7 @@ function engineDir(spec: DirSpec): string {
     const manifest = {
       schemaVersion: 1, contentFormat: 4, status: spec.status ?? 'done', title: '书', author: '作者',
       chapters: [{ index: 0, title: '第一章', url: 'https://example.invalid/1', chars: 5, status: 'done', file: '0.txt' }],
+      ...(spec.gap !== undefined ? { chapters_missing: spec.gap } : {}),
     };
     writeFileSync(join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
     setAge(join(dir, 'manifest.json'), spec.manifestAge ?? 0);
@@ -75,6 +78,32 @@ describe('manifestStatus', () => {
     writeFileSync(path, JSON.stringify({ chapters: [{ status: 'done' }] }, null, 2));
     expect(manifestStatus(path)).toBe('unknown');
     expect(manifestStatus(join(root, 'missing.json'))).toBeNull();
+  });
+});
+
+describe('manifestGapped', () => {
+  it('只认顶层 chapters_missing ≥1（0 与缺键为否）；章节表超 4KB 时仍在尾部读到；无文件 → false', () => {
+    expect(manifestGapped(join(engineDir({ adapter: K(1), gap: 2 }), 'manifest.json'))).toBe(true);
+    rmSync(outOf(), { recursive: true });
+    expect(manifestGapped(join(engineDir({ adapter: K(1), gap: 0 }), 'manifest.json'))).toBe(false);
+    rmSync(outOf(), { recursive: true });
+    const path = join(engineDir({ adapter: K(1) }), 'manifest.json');
+    expect(manifestGapped(path)).toBe(false);
+    const chapters = Array.from({ length: 200 }, (_, index) => ({ index, title: `第${index}章`, status: 'done', file: `${index}.txt` }));
+    writeFileSync(path, JSON.stringify({ status: 'done', chapters, chapters_missing: 3, artifact: { file: 'book.txt' } }, null, 2));
+    expect(manifestGapped(path)).toBe(true);
+    expect(manifestGapped(join(root, 'missing.json'))).toBe(false);
+  });
+
+  it('带占位章的 done 按 partial 判龄：4 天留、15 天删；无缺章的 4 天就删', async () => {
+    const gapYoung = engineDir({ adapter: K(1), gap: 1, manifestAge: 4 * DAY });
+    const gapOld = engineDir({ adapter: K(2), gap: 1, manifestAge: 15 * DAY, inst: 2 });
+    const plain = engineDir({ adapter: K(3), gap: 0, manifestAge: 4 * DAY, inst: 3 });
+    const report = await prune({ root, protectFile: writeProtect([]), apply: true, now: NOW });
+    expect(report).toMatchObject({ dirs: 3, kept: 1, doneDirs: 2, errors: 0 });
+    expect(existsSync(gapYoung)).toBe(true);
+    expect(existsSync(gapOld)).toBe(false);
+    expect(existsSync(plain)).toBe(false);
   });
 });
 

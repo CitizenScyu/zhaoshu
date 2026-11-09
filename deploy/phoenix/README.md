@@ -111,7 +111,7 @@ runnerFragments 钉住 `--apply` 与 `--protect`（少前者只是预演，少�
 | 活锁 | `download.lock` 在，且 max(锁, manifest) 不足 6h（任务预算 5.5h） | 整目录不动 |
 | R1 | `book.txt` 与 manifest 都超 1h | 只删 `book.txt`（完成当刻已被读走，可由章文件重建） |
 | R2 | `status=done` 超 3d，且不在保护名单 | 整目录删 |
-| R3 | 其余（partial / 无 manifest 等）超 14d，且不在保护名单 | 整目录删 |
+| R3 | 其余（partial / 无 manifest / done 但带占位章 `chapters_missing≥1`）超 14d，且不在保护名单 | 整目录删 |
 
 - 保护名单 = 用户任务（`requested_by='user'`）及其候选源的适配键，由 `prune-protect.sh` 以 root 写到
   `/run/zhaoshu-prune-protect/protect.txt`。生成失败、键数为 0 或超 2h 未更新时，本轮只做 R1。
@@ -233,7 +233,9 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   （`chapters_done < chapters_total`）且没有 pending/running 任务的书，插一条新系统任务重下
   （`source_revision=gapfill-YYYYMMDD`）。第 k 次（从 0 起）要等「缺章发布与上次补抓中较晚者」之后
   24h × 2^k，即 1、2、4、8、16、32 天；每本最多 6 次，每天最多 100 本。重下会重新选源，抓到正文就以更全的版本晋升；
-  仍缺的照旧保留已发布版本。缓存目录按实例分，又被 prune 3 天清，所以补抓基本是整本重下，费用由退避与日上限兜住。
+  仍缺的照旧保留已发布版本。选中同一源时，续传（含 `DOWNLOAD_RESUME_PEERS` 从兄弟实例同键目录播种）只重抓占位章；
+  带占位章的缓存目录 prune 按 14 天保留（读 manifest 末 4KB 的 `chapters_missing`），覆盖第 1/2/4/8 天四次补抓。
+  换了源才是整本重下，费用由退避与日上限兜住。
   - `gapfill --dry-run` 在事务里照实插入后回滚，打印分桶（`gap_due`/`gap_waiting`/`gap_capped`）与「会插入」数。
   - 可调：`ZS_GAP_MAX_TRIES`（6）、`ZS_GAP_MAX_ENQUEUE`（100）、`ZS_GAP_BASE_HOURS`（24）。
   - 日志 `journalctl -u zhaoshu-gapfill`；关停 `systemctl disable --now zhaoshu-gapfill.timer`；已插的任务可按
