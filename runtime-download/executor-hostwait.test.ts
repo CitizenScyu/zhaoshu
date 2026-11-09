@@ -94,9 +94,9 @@ describe('发布退避与失租约留日志（带任务 id，不带路径）', (
     }]]);
   });
 
-  it('退避写库时租约已失 → 一行「下载腿失租约，交回收器」', async () => {
+  it('退避写库时租约已失 → 一行「任务失租约，交回收器」', async () => {
     const h = harness(false, { outcome: complete, put: conflict, deferLost: true });
     expect(await h.run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
-    expect(h.logged).toEqual([['下载腿失租约，交回收器', { taskId: 9 }]]);
+    expect(h.logged).toEqual([['任务失租约，交回收器', { taskId: 9 }]]);
   });
 });

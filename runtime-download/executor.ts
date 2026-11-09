@@ -322,7 +322,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
         const stage = PUBLICATION_CAUSE.test(result.stage ?? '') ? result.stage : 'unknown';
         log('info', '发布失败，已退避放回', { taskId: claimedId, stage, retryAt: result.retryAt ?? null });
       }
-      if (!result.processed && result.reason === 'lease_lost') log('info', '下载腿失租约，交回收器', { taskId: claimedId });
+      if (!result.processed && result.reason === 'lease_lost') log('info', '任务失租约，交回收器', { taskId: claimedId });
       // 任务中途（心跳/发布/finish）撞配额：worker 已把异常吞成 failed + reason 文本；任务行多半仍是
       // running（finish 同样 402），由回收器接管。这里只布置冷却，不再零间隔领下一本。
       if (result.processed && result.terminal === 'failed' && isDbQuotaError(result.reason)) armQuota('task');

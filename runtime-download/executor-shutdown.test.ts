@@ -136,6 +136,6 @@ describe('shutrel1030 停机放回在途下载', () => {
     expect(await h.run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     expect(h.log).toEqual(['claim', 'consume', 'download', 'leg:true', 'release']);
     expect(h.refundBudget).not.toHaveBeenCalled();
-    expect(h.logged).toEqual([]);
+    expect(h.logged).toEqual(release === false ? [['任务失租约，交回收器', expect.objectContaining({ taskId: expect.anything() })]] : []);
   });
 });
