@@ -374,6 +374,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     const txt = completeText('测试书', 3);
     const result = await runDownloadTask(options([scriptAdapter({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })]), (await claimDownloadTask(sql as never, 'worker-a'))!);
     expect(result.reason).toBe('publication_retry');
+    expect(result.stage).toBe('snapshot:http_502');
     const state = await retryState(id);
     expect(state).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 30 });
     expect(state.error).toContain('snapshot:http_502');

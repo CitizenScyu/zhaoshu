@@ -629,7 +629,7 @@ export async function runDownloadTask(
         throwIfAbortedUnlessBudget(signal);
         const { retryAt } = await settlePublicationFailure(storage, lease, error);
         return retryAt
-          ? { processed: true, reason: 'publication_retry', retryAt }
+          ? { processed: true, reason: 'publication_retry', stage: `${error.stage}:${error.detail}`, retryAt }
           : { processed: true, terminal: 'failed', reason: error.message, retryAt: null };
       }
       if (error instanceof LeaseLostError || error instanceof PublicationStageError) throw error;

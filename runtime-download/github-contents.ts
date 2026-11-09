@@ -34,7 +34,12 @@ export interface GitHubContentsOptions {
   branch: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** PUT 遇 409 的就地重试次数（重读 sha 再写）；测试注入 sleep 免等。 */
+  conflictRetries?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
+
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export function repoApiBase(repository: string): string {
   const [owner, repo, extra] = repository.split('/');
@@ -65,7 +70,9 @@ export function createGitHubRequest({ token, fetchImpl = fetch, timeoutMs = 60_0
     fetchImpl(url, { ...init, headers: { ...headers, Accept: accept, ...(init.headers ?? {}) }, signal: AbortSignal.timeout(timeoutMs) });
 }
 
-export function createGitHubContents({ token, repository, branch, fetchImpl = fetch, timeoutMs = 60_000 }: GitHubContentsOptions): GitHubContents {
+export function createGitHubContents({
+  token, repository, branch, fetchImpl = fetch, timeoutMs = 60_000, conflictRetries = 4, sleep = defaultSleep,
+}: GitHubContentsOptions): GitHubContents {
   if (!branch) throw new Error('createGitHubContents requires branch');
   const request = createGitHubRequest({ token, fetchImpl, timeoutMs });
   // GET 落到 `?ref=<branch>`，与 PUT body 的 branch 同一条，读写不分叉到默认分支。
@@ -83,18 +90,20 @@ export function createGitHubContents({ token, repository, branch, fetchImpl = fe
   return {
     async put(path, text, message) {
       const { url } = apiUrl(repository, path);
-      const sha = await currentSha(url);
-      const res = await request(url, 'application/vnd.github+json', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message,
-          content: Buffer.from(text, 'utf8').toString('base64'),
-          branch,
-          ...(sha ? { sha } : {}),
-        }),
-      });
-      if (!res.ok) throw httpError(res.status);
+      const content = Buffer.from(text, 'utf8').toString('base64');
+      // 20 个 worker 往同一分支提交：分支头在 GET sha 与 PUT 之间被别人推进时 contents API 回 409。
+      // 写入内容与 sha 来源都不依赖首次结果，重读 sha 再写与首写等价；退避带抖动，错开并发提交者。
+      for (let attempt = 0; ; attempt += 1) {
+        const sha = await currentSha(url);
+        const res = await request(url, 'application/vnd.github+json', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, content, branch, ...(sha ? { sha } : {}) }),
+        });
+        if (res.ok) return;
+        if (res.status !== 409 || attempt >= conflictRetries) throw httpError(res.status);
+        await sleep(1000 * 2 ** attempt * (0.5 + Math.random()));
+      }
     },
 
     async getBytes(path) {

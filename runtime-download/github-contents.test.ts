@@ -178,4 +178,36 @@ describe('T8 GitHubContents 生产适配器（合成 fetch，忠实复刻媒体�
     expect(() => createGitHubContents({ token: TOKEN, repository: REPO, branch: '', fetchImpl: makeFetch(() => ({ status: 200 })).impl }))
       .toThrow('createGitHubContents requires branch');
   });
+
+  it('PUT 409（分支头被并发推进）→ 重读 sha 再写，成功即返回；退避逐次加倍', async () => {
+    let puts = 0;
+    let shaGets = 0;
+    const { impl, calls } = makeFetch((c) => {
+      if (c.method === 'GET') return { status: 200, json: { sha: `sha-${++shaGets}` } };
+      return { status: ++puts < 3 ? 409 : 201 };
+    });
+    const waits: number[] = [];
+    const gh = createGitHubContents({ token: TOKEN, repository: REPO, branch: 'main', fetchImpl: impl, sleep: async (ms) => { waits.push(ms); } });
+    await gh.put('a/b.txt', 'x', 'msg');
+    const bodies = calls.filter((c) => c.method === 'PUT').map((c) => c.body!);
+    expect(bodies.map((b) => b.sha)).toEqual(['sha-1', 'sha-2', 'sha-3']);
+    expect(new Set(bodies.map((b) => b.content)).size).toBe(1);
+    expect(waits).toHaveLength(2);
+    expect(waits[0]).toBeGreaterThanOrEqual(500);
+    expect(waits[0]).toBeLessThan(1500);
+    expect(waits[1]).toBeGreaterThanOrEqual(1000);
+    expect(waits[1]).toBeLessThan(3000);
+  });
+
+  it('409 超过重试上限仍抛 github_http_409；非 409 错误不重试', async () => {
+    const conflict = makeFetch((c) => (c.method === 'GET' ? { status: 404 } : { status: 409 }));
+    const gh = createGitHubContents({ token: TOKEN, repository: REPO, branch: 'main', fetchImpl: conflict.impl, conflictRetries: 2, sleep: async () => {} });
+    await expect(gh.put('a/b.txt', 'x', 'msg')).rejects.toThrow('github_http_409');
+    expect(conflict.calls.filter((c) => c.method === 'PUT')).toHaveLength(3);
+
+    const unprocessable = makeFetch((c) => (c.method === 'GET' ? { status: 404 } : { status: 422 }));
+    const gh2 = createGitHubContents({ token: TOKEN, repository: REPO, branch: 'main', fetchImpl: unprocessable.impl, sleep: async () => { throw new Error('不应等待'); } });
+    await expect(gh2.put('a/b.txt', 'x', 'msg')).rejects.toThrow('github_http_422');
+    expect(unprocessable.calls.filter((c) => c.method === 'PUT')).toHaveLength(1);
+  });
 });

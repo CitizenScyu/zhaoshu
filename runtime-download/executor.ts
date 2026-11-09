@@ -83,6 +83,7 @@ export class PrecheckDeferredError extends Error {
 
 const REASON_CODE = /^[a-z0-9_]{1,64}$/;
 const STAGE_CODE = /^[a-z]{1,16}$/;
+const PUBLICATION_CAUSE = /^[a-z]{1,16}:[A-Za-z0-9_]{1,64}$/;
 
 const hostOf = (url: string): string => {
   try { return new URL(url).hostname; } catch { return ''; }
@@ -255,9 +256,11 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
       // 单实例 + 并发=1 下 consume 不存在并发写者，peek 与写入之间无竞争。
       // 每次成功扣减记一张票据（任务 id + 租约 generation），书源不可达时凭票退还。
       let ticket: BudgetTicket | null = null;
+      let claimedId: Parameters<WorkerStorage['heartbeat']>[0]['id'] | null = null;
       const claim = async (owner: string) => {
         const lease = await deps.storage.claim(owner);
         if (!lease) return null;
+        claimedId = lease.id;
         if (deps.precheck) await precheckBeforeConsume(lease, deps.precheck);
         let consumed: { allowed: boolean; date?: string };
         try {
@@ -315,6 +318,11 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
           });
         }
       }
+      if (result.processed && result.reason === 'publication_retry') {
+        const stage = PUBLICATION_CAUSE.test(result.stage ?? '') ? result.stage : 'unknown';
+        log('info', '发布失败，已退避放回', { taskId: claimedId, stage, retryAt: result.retryAt ?? null });
+      }
+      if (!result.processed && result.reason === 'lease_lost') log('info', '下载腿失租约，交回收器', { taskId: claimedId });
       // 任务中途（心跳/发布/finish）撞配额：worker 已把异常吞成 failed + reason 文本；任务行多半仍是
       // running（finish 同样 402），由回收器接管。这里只布置冷却，不再零间隔领下一本。
       if (result.processed && result.terminal === 'failed' && isDbQuotaError(result.reason)) armQuota('task');

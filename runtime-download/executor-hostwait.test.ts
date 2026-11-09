@@ -16,7 +16,7 @@ const occupied: AdapterOutcome = {
   chaptersTotal: 0, chaptersDone: 0, charsTotal: 0,
 };
 
-function harness(hostWait: boolean, extra: { progress?: boolean; outcome?: AdapterOutcome; lease?: DownloadTaskLease } = {}) {
+function harness(hostWait: boolean, extra: { progress?: boolean; outcome?: AdapterOutcome; lease?: DownloadTaskLease; put?: () => Promise<void>; deferLost?: boolean } = {}) {
   const deferred: Parameters<WorkerStorage['defer']>[1][] = [];
   const logged: [string, Record<string, unknown> | undefined][] = [];
   const storage: WorkerStorage = {
@@ -25,7 +25,7 @@ function harness(hostWait: boolean, extra: { progress?: boolean; outcome?: Adapt
     heartbeat: async () => true,
     progress: async () => true,
     finish: async () => true,
-    defer: async (_l, input) => { deferred.push(input); return '2026-10-31T10:00:00.000Z'; },
+    defer: async (_l, input) => { deferred.push(input); return extra.deferLost ? null : '2026-10-31T10:00:00.000Z'; },
     reserveArtifactPath: async () => 1,
     findArtifactBinding: async () => null,
     registerArtifact: async () => 'registered',
@@ -37,7 +37,7 @@ function harness(hostWait: boolean, extra: { progress?: boolean; outcome?: Adapt
   const refundBudget = vi.fn(async (_ticket: BudgetTicket): Promise<BudgetRefundOutcome> => 'refunded');
   const adapter: SourceAdapter = { kind: 'engine', download: async () => extra.outcome ?? occupied };
   const executor = createExecutor({
-    storage, github: { put: async () => {}, getBytes: async () => null }, adapters: [adapter], budget, refundBudget,
+    storage, github: { put: extra.put ?? (async () => {}), getBytes: async () => null }, adapters: [adapter], budget, refundBudget,
     repositoryId: 1, branch: 'main', owner: 'owner', decisions: DEFAULT_DECISIONS,
     log: (_level, message, fields) => { logged.push([message, fields]); },
     ...(hostWait ? { hostWait: true } : {}),
@@ -78,5 +78,25 @@ describe('hostwait1031 执行器透传', () => {
     await off.run();
     expect(off.deferred).toHaveLength(1);
     expect(off.deferred[0].countAttempt).toBeUndefined();
+  });
+});
+
+describe('发布退避与失租约留日志（带任务 id，不带路径）', () => {
+  const txt = ['合成书', '合成作者', '', ...Array.from({ length: 3 }, (_, i) => `【第${i + 1}章 合成。】\n\n${'正文'.repeat(400)}`)].join('\n');
+  const complete: AdapterOutcome = { kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 };
+  const conflict = async () => { throw Object.assign(new Error('github_http_409'), { status: 409 }); };
+
+  it('publication_retry → 一行「发布失败，已退避放回」，含阶段与 retryAt', async () => {
+    const h = harness(false, { outcome: complete, put: conflict });
+    expect(await h.run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    expect(h.logged).toEqual([['发布失败，已退避放回', {
+      taskId: 9, stage: expect.stringMatching(/^[a-z]+:github_http_409$/), retryAt: '2026-10-31T10:00:00.000Z',
+    }]]);
+  });
+
+  it('退避写库时租约已失 → 一行「下载腿失租约，交回收器」', async () => {
+    const h = harness(false, { outcome: complete, put: conflict, deferLost: true });
+    expect(await h.run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    expect(h.logged).toEqual([['下载腿失租约，交回收器', { taskId: 9 }]]);
   });
 });
