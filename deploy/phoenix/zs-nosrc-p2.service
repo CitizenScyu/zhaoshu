@@ -1,8 +1,0 @@
-[Unit]
-Description=zhaoshu nosrc lastcall-20261109 daily cleanup (back up, then delete cohort books with no findable source)
-After=docker.service
-
-[Service]
-Type=oneshot
-ExecStart=/root/zs-backup/nosrc-tool.sh p2run
-Nice=10

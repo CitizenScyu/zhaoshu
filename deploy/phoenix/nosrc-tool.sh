@@ -1,6 +1,6 @@
 #!/bin/bash
-# nosrc-tool.sh: back up and delete QQ-paywall books that have no findable free source (see deploy/phoenix/README.md).
-# usage: select p1|cohort|p2 <out> | backup <ids> <dir> | delete <dir> | enqueue <ids> <rev> | status | p2run
+# nosrc-tool.sh: back up and delete books that cannot be downloaded (see deploy/phoenix/README.md).
+# usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [mode] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run]
 # ZS_DB / ZS_BASE override the database and backup root (scratch-copy tests only).
 set -euo pipefail
 umask 077
@@ -9,6 +9,11 @@ DB=${ZS_DB:-zhaoshu}
 PSQL=(docker exec -i zhaoshu-tempdb-postgres-1 psql -U postgres -d "$DB" -X -q -A -t -v ON_ERROR_STOP=1)
 BASE=${ZS_BASE:-/root/zs-backup}
 [[ $BASE =~ ^/root/[a-z0-9-]+$ ]] || { echo "bad ZS_BASE" >&2; exit 3; }
+GC_MAX_DELETE=${ZS_GC_MAX_DELETE:-2000}
+GC_MAX_ENQUEUE=${ZS_GC_MAX_ENQUEUE:-300}
+[[ $GC_MAX_DELETE =~ ^[0-9]+$ && $GC_MAX_ENQUEUE =~ ^[0-9]+$ ]] || { echo "bad ZS_GC_MAX_*" >&2; exit 3; }
+GC_DELETE_WHERE="delkind AND final AND NOT freeok"
+GC_LAST_WHERE="NOT ($GC_DELETE_WHERE) AND NOT had_last"
 REV=lastcall-20261109
 COHORT=$BASE/nosrc-$REV/cohort-ids.txt
 DEADLINE=20261125
@@ -43,17 +48,67 @@ WHERE COALESCE(lower(substring(lb.source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([
 SQL
 }
 
+# gc: every book with no artifact, no done/pending/running task and no user request, whose latest task failed
+# (or that never got a task). delkind = the failure means no usable source; final = this was already the second
+# attempt (a lastcall revision, or >= 2 failed tasks with the latest started in the last 14 days).
+gc_sql() {
+cat <<'SQL'
+CREATE TEMP TABLE gc AS
+WITH l AS (
+  SELECT DISTINCT ON (book_id) book_id, status, error, source_revision, created_at
+  FROM download_tasks ORDER BY book_id, id DESC
+), f AS (
+  SELECT book_id, count(*) FILTER (WHERE status IN ('failed', 'partial')) AS fails,
+         bool_or(source_revision LIKE 'lastcall-%' OR source_revision LIKE 'gc-lastcall-%') AS had_last
+  FROM download_tasks GROUP BY book_id
+)
+SELECT lb.id,
+  COALESCE(f.had_last, false) AS had_last,
+  EXISTS (SELECT 1 FROM download_source_candidates c WHERE c.book_id = lb.id AND c.failure = ''
+          AND c.host NOT IN ('book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com')) AS freeok,
+  COALESCE((l.status = 'failed' AND l.error ~ '^(identity_mismatch|identity_mismatch_or_no_candidate|download_failed|invalid_next_page|invalid_chapter|unsupported_toc_rule|preview_truncated|toc_limit)$')
+           OR l.error LIKE '源不可用（search 阶段，已连续 % 次，停止自动重试）：no_candidates', false) AS delkind,
+  COALESCE(l.source_revision LIKE 'lastcall-%' OR l.source_revision LIKE 'gc-lastcall-%'
+           OR (COALESCE(f.fails, 0) >= 2 AND l.created_at > now() - interval '14 days'), false) AS final,
+  CASE WHEN l.book_id IS NULL THEN 'no_task'
+       WHEN l.error LIKE '%：no_candidates' THEN 'no_candidates'
+       WHEN l.error LIKE '%：source_unavailable' THEN 'source_unavailable'
+       WHEN l.error LIKE '缺章%' THEN 'missing_chapters'
+       WHEN l.error ~ '^[a-z_]+$' THEN l.error
+       ELSE 'other' END AS kind
+FROM labeled_books lb LEFT JOIN l ON l.book_id = lb.id LEFT JOIN f ON f.book_id = lb.id
+WHERE NOT EXISTS (SELECT 1 FROM book_artifacts a WHERE a.labeled_book_id = lb.id)
+  AND NOT EXISTS (SELECT 1 FROM download_tasks d WHERE d.book_id = lb.id AND d.status IN ('done', 'pending', 'running'))
+  AND NOT EXISTS (SELECT 1 FROM download_tasks u WHERE u.book_id = lb.id AND u.requested_by = 'user')
+  AND (l.book_id IS NULL OR l.status IN ('failed', 'partial'));
+SQL
+}
+
+gc_report() {
+  { gc_sql; cat <<'SQL'
+SELECT bucket || ' ' || count(*) FROM (
+  SELECT CASE WHEN delkind AND final AND NOT freeok THEN 'delete_' || kind
+              WHEN NOT had_last THEN 'lastcall_' || kind
+              WHEN freeok THEN 'held_freeok'
+              ELSE 'held_' || kind END AS bucket FROM gc) s
+GROUP BY bucket ORDER BY bucket;
+SQL
+  } | "${PSQL[@]}"
+}
+
 cmd_select() {
-  local mode=$1 out=$2 where cohort='{}'
+  local mode=$1 out=$2 where cohort='{}' gen=zs_sql tail=''
   case $mode in
     p1) where="$P1_WHERE" ;;
     cohort) where="NOT ($P1_WHERE)" ;;
     p2) check_ids "$COHORT"
         where="grp = 'nocand' AND last_rev = '$REV' AND NOT user_req AND NOT freeok AND id = ANY (:'cohort'::integer[])"
         cohort=$(ids_literal "$COHORT") ;;
+    gc) gen=gc_sql; where="$GC_DELETE_WHERE" ;;
+    gclast) gen=gc_sql; where="$GC_LAST_WHERE"; tail=" LIMIT $GC_MAX_ENQUEUE" ;;
     *) die "unknown select mode $mode" ;;
   esac
-  { zs_sql; printf 'COPY (SELECT id FROM zs WHERE %s ORDER BY id) TO STDOUT;\n' "$where"; } \
+  { $gen; printf 'COPY (SELECT id FROM %s WHERE %s ORDER BY id%s) TO STDOUT;\n' "${gen%_sql}" "$where" "$tail"; } \
     | "${PSQL[@]}" -v cohort="$cohort" > "$out.tmp"
   if grep -qvxE '[0-9]+' "$out.tmp"; then die "unexpected select output"; fi
   mv "$out.tmp" "$out"
@@ -77,10 +132,12 @@ export_all() {
 }
 
 cmd_backup() {
-  local ids=$1
+  local ids=$1 mode=${3:-nosrc}
   DIR=$2
+  [[ $mode =~ ^(nosrc|gc)$ ]] || die "bad backup mode $mode"
   check_ids "$ids"
   mkdir -m 700 "$DIR"
+  echo "$mode" > "$DIR/mode"
   sort -n -u "$ids" > "$DIR/ids.txt"
   IDS=$(ids_literal "$DIR/ids.txt")
   docker exec zhaoshu-tempdb-postgres-1 pg_dump -U postgres -Fc "$DB" > "$DIR/full.dump"
@@ -114,16 +171,25 @@ cmd_delete() {
   [ -s "$DIR/full.dump" ] && [ -s "$DIR/counts.txt" ] && [ -x "$DIR/restore.sh" ] || die "backup incomplete in $DIR"
   [ ! -e "$DIR/deleted.ok" ] || die "already deleted"
   c() { awk -v t="$1" '$1 == t {print $2}' "$DIR/counts.txt"; }
+  local mode=nosrc
+  [ -f "$DIR/mode" ] && mode=$(cat "$DIR/mode")
+  [[ $mode =~ ^(nosrc|gc)$ ]] || die "bad mode in $DIR"
   IDS=$(ids_literal "$DIR/ids.txt")
-  cat <<'SQL' | "${PSQL[@]}" -v ids="$IDS" -v e_books="$(c labeled_books)" -v e_tasks="$(c download_tasks)" \
-      -v e_cands="$(c download_source_candidates)" -v e_arts="$(c book_artifacts)" -v e_pref="$(c download_source_prefetch)" \
-      -v e_fol="$(c followup_probe_state)" -v e_cap="$(c artifact_capacity_reservations)" 2>&1 | tee "$DIR/delete.log"
+  {
+    cat <<'SQL'
 BEGIN;
 CREATE TEMP TABLE del_ids (id integer PRIMARY KEY) ON COMMIT DROP;
 INSERT INTO del_ids SELECT DISTINCT unnest(:'ids'::integer[]);
 CREATE TEMP TABLE exp ON COMMIT DROP AS
   SELECT :'e_books'::int AS books, :'e_tasks'::int AS tasks, :'e_cands'::int AS cands, :'e_arts'::int AS arts,
          :'e_pref'::int AS pref, :'e_fol'::int AS fol, :'e_cap'::int AS cap;
+SQL
+    # gc re-evaluates its rule after the books are locked, so a task enqueued meanwhile disqualifies the book.
+    if [ "$mode" = gc ]; then
+      printf 'SELECT count(*) AS locked FROM (SELECT 1 FROM labeled_books WHERE id IN (SELECT id FROM del_ids) FOR UPDATE) s;\n'
+      gc_sql
+    fi
+    cat <<'SQL'
 DO $$
 DECLARE e record; n int; m int;
 BEGIN
@@ -144,6 +210,11 @@ BEGIN
   PERFORM 1 FROM labeled_books WHERE id IN (SELECT id FROM del_ids) FOR UPDATE;
   GET DIAGNOSTICS m = ROW_COUNT;
   IF m <> n THEN RAISE EXCEPTION 'locked % of % books', m, n; END IF;
+SQL
+    if [ "$mode" = gc ]; then
+      printf '  SELECT count(*) INTO m FROM del_ids x WHERE x.id NOT IN (SELECT id FROM gc WHERE %s);\n' "$GC_DELETE_WHERE"
+    else
+      cat <<'SQL'
   SELECT count(*) INTO m FROM del_ids x JOIN labeled_books lb ON lb.id = x.id
   WHERE NOT (
     COALESCE(lower(substring(lb.source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/:?#]+)')), '')
@@ -154,6 +225,9 @@ BEGIN
       AND c.host NOT IN ('book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com'))
     AND EXISTS (SELECT 1 FROM (SELECT d.error FROM download_tasks d WHERE d.book_id = x.id ORDER BY d.id DESC LIMIT 1) l
       WHERE l.error LIKE '源不可用（search 阶段，已连续 % 次，停止自动重试）：no_candidates'));
+SQL
+    fi
+    cat <<'SQL'
   IF m > 0 THEN RAISE EXCEPTION '% books no longer qualify', m; END IF;
   SELECT count(*) INTO m FROM download_tasks o WHERE o.book_id NOT IN (SELECT id FROM del_ids)
     AND (o.retry_of IN (SELECT d.id FROM download_tasks d WHERE d.book_id IN (SELECT id FROM del_ids))
@@ -191,10 +265,13 @@ BEGIN
   DELETE FROM labeled_books WHERE id IN (SELECT id FROM del_ids);
   GET DIAGNOSTICS m = ROW_COUNT;
   IF m <> n THEN RAISE EXCEPTION 'books % <> %', m, n; END IF;
-  RAISE NOTICE 'nosrc deleted books=% tasks=% candidates=% artifacts=%', n, e.tasks, e.cands, e.arts;
+  RAISE NOTICE 'deleted books=% tasks=% candidates=% artifacts=%', n, e.tasks, e.cands, e.arts;
 END $$;
 COMMIT;
 SQL
+  } | "${PSQL[@]}" -v ids="$IDS" -v e_books="$(c labeled_books)" -v e_tasks="$(c download_tasks)" \
+      -v e_cands="$(c download_source_candidates)" -v e_arts="$(c book_artifacts)" -v e_pref="$(c download_source_prefetch)" \
+      -v e_fol="$(c followup_probe_state)" -v e_cap="$(c artifact_capacity_reservations)" 2>&1 | tee "$DIR/delete.log"
   local left
   left=$(printf "SELECT count(*) FROM labeled_books WHERE id = ANY (:'ids'::integer[]);\n" | "${PSQL[@]}" -v ids="$IDS")
   [ "$left" = 0 ] || die "rows still present after delete: $left"
@@ -265,12 +342,41 @@ cmd_p2run() {
   fi
 }
 
+# Daily rule-based cleanup: delete books that failed twice for lack of a source, give the rest one last search.
+cmd_gcrun() {
+  local dry=0 ts del last n
+  case $1 in '') ;; --dry-run) dry=1 ;; *) die "usage: gcrun [--dry-run]" ;; esac
+  exec 9> /run/zs-maint.lock
+  flock -w 900 9 || die "maintenance lock busy"
+  ts=$(date +%Y%m%d-%H%M%S)
+  del=/run/zs-nosrc-gc-$ts.ids
+  last=/run/zs-nosrc-gclast-$ts.ids
+  trap "rm -f '$del' '$last' '$del.tmp' '$last.tmp'" EXIT
+  gc_report
+  cmd_select gc "$del"
+  cmd_select gclast "$last"
+  n=$(wc -l < "$del")
+  if [ "$dry" = 1 ]; then
+    echo "dry run: would delete $n books and enqueue $(wc -l < "$last") last calls"
+    return
+  fi
+  [ "$n" -le "$GC_MAX_DELETE" ] || die "refusing to delete $n books (cap $GC_MAX_DELETE); review and raise ZS_GC_MAX_DELETE by hand"
+  if [ "$n" -gt 0 ]; then
+    cmd_backup "$del" "$BASE/nosrc-gc-$ts" gc
+    cmd_delete "$BASE/nosrc-gc-$ts"
+  fi
+  if [ -s "$last" ]; then
+    cmd_enqueue "$last" "gc-lastcall-$(date +%Y%m%d)"
+  fi
+}
+
 case ${1:-} in
   select) cmd_select "$2" "$3" ;;
-  backup) cmd_backup "$2" "$3" ;;
+  backup) cmd_backup "$2" "$3" "${4:-nosrc}" ;;
   delete) cmd_delete "$2" ;;
   enqueue) cmd_enqueue "$2" "$3" ;;
   status) cmd_status ;;
   p2run) cmd_p2run ;;
-  *) die "usage: select p1|cohort|p2 <out> | backup <ids> <dir> | delete <dir> | enqueue <ids> <rev> | status | p2run" ;;
+  gcrun) cmd_gcrun "${2:-}" ;;
+  *) die "usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [nosrc|gc] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run]" ;;
 esac

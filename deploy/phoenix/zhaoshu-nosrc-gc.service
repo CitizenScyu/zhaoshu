@@ -1,0 +1,9 @@
+[Unit]
+Description=zhaoshu daily book GC: delete books that failed twice for lack of a source (backed up first), give the rest one last search
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/zhaoshu/nosrc-tool.sh gcrun
+Nice=10
+TimeoutStartSec=30min
