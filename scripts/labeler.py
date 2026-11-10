@@ -4238,7 +4238,12 @@ def main() -> int:
             # 产出与 fetch_rank_books() 同构，后续打标循环零改动复用。
             print('拉取名单并搜索 book15...')
             # 桥接：名单源（豆瓣/起点）传完整 URL，book15 搜索侧传站内相对路径。
-            bridged = lambda path: http_get(BOOK15.absolute(path))
+            # listpolicy1110：名单页不受书源停用清单/死源冷却拦截（见 SourcePolicy.list_scope）。
+            def bridged(path):
+                if SOURCE_POLICY is None:
+                    return http_get(BOOK15.absolute(path))
+                with SOURCE_POLICY.list_scope():
+                    return http_get(BOOK15.absolute(path))
             # 同名且双方作者可确认不同的候选继续核验；未知作者仍保守跳过。
             done_index = douban_list.load_done_index(data_path('labels.jsonl'))
             # 豆瓣翻页默认 1 页；.env 里 LABELER_DOUBAN_PAGES=3 才开 3 页（审查 D.3）。

@@ -269,8 +269,10 @@ class MultiSourceDeepenTest(unittest.TestCase):
             return [{'title': b['title'], 'url': f'u:{b["title"]}', 'origin': b['origin'],
                      'finished': b.get('finished')} for b in candidates]
 
+        # 轮转/游标语义按 4 页预算钉（deep1110 生产默认改 6 页，不影响这里的逻辑断言）
         with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(self.out), \
                 mock.patch.object(dl, '_resolve_candidates', fake_resolve), \
+                mock.patch.object(dl, 'LIST_DEEPEN_MAX_PAGES', 4), \
                 mock.patch.object(dl, 'LIST_DEEPEN_PAGE_DELAY', 0):
             return dl.build_webnovel_queue(self.http_get, include_douban=False,
                                            list_cursor=cursor, deepen_min=deepen_min)
@@ -283,7 +285,7 @@ class MultiSourceDeepenTest(unittest.TestCase):
         cursor = dl.ListCursor(self.cursor_path)
         queue = self.build(cursor)
         self.assertEqual(self.deep_seen(), [deep_url(i, 1) for i in range(4)])
-        self.assertEqual(len(self.deep_seen()), dl.LIST_DEEPEN_MAX_PAGES)
+        self.assertEqual(len(self.deep_seen()), 4)          # = build() 里钉的页预算
         titles = [q['title'] for q in queue]
         self.assertEqual(titles, ['七库甲', '一七甲', '红甲', '红乙', '塔甲'])
         self.assertTrue(all(q['finished'] for q in queue))

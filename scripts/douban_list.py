@@ -3028,8 +3028,11 @@ _QM_SHUKU_TITLE_RE = re.compile(
     r'<span\s[^>]*class="s-tit"[^>]*>\s*<a\s[^>]*href="(?:https?:)?//www\.qimao\.com/shuku/\d+/"'
     r'[^>]*>([^<]+)</a>')
 LIST_DEEPEN_ENV = 'LABELER_LIST_DEEPEN_MIN'   # 队列下限；0 关闭加深
-LIST_DEEPEN_MIN = 10
-LIST_DEEPEN_MAX_PAGES = 4                     # 每轮最多翻页数（每页 15 本）
+# deep1110：10→30、每轮 4→6 页。2026-11-08～10 local-server：固定名单每轮 40–52 本入队、其中 35+ 本是
+# 每轮重复的取文失败，队列从没低于 10 ⇒ 加深一次都没触发（labels-list-cursor.json 不存在），每轮成功 3–12 本。
+# fetchfail1110 把重复失败的书退避出队后，靠加深从多平台完结书库补新书。
+LIST_DEEPEN_MIN = 30
+LIST_DEEPEN_MAX_PAGES = 6                     # 每轮最多翻页数（每页 15 本）
 LIST_DEEPEN_PAGE_DELAY = 1.0
 LIST_DEEPEN_PAGE_CAP = 300                    # 游标超过此页回第 1 页（个别站越界页重复返回末页）
 LIST_CURSOR_FILENAME = 'labels-list-cursor.json'

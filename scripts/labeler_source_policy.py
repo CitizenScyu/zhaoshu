@@ -32,6 +32,7 @@ douban_list.search_book15 搜索层）都只问它，不各写 if：
 （默认 time.time），便于假时钟离线单测。注意 urllib 的 timeout 是**单次请求**超时，
 不是整轮墙钟上限——本模块不承诺后者（冷却 TTL 才是跨轮的界）。
 """
+import contextlib
 import json
 import os
 import re
@@ -207,6 +208,8 @@ class SourcePolicy:
         self._env_disabled: set[str] = set()   # env 清单停用（仅本进程，绝不落盘）
         self._disabled: dict[str, dict] = {}   # disable() 写入的运维停用（落状态文件）
         self._loaded = False
+        self._list_depth = 0                   # >0 = 名单页拉取中（listpolicy1110，见 list_scope）
+        self._list_fails: dict[str, int] = {}  # 名单页本轮失败计数（不落盘、与书源冷却分开）
         for h in extra_disabled:
             host = str(h).lower()
             if _HOST_RE.match(host):
@@ -298,13 +301,35 @@ class SourcePolicy:
 
     def blocked(self, host: str) -> tuple[bool, str]:
         """(是否拦截, 原因)。停用优先于冷却；两者都不命中 → (False, '')。
-        这是所有取文/搜索入口该问的唯一问题。"""
+        这是所有取文/搜索入口该问的唯一问题。list_scope 内除 book15 一族外一律放行。"""
         h = (host or '').lower()
+        if self._list_bypass(h):
+            if self._list_fails.get(h, 0) >= self.threshold:
+                return True, '名单冷却'
+            return False, ''
         if self.is_disabled(h):
             return True, '停用'
         if self.cooldown_remaining(h) > 0:
             return True, '冷却中'
         return False, ''
+
+    @contextlib.contextmanager
+    def list_scope(self):
+        """listpolicy1110：名单页（起点/红袖等榜单）拉取期间，停用清单与死源冷却不拦——那是**取文**口径：
+        2026-11-08～10 local-server gate.log，m.qidian.com 作书源目录全败被判死后，起点完本频道 + 7 个起点榜
+        跟着被「冷却中」拦了 6/8 轮；www.hongxiu.com 在书源停用清单里，红袖完本页 8/8 轮被拦。
+        域内名单页的失败/成功另记一套**仅本轮**计数（_list_fails）：同 host 名单页最终失败达阈值
+        → 本轮余下名单页拦为「名单冷却」（726 的「挂掉的名单站别每页都白等重试」保留），
+        但不进书源冷却、不落死源侧车，也不替书源清冷却；下一轮重新尝试。
+        book15 一族（search_book15 也走同一个 http_get）行为逐字不变。"""
+        self._list_depth += 1
+        try:
+            yield self
+        finally:
+            self._list_depth -= 1
+
+    def _list_bypass(self, host: str) -> bool:
+        return bool(self._list_depth) and host not in BOOK15_HOSTS
 
     def blocked_url(self, url: str) -> tuple[bool, str]:
         return self.blocked(host_of(url))
@@ -326,6 +351,12 @@ class SourcePolicy:
         「临时失败」的判别在调用方（douban_list.search_book15：重试全失败才记；
         正常 miss / 拿到页面 → record_success）。"""
         h = (host or '').lower()
+        if h and self._list_bypass(h):
+            self._list_fails[h] = self._list_fails.get(h, 0) + 1
+            if self._list_fails[h] == self.threshold:
+                print(f'  名单冷却: {h} 本轮名单页已 {self.threshold} 次失败，本轮余下名单页跳过'
+                      f'（不计书源冷却）', flush=True)
+            return
         if not h or self.ttl <= 0 or self.is_disabled(h):
             return
         self._fails[h] = self._fails.get(h, 0) + 1
@@ -345,6 +376,9 @@ class SourcePolicy:
         计数与冷却。**绝不动停用态与跨轮判死**：停用只能 enable()/人工恢复；跨轮判死
         由 DeadHostMemory 的 TTL 自然过期（同引擎分支语义）。无可清内容时零副作用。"""
         h = (host or '').lower()
+        if self._list_bypass(h):    # listpolicy1110：名单页成功只清名单计数，不替书源清冷却
+            self._list_fails.pop(h, None)
+            return
         self._fails.pop(h, None)
         self._cooled.pop(h, None)
 

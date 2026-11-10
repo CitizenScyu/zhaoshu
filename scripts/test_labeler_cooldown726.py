@@ -6,6 +6,8 @@
     → labeler.SOURCE_POLICY → bridged http_get → fetch_douban_books）不调 main() 本体；
   * 第一轮：选书期名单 host 持续失败达阈值 → 经 sink 真实落盘 labels-dead-hosts.json；
   * 第二轮：独立装配在选书前即识别冷却，相关 HTTP 调用 = 0（传输层炸弹证明未发请求）；
+    （listpolicy1110 改口径：名单页走 list_scope ⇒ 只在本轮「名单冷却」、不落侧车，书源判死/
+    停用不拦名单页；上两条现只对取文口径的裸 http_get 成立）
   * TTL 到期恢复资格；retired（book15 一族）与运维停用永不复活；
   * 正常合法源仍可尝试；正常 miss（拿到页面但无结果）不记失败、不进侧车；
   * TTL<=0 只关临时冷却，停用门照常；
@@ -109,15 +111,21 @@ class Harness(unittest.TestCase):
         labeler.SOURCE_POLICY = policy
         return mem, policy
 
-    def _bridged(self):
-        # 与 main() 选书段逐字同构：名单源完整 URL 经 BOOK15.absolute 透传给 http_get。
-        return lambda path: labeler.http_get(labeler.BOOK15.absolute(path))
+    def _bridged(self, scoped=True):
+        # 与 main() 选书段逐字同构：名单源完整 URL 经 BOOK15.absolute 透传给 http_get，
+        # listpolicy1110 起包在 SOURCE_POLICY.list_scope() 里。scoped=False = 取文口径的裸 http_get。
+        def bridged(path):
+            if not scoped or labeler.SOURCE_POLICY is None:
+                return labeler.http_get(labeler.BOOK15.absolute(path))
+            with labeler.SOURCE_POLICY.list_scope():
+                return labeler.http_get(labeler.BOOK15.absolute(path))
+        return bridged
 
-    def _fetch_douban(self, urlopen_fake):
+    def _fetch_douban(self, urlopen_fake, scoped=True):
         with mock.patch.object(labeler.urllib.request, 'urlopen', urlopen_fake):
             with contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):
-                return douban_list.fetch_douban_books(self._bridged())
+                return douban_list.fetch_douban_books(self._bridged(scoped))
 
 
 class TestIsolationGuards(Harness):
@@ -135,30 +143,86 @@ class TestIsolationGuards(Harness):
 
 
 class TestSelectionCooldownRoundTrip(Harness):
-    """第一轮达阈值落盘 → 第二轮选书前即冷却、HTTP=0。"""
+    """listpolicy1110 起：名单页失败只在本轮「名单冷却」，不落侧车；书源判死不拦名单页。"""
 
-    def test_round1_selection_failures_reach_threshold_and_persist(self):
-        """名单 host 持续失败：达阈值（3 次最终失败）判冷却并落侧车。"""
+    def test_main_bridged_uses_list_scope(self):
+        """main() 的 bridged 与 Harness._bridged 同构（源码级钉住，防回退成裸 lambda）。"""
+        src = Path(labeler.__file__).read_text(encoding='utf-8')
+        body = src[src.index('            def bridged(path):'):]
+        body = body[:body.index('done_index = douban_list.load_done_index')]
+        self.assertIn('with SOURCE_POLICY.list_scope():', body)
+        self.assertIn('http_get(BOOK15.absolute(path))', body)
+
+    def test_round1_list_failures_cool_within_round_only(self):
+        """名单 host 持续失败：第 3 次最终失败起本轮余下名单页零请求，但不落侧车、不进书源冷却。"""
         mem, policy = self._assemble()
-        books = self._fetch_douban(_fail_urlopen)
-        self.assertEqual(books, [])
-        # 13 个 tag × 每个最终失败计 1 次 record_failure：第 3 次起进冷却并 sink 落盘
-        self.assertEqual(sp.COOLDOWN_FAIL_THRESHOLD, 3)
-        self.assertTrue(self.sidecar.exists())
-        hosts = json.loads(self.sidecar.read_text(encoding='utf-8'))['hosts']
-        self.assertIn('book.douban.com', hosts)
-        self.assertEqual(policy.blocked('book.douban.com'), (True, '冷却中'))
+        calls = []
 
-    def test_round2_independent_assembly_zero_http_before_selection(self):
-        """独立 policy/worker 式装配：选书前即识别冷却，HTTP 调用 0（传输层为炸弹）。"""
+        def fail(req, timeout=30):
+            calls.append(req.full_url)
+            raise urllib.error.URLError('synthetic offline failure')
+
+        books = self._fetch_douban(fail)
+        self.assertEqual(books, [])
+        self.assertEqual(sp.COOLDOWN_FAIL_THRESHOLD, 3)
+        self.assertEqual(len(calls), 3 * (1 + labeler.HTTP_RETRY))   # 13 个 tag 只真打前 3 个
+        self.assertFalse(self.sidecar.exists())
+        self.assertEqual(policy.blocked('book.douban.com'), (False, ''))
+        with policy.list_scope():
+            self.assertEqual(policy.blocked('book.douban.com'), (True, '名单冷却'))
+
+    def test_round2_book_source_dead_does_not_block_list_pages(self):
+        """侧车里判死的 host（取文口径）照样拉名单页；取文口径仍冷却。"""
         mem = labeler.DeadHostMemory(self.sidecar, ttl_sec=3600)
         mem.add('book.douban.com', now=labeler.time.time())
         mem.save()
+        seen = []
+
+        def ok_urlopen(req, timeout=30):
+            seen.append(req.full_url)
+            return io.BytesIO(DOUBAN_TAG_HTML.encode('utf-8'))
+
         mem2, policy2 = self._assemble()          # 新“进程”：重新 load 同一文件
         self.assertIn('book.douban.com', mem2.dead_hosts(now=labeler.time.time()))
-        books = self._fetch_douban(_bomb_urlopen)  # 任何真实请求都会炸
-        self.assertEqual(books, [])
+        self.assertEqual(len(self._fetch_douban(ok_urlopen)), 3)
+        self.assertEqual(len(seen), 13)
         self.assertEqual(policy2.blocked('book.douban.com'), (True, '冷却中'))
+        self.assertEqual(self._fetch_douban(_bomb_urlopen, scoped=False), [])
+
+    def test_disabled_host_lists_still_fetched_but_book15_never(self):
+        """停用清单（env/运维）只管取文：名单页放行；book15 一族在名单口径下也照拦。"""
+        _, policy = self._assemble(env={sp.DISABLED_HOSTS_ENV: 'book.douban.com'})
+        self.assertTrue(policy.disable('ops.example', 'ops', now=1.0))
+        with policy.list_scope():
+            self.assertEqual(policy.blocked('book.douban.com'), (False, ''))
+            self.assertEqual(policy.blocked('ops.example'), (False, ''))
+            for h in sp.BOOK15_HOSTS:
+                self.assertEqual(policy.blocked(h), (True, '停用'))
+                policy.record_success(h)
+                self.assertEqual(policy.blocked(h), (True, '停用'))
+        self.assertEqual(policy.blocked('book.douban.com'), (True, '停用'))
+        self.assertEqual(policy.blocked('ops.example'), (True, '停用'))
+
+    def test_list_counts_isolated_from_book_source_cooldown(self):
+        """名单页成功不替书源清冷却；书源失败计数不被名单页计入。"""
+        _, policy = self._assemble()
+        for _ in range(sp.COOLDOWN_FAIL_THRESHOLD):
+            policy.record_failure('a.example', 'x', now=1.0)
+        self.assertEqual(policy.blocked('a.example'), (True, '冷却中'))
+        with policy.list_scope():
+            policy.record_success('a.example')
+            policy.record_failure('b.example')
+        self.assertEqual(policy.blocked('a.example'), (True, '冷却中'))
+        self.assertEqual(policy.fail_count('b.example'), 0)
+        # 名单页一次成功即清名单计数
+        with policy.list_scope():
+            for _ in range(2):
+                policy.record_failure('c.example')
+            policy.record_success('c.example')
+            policy.record_failure('c.example')
+            self.assertEqual(policy.blocked('c.example'), (False, ''))
+        hosts = json.loads(self.sidecar.read_text(encoding='utf-8'))['hosts']
+        self.assertEqual(set(hosts), {'a.example'})      # 只有取文口径的判死落侧车
 
     def test_expired_ttl_restores_but_retired_never_revives(self):
         """TTL 过期 → 名单 host 恢复资格（真实尝试）；book15 retired 恸不复活。"""
@@ -219,7 +283,7 @@ class TestSelectionCooldownRoundTrip(Harness):
         """选书阶段落的状态即打标阶段读的状态：同文件名、同 mem.dead_hosts 口径。"""
         self.assertEqual(labeler.DEAD_HOSTS_FILENAME, 'labels-dead-hosts.json')
         self._assemble()                             # 装配（sink 才接了侧车）
-        self._fetch_douban(_fail_urlopen)            # 第一轮落盘
+        self._fetch_douban(_fail_urlopen, scoped=False)   # 取文口径失败才落盘
         self.assertTrue(self.sidecar.exists())
         mem = labeler.DeadHostMemory.load(self.sidecar, ttl_sec=3600)
         remembered = mem.dead_hosts(now=labeler.time.time())
