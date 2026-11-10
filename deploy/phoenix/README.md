@@ -266,6 +266,17 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   凑满 5 个成功章或探满 10 章为止；瞬时类失败（网络/超时）即放弃先探，交主循环。
 - 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
 
+## 选源跳过从没搜到过书的 host（neverhit1110，2026-11-11）
+
+- drop-in `zhaoshu-download-b@.service.d/92-neverhit.conf`：`DOWNLOAD_SCAN_SKIP_NEVER_HIT=1`（scan-miss 记忆也须开着）。
+  门槛 `DOWNLOAD_SCAN_NEVER_HIT_MIN` 缺省 200，最低 50。
+- 判据：近 24h scan-miss 记忆里确认无书的不同书数 ≥ 门槛，且近 30 天候选表与 done 任务里都没出现过的 host，
+  选源时整 host 跳过。每 10 分钟按记忆目录和库重算一次；查库失败或 30 天全库无候选时不跳。
+- 动机：zeroskip 只认有失败候选行的 host，从没搜到过书的 host 没有候选行、永远不降。11-10 这类 113 个 host
+  占 scan-miss 26.4 万中的 10.1 万、当天 13.3 万次请求。上线后每次选源约跳过 170 个池源。
+- 自愈：被跳的 host 不再产生 miss，24h 后计数掉到门槛下会重新扫；每天每 host 约留 200 本书的探测。
+- 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
+
 ## release 目录布局 / 回滚
 
 ```
