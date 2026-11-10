@@ -56,6 +56,11 @@ export interface SourceSelectorOptions {
    */
   skipZeroYield?: boolean;
   /**
+   * neverhit1110：从没搜到过书的 host 集（见 never-hit.ts），其源直接出池，不探测、不占 scanLimit。提供方拿本轮池
+   * （去重/目录过滤后）把记忆键映射回 host，自行吞错回空集（读不到 = 不跳过）。缺省 = 无（逐字同改前）。
+   */
+  neverHit?: (pool: readonly PoolSource[], signal: AbortSignal) => Promise<ReadonlySet<string>>;
+  /**
    * scanmiss1101：确认无书记忆（见 scan-miss-memo.ts）。缺省 = 无记忆（逐字同改前）。命中的源不出网、不扣
    * scanBudget，但照旧占 scanLimit 名额（轮转窗口划分不变，记忆只省请求、不扩扫描面）。
    */
@@ -260,6 +265,20 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         deduped = before - pool.length;
       }
       if (options.skipStrictToc) pool = pool.filter(source => !strictTocDoomed(source));
+      let neverHitSkipped = 0;
+      if (options.neverHit) {
+        let skip: ReadonlySet<string> = new Set();
+        try {
+          skip = await sourceAbortable(options.neverHit(pool, overall), overall);
+        } catch {
+          signal.throwIfAborted();
+        }
+        if (skip.size) {
+          const before = pool.length;
+          pool = pool.filter(source => !skip.has(hostOf(source.url)));
+          neverHitSkipped = before - pool.length;
+        }
+      }
       let lead = 0;
       let zeroYieldSkipped = 0;
       if (options.hostPriority) {
@@ -418,6 +437,7 @@ export function createSourceSelector(options: SourceSelectorOptions): SourceSele
         taskId: task.id, scanned, candidates: picked.length, hosts: pickedHosts,
         ...(memo ? { remembered } : {}), ...(options.dedupeVariants ? { deduped } : {}),
         ...(options.skipZeroYield ? { zeroYieldSkipped } : {}),
+        ...(options.neverHit ? { neverHitSkipped } : {}),
         errors, ...(errors ? { errorKinds: Object.fromEntries([...errorKinds].sort((a, b) => b[1] - a[1]).slice(0, 6)) } : {}),
         ...(unprobed ? { unprobed } : {}),
         ...(errorHosts.size ? { errorHosts: Object.fromEntries([...errorHosts].sort((a, b) => b[1] - a[1]).slice(0, 16)) } : {}),

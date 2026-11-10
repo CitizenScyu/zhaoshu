@@ -28,7 +28,7 @@ import {
   type AdapterOutcome, type SourceAdapter, type TaskRow,
 } from '../src/lib/download-worker';
 import { classifyFailure } from '../src/lib/download-source-candidates';
-import { createSourceSelector, type SourceSelection } from './source-selector';
+import { createSourceSelector, type SourceSelection, type SourceSelectorOptions } from './source-selector';
 import type { ScanMissMemo } from './scan-miss-memo';
 import type { PrecheckHook, PrecheckResult } from './executor';
 
@@ -106,6 +106,8 @@ export interface BuiltinFallbackOptions {
   dedupeVariants?: boolean;
   /** zeroskip1105：透传给 selector，零产出 host（hostPriority 负分）出池不扫；缺省关。 */
   skipZeroYield?: boolean;
+  /** neverhit1110：透传给 selector，从没搜到过书的 host 出池不扫（见 never-hit.ts）；缺省无。recall 不需要：这类 host 没有候选行。 */
+  neverHit?: SourceSelectorOptions['neverHit'];
   /**
    * poolrecall1107：recall 只取池里仍解析得到的旧候选（与 resolveSource 同口径：URL 前缀或同站键）；缺省关。
    * 源被停用/出池后旧候选必落空 no_engine_source_for_host——2026-11-07 停用 bqg9/59wt 后 12h 仍被召回 195 次，
@@ -208,6 +210,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
     skipStrictToc: options.skipStrictToc,
     dedupeVariants: options.dedupeVariants,
     skipZeroYield: options.skipZeroYield,
+    neverHit: options.neverHit,
     missMemo: options.missMemo,
     scanConcurrency: options.scanConcurrency,
   });

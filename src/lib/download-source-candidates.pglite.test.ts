@@ -7,7 +7,7 @@ import { createPGliteSql } from '../lib/fixtures/pglite-sql';
 import { initializeBusinessSchema } from '../lib/business-schema';
 import {
   claimSourcePrefetch, classifyFailure, failedCandidateSources, markCandidateDone, markCandidateFailure, occupiedHosts,
-  productiveHostScores, releaseHostOccupancy, releaseSourcePrefetch, replaceSourceCandidates,
+  productiveHostScores, recentCandidateHosts, releaseHostOccupancy, releaseSourcePrefetch, replaceSourceCandidates,
   tryOccupyHost, usableSourceCandidates, zeroYieldHosts,
 } from './download-source-candidates';
 
@@ -196,6 +196,23 @@ maybe('bsrcfix-41：候选源持久化与跨实例占位（0005 三表）', () =
     expect(await zeroYieldHosts(sql())).toEqual(new Map());
     await expect(zeroYieldHosts(sql(), 0)).rejects.toThrow('windowDays is invalid');
     await expect(zeroYieldHosts(sql(), 30, 0)).rejects.toThrow('minBooks is invalid');
+  });
+
+  it('neverhit1110 recentCandidateHosts：窗口内任一候选行（可用/失败/成功标记）或 done 任务的 host，小写；过窗/空 host 不计', async () => {
+    await pg.exec(`
+      INSERT INTO labeled_books (title, author) SELECT 'b' || g, '' FROM generate_series(2, 3) g;
+      INSERT INTO download_source_candidates (book_id, source_url, host, failure, updated_at) VALUES
+        (1, 'https://A.example/', 'A.example', '', now()),
+        (1, 'https://f.example/', 'f.example', 'temporary', now()),
+        (2, 'https://old.example/', 'old.example', 'permanent', now() - interval '40 days'),
+        (3, 'bad', '', '', now());
+      INSERT INTO download_tasks (user_id, book_id, title, status, source_url, updated_at) VALUES
+        (1, 31, 't', 'done', 'https://WWW.D.example:8443/book/1', now()),
+        (1, 32, 't', 'failed', 'https://x.example/book/1', now()),
+        (1, 33, 't', 'done', 'https://olddone.example/book/1', now() - interval '40 days');
+    `);
+    expect(await recentCandidateHosts(sql())).toEqual(new Set(['a.example', 'f.example', 'www.d.example']));
+    await expect(recentCandidateHosts(sql(), 0)).rejects.toThrow('windowDays is invalid');
   });
 
   it('yieldattr1105 markCandidateDone：回退站实收计入 productive、解除 zeroyield 降级；失败行被覆盖为成功', async () => {

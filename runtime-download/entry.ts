@@ -28,6 +28,7 @@ import { createFanqieLeg, createFanqieSearchFetch, fanqieDailyLimit, fanqieDir, 
 import { createHostOccupancy, type HostOccupancy } from './host-occupancy';
 import { createHostPriority, dedupeVariantsEnabled, scanConcurrency, scanRotateEnabled, skipStrictTocEnabled, skipZeroYieldEnabled } from './host-priority';
 import { createScanMissMemo, scanMissDir, scanMissMemoEnabled } from './scan-miss-memo';
+import { createNeverHit, neverHitMinBooks, skipNeverHitEnabled } from './never-hit';
 import { createSharedHostSuspect, hostSuspectDir, sharedHostSuspectEnabled } from './shared-host-suspect';
 import { isHostSuspect, setHostHealthListener, sourceHostSuspectMs } from '../src/lib/source-host-health';
 import { peerOutRoots, resumePeersEnabled, resumeStaleLocksEnabled, seedFromPeers } from './resume-seed';
@@ -361,6 +362,10 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       skipStrictToc: skipStrictTocEnabled(env),
       dedupeVariants: dedupeVariantsEnabled(env),
       skipZeroYield: skipZeroYieldEnabled(env),
+      // neverhit1110：证据来自 scan-miss 记忆，记忆关着时目录不再更新、计数随 TTL 归零，不会误跳。
+      neverHit: candidateSql && skipNeverHitEnabled(env)
+        ? createNeverHit(candidateSql, scanMissDir(options.workDir), neverHitMinBooks(env))
+        : undefined,
       recallPoolCheck: env.DOWNLOAD_RECALL_POOL_CHECK !== '0',
       missMemo: scanMissMemoEnabled(env) ? createScanMissMemo(scanMissDir(options.workDir)) : undefined,
       scanConcurrency: scanConcurrency(env),

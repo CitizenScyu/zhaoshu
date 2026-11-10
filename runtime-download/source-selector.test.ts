@@ -26,6 +26,7 @@ function harness(opts: {
   skipStrictToc?: boolean;
   dedupeVariants?: boolean;
   skipZeroYield?: boolean;
+  neverHit?: (pool: readonly { url: string }[], signal: AbortSignal) => Promise<ReadonlySet<string>>;
   missMemo?: ScanMissMemo;
   scanConcurrency?: number;
 }) {
@@ -72,6 +73,7 @@ function harness(opts: {
     skipStrictToc: opts.skipStrictToc,
     dedupeVariants: opts.dedupeVariants,
     skipZeroYield: opts.skipZeroYield,
+    neverHit: opts.neverHit,
     missMemo: opts.missMemo,
     scanConcurrency: opts.scanConcurrency,
   });
@@ -109,6 +111,23 @@ describe('共用选源器', () => {
     // 无优先分（读失败回空表）⇒ 不剔任何源。
     const empty = harness({ pool, search: () => [], hostPriority: async () => new Map(), skipZeroYield: true });
     expect((await empty.selector(request(), freshSignal())).scanned).toBe(5);
+  });
+
+  it('neverhit1110：neverHit 集内 host 出池零出网、不占 scanLimit，提供方拿到本轮池；读失败/未配 ⇒ 照扫', async () => {
+    const pool = ['https://n.example/', 'https://a.example/', 'https://n.example/v2', 'https://b.example/', 'https://c.example/'];
+    const seen: string[][] = [];
+    const neverHit = async (p: readonly { url: string }[]) => { seen.push(p.map(s => s.url)); return new Set(['n.example']); };
+    const on = harness({ pool, search: () => [], neverHit });
+    expect((await on.selector(request({ scanLimit: 2 }), freshSignal())).scanned).toBe(2);
+    expect(on.searchedUrls).toEqual(['https://a.example/', 'https://b.example/']);
+    expect(seen).toEqual([pool]);
+    expect(on.logs.find(l => l.message === '选源完成')?.fields?.neverHitSkipped).toBe(2);
+    const broken = harness({ pool, search: () => [], neverHit: async () => { throw new Error('boom'); } });
+    expect((await broken.selector(request(), freshSignal())).scanned).toBe(5);
+    expect(broken.logs.find(l => l.message === '选源完成')?.fields?.neverHitSkipped).toBe(0);
+    const off = harness({ pool, search: () => [] });
+    expect((await off.selector(request(), freshSignal())).scanned).toBe(5);
+    expect(off.logs.find(l => l.message === '选源完成')?.fields).not.toHaveProperty('neverHitSkipped');
   });
 
   it('toctgate1030：skipStrictToc 开 ⇒ strict 目录必拒的源零出网出池、不耗 scanLimit；关 ⇒ 逐字同改前', async () => {

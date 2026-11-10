@@ -35,6 +35,9 @@ export interface ScanMissMemo {
 
 const sha = (text: string, length: number) => createHash('sha256').update(text).digest('hex').slice(0, length);
 
+/** 记忆文件里源 URL 的键（never-hit.ts 按池 URL 反查 host 用同一口径）。 */
+export const scanMissKey = (url: string): string => sha(url, 16);
+
 /** workDir = <base>/<inst-N>/<work> 的多实例布局 ⇒ <base>/scan-miss；否则 <workDir>/scan-miss。 */
 export function scanMissDir(workDir: string): string {
   const inst = dirname(workDir);
@@ -70,7 +73,7 @@ export function createScanMissMemo(dir: string, now: () => number = Date.now): S
   return {
     load(task) {
       const misses = read(fileOf(task));
-      return url => misses[sha(url, 16)] !== undefined;
+      return url => misses[scanMissKey(url)] !== undefined;
     },
     record(task, urls) {
       if (!urls.length) return;
@@ -79,7 +82,7 @@ export function createScanMissMemo(dir: string, now: () => number = Date.now): S
         const file = fileOf(task);
         const misses = read(file);
         const at = now();
-        for (const url of urls) misses[sha(url, 16)] = at;
+        for (const url of urls) misses[scanMissKey(url)] = at;
         const tmp = `${file}.${process.pid}.tmp`;
         writeFileSync(tmp, JSON.stringify({ v: 1, misses }));
         renameSync(tmp, file);

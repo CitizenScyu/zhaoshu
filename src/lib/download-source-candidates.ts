@@ -236,6 +236,22 @@ export async function zeroYieldHosts(sql: CandidateSql, windowDays = 30, minBook
   return hosts;
 }
 
+/**
+ * neverhit1110：近 windowDays 天在候选表出现过（命中/失败/成功标记任一行；预取命中同表）或有 done 任务的 host。
+ * 不在集合里 = 这段时间选源从没在它那里搜到过书（见 runtime-download/never-hit.ts）。host 与 selector 同键（小写主机名）。
+ */
+export async function recentCandidateHosts(sql: CandidateSql, windowDays = 30): Promise<Set<string>> {
+  if (!Number.isSafeInteger(windowDays) || windowDays <= 0) throw new Error('windowDays is invalid');
+  const rows = await sql`
+    SELECT lower(host) AS host FROM download_source_candidates
+    WHERE host <> '' AND updated_at > now() - (${windowDays}::int * interval '1 day')
+    UNION
+    SELECT lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)'))
+    FROM download_tasks
+    WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day')` as unknown as { host: string | null }[];
+  return new Set(rows.map(row => row.host).filter((host): host is string => Boolean(host)));
+}
+
 /** 下载失败 → 候选失败分类（permanent/temporary）。判据与 AdapterOutcome.failure.code 对齐。 */
 export function classifyFailure(code: string): Exclude<CandidateFailureKind, ''> {
   // identity_mismatch_or_no_candidate：该源详情页/正文身份不符——确定不是这本书，重试无意义。
