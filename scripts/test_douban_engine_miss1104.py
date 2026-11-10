@@ -13,6 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import douban_list as dl
+import labeler
 import labeler_source_policy as sp
 
 
@@ -176,6 +177,86 @@ class EngineMissMemoTest(unittest.TestCase):
                  and isinstance(node.func, ast.Attribute) and node.func.attr == 'save'
                  and isinstance(node.func.value, ast.Name) and node.func.value.id == 'engine_miss']
         self.assertEqual(len(saves), 1)
+
+
+class FetchFailBackoffTest(EngineMissMemoTest):
+    """fetchfail1110：引擎命中但取文源失效放弃的书按 base·2^(n-1) 退避（封顶 7 天），成功清除。"""
+
+    def memo(self, ttl=3600, base=100):
+        return dl.EngineMissMemo.load(self.path, ttl, clock=self.clock, fetch_fail_base_sec=base)
+
+    def test_backoff_doubles_and_caps(self):
+        memo = self.memo(base=dl.FETCH_FAIL_BASE_SEC)
+        self.assertEqual([memo.fetch_backoff_sec(n) for n in (1, 2, 3, 4, 5, 9)],
+                         [12 * 3600, 24 * 3600, 48 * 3600, 96 * 3600, 7 * 86400, 7 * 86400])
+
+    def test_skip_within_backoff_then_research(self):
+        memo = self.memo()
+        self.assertEqual(memo.record_fetch_fail('合成书', '甲作者'), 1)
+        memo.save()
+        cli = Cli(author='甲作者')
+        self.out.truncate(0)
+        self.assertEqual(self.resolve(cli, self.memo()), [])
+        self.assertEqual(cli.calls, [])
+        self.assertIn('1 本近期取文源失效，退避中未重搜', self.out.getvalue())
+        self.assertNotIn('未命中 1 本', self.out.getvalue())
+        self.clock.now += 101
+        self.assertEqual(len(self.resolve(cli, self.memo())), 1)
+        # 第二次失败退避翻倍：100s 内跳过，200s 后才重搜
+        memo = self.memo()
+        self.assertEqual(memo.record_fetch_fail('合成书', '甲作者'), 2)
+        self.clock.now += 150
+        self.assertTrue(memo.fetch_backoff('合成书', '甲作者'))
+        self.clock.now += 60
+        self.assertFalse(memo.fetch_backoff('合成书', '甲作者'))
+
+    def test_clear_on_success_and_persist(self):
+        memo = self.memo()
+        memo.record_fetch_fail('合成书', '甲作者')
+        memo.record('别的书', '')
+        memo.save()
+        memo = self.memo()
+        self.assertTrue(memo.fetch_backoff('《合成书》', '甲作者'))
+        memo.clear_fetch_fail('合成书', '甲作者')
+        self.assertTrue(memo.dirty)
+        memo.save()
+        memo = self.memo()
+        self.assertFalse(memo.fetch_backoff('合成书', '甲作者'))
+        self.assertTrue(memo.recent('别的书', ''))
+
+    def test_disabled_and_independent_switches(self):
+        self.assertEqual(dl.resolve_fetch_fail_base({dl.FETCH_FAIL_BASE_ENV: '0'}), 0)
+        self.assertEqual(dl.resolve_fetch_fail_base({}), dl.FETCH_FAIL_BASE_SEC)
+        self.assertEqual(dl.resolve_fetch_fail_base({dl.FETCH_FAIL_BASE_ENV: 'x'}), dl.FETCH_FAIL_BASE_SEC)
+        off = self.memo(base=0)
+        self.assertEqual(off.record_fetch_fail('合成书', '甲作者'), 0)
+        self.assertFalse(off.fetch_backoff('合成书', '甲作者'))
+        # 引擎 miss 关、取文退避开：照样读写 fetch_fail
+        only = self.memo(ttl=0)
+        only.record_fetch_fail('合成书', '甲作者')
+        only.save()
+        self.assertTrue(self.memo(ttl=0).fetch_backoff('合成书', '甲作者'))
+        # 取文退避关：读回保留旧记录、不判退避
+        self.assertFalse(self.memo(base=0).fetch_backoff('合成书', '甲作者'))
+
+    def test_corrupt_fetch_fail_entries_ignored(self):
+        key = dl.EngineMissMemo.key('合成书', '甲作者')
+        self.path.write_text(json.dumps({'version': 1, 'misses': {}, 'fetch_fail': {
+            key: [self.clock.now - 10, 1], 'a': 'x', 'b': [1, 0], 'c': [1.0, 'n'],
+            'old': [self.clock.now - 30 * 86400, 3]}}), encoding='utf-8')
+        memo = self.memo()
+        self.assertEqual(set(memo.fetch_fail), {key})
+
+    def test_main_notes_fetch_result(self):
+        """labeler 主循环：源失效放弃记退避、打标成功清除（经 _note_fetch_result 即时落盘）。"""
+        memo = self.memo()
+        labeler._note_fetch_result(memo, ('合成书', '甲作者'),
+                                   labeler.EngineSourceGaveUp('a.example', 'no_source', 'x'))
+        self.assertTrue(self.memo().fetch_backoff('合成书', '甲作者'))
+        labeler._note_fetch_result(memo, ('合成书', '甲作者'), None)
+        self.assertFalse(self.memo().fetch_backoff('合成书', '甲作者'))
+        labeler._note_fetch_result(None, ('合成书', '甲作者'), None)
+        labeler._note_fetch_result(memo, None, None)
 
 
 if __name__ == '__main__':

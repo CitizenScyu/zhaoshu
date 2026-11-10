@@ -491,6 +491,58 @@ class TestFetchSegmented(_NoSleep):
             spec['toc_empty'] = True
         self.assertNotIn('a.example.com', tracker.dead)
 
+    def test_consecutive_bodyless_books_mark_plan_host_dead(self):
+        """bodydead1110：目录正常、正文一章都取不到 → 连续 CONTENT_FAIL_GIVEUPS 本判死，之后零请求。"""
+        dead_cb = []
+        tracker = labeler.SourceGiveupTracker(labeler.DEAD_HOST_GIVEUPS, on_dead=dead_cb.append)
+        cli = make_cli({'a.example.com': {'n': 100, 'body': lambda i: None}})
+        for _ in range(labeler.CONTENT_FAIL_GIVEUPS):
+            self.assertNotIn('a.example.com', tracker.dead)
+            with self.assertRaises(labeler.EngineSourceGaveUp):
+                _fetch(cli, _book(), tracker=tracker)
+        self.assertIn('a.example.com', tracker.dead)
+        self.assertEqual(dead_cb, ['a.example.com'])
+        before = len(cli.calls)
+        with self.assertRaises(labeler.EngineSourceGaveUp):
+            _fetch(cli, _book(), tracker=tracker)
+        self.assertEqual(len(cli.calls), before)
+
+    def test_plan_source_feeding_body_resets_streak(self):
+        """计划源中间供出过正文 → 连败清零，不判死。"""
+        tracker = labeler.SourceGiveupTracker(labeler.DEAD_HOST_GIVEUPS)
+        spec = {'n': 100, 'body': lambda i: None}
+        cli = make_cli({'a.example.com': spec})
+        for _ in range(labeler.CONTENT_FAIL_GIVEUPS - 1):
+            with self.assertRaises(labeler.EngineSourceGaveUp):
+                _fetch(cli, _book(), tracker=tracker)
+        self.assertEqual(tracker.empty_bodies, {'a.example.com': labeler.CONTENT_FAIL_GIVEUPS - 1})
+        spec['body'] = _book_body
+        _fetch(cli, _book(), tracker=tracker)
+        self.assertEqual(tracker.empty_bodies, {})
+        spec['body'] = lambda i: None
+        with self.assertRaises(labeler.EngineSourceGaveUp):
+            _fetch(cli, _book(), tracker=tracker)
+        self.assertNotIn('a.example.com', tracker.dead)
+
+    def test_no_body_request_does_not_count(self):
+        """取文时限在目录阶段就耗尽（计划源一章正文都没请求）→ 不计连败。"""
+        tracker = labeler.SourceGiveupTracker(labeler.DEAD_HOST_GIVEUPS)
+        now = [0.0]
+        inner = make_cli({'a.example.com': {'n': 100}})
+
+        class TocEatsBudget:
+            calls = inner.calls
+
+            def run(self, sub, *args, **kw):
+                now[0] += 59.5 if sub == 'toc' else 1
+                return inner.run(sub, *args, **kw)
+
+        with self.assertRaises(labeler.EngineSourceGaveUp):
+            _fetch(TocEatsBudget(), _book(), tracker=tracker, time_budget_s=60,
+                   clock=lambda: now[0])
+        self.assertEqual(_content_calls(inner), [])
+        self.assertEqual(tracker.empty_bodies, {})
+
     def test_time_budget_stops_fetching(self):
         """每个 CLI 请求耗 10s、时限 60s：到时即停，已取到的段照用，其余段标未取到；
         最后一个请求在时限前发出（总耗时 ≤ 时限 + 单请求）。"""

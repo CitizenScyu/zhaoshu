@@ -94,7 +94,8 @@ REQUIRED_DOUBAN_LIST_API = (
     'author_matches', 'body_pair_details', 'build_douban_queue', 'build_webnovel_queue',
     'engine_fallback_enabled', 'fetch_content_fingerprint', 'is_placeholder_author',
     'load_done_index', 'resolve_book15_breaker', 'resolve_douban_pages',
-    'resolve_engine_miss_ttl', 'resolve_list_deepen_min', 'resolve_list_queue_max', 'same_book',
+    'resolve_engine_miss_ttl', 'resolve_fetch_fail_base', 'resolve_list_deepen_min',
+    'resolve_list_queue_max', 'same_book',
     'search_engine', 'title_compatible', 'validate_engine',
 )
 REQUIRED_SOURCE_POLICY_API = (
@@ -1545,6 +1546,11 @@ DETERMINISTIC_ENGINE_ERRORS = frozenset({'policy', 'http_4xx', 'no_source'})
 # （本轮后续不再请求 + 落死源侧车跨轮跳过，选书阶段也不再选它的候选）。只看分段取文的目录阶段。
 EMPTY_TOC_KIND = 'empty'
 EMPTY_TOC_GIVEUPS = 3
+# bodydead1110：目录正常、正文一章都取不到的站，旧判据看不到（只看目录阶段）。2026-11-08～10 local-server
+# gate.log：ziyunbook/303wx/cmread/dingdian888/qiluwx 等连续 50–235 本「分段取文各段均未取到正文」、零成功，
+# 每轮每本仍耗满取文时限；有成功的 host 最长连败只有 4（hongyebookzhai、conglianhao）。同 host 作计划源时
+# 连续 CONTENT_FAIL_GIVEUPS 本一章正文都没供出（中间无一本供出过）→ 按死源处理（同 emptytoc：落侧车跨轮跳过）。
+CONTENT_FAIL_GIVEUPS = 5
 # 主源与全部备选都在本轮已失效 host 上、一个请求都没发时的放弃 kind（不是 CLI 错误类别）。
 DEAD_HOST_SKIP_KIND = 'dead_host_skipped'
 MIN_BOOK_CHARS = 10_000     # 一本书至少要抓到的字数（不足记「抓取字数不足」）
@@ -1703,6 +1709,7 @@ class SourceGiveupTracker:
         self.threshold = threshold
         self.counts: dict[str, int] = {}
         self.empty_tocs: dict[str, int] = {}
+        self.empty_bodies: dict[str, int] = {}
         self.dead: set[str] = set(dead)
         self.on_dead = on_dead
 
@@ -1719,6 +1726,15 @@ class SourceGiveupTracker:
 
     def record_toc_ok(self, host: str) -> None:
         self.empty_tocs.pop(host, None)
+
+    def record_body(self, host: str, fed: bool) -> None:
+        """bodydead1110：host 作计划源本书是否供出过正文；连续 CONTENT_FAIL_GIVEUPS 本没供出 → 判死。"""
+        if fed:
+            self.empty_bodies.pop(host, None)
+            return
+        n = self.empty_bodies[host] = self.empty_bodies.get(host, 0) + 1
+        if n >= CONTENT_FAIL_GIVEUPS:
+            self._mark_dead(host, f'连续 {n} 本正文均未取到')
 
     def _mark_dead(self, host: str, why: str) -> None:
         if host not in self.dead:
@@ -2703,6 +2719,7 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
     fill_caches: dict = {}              # {'cand_toc': {id: 原因}, 'cand_ch': {id: {num: text}}}：跨段复用，候选抓章 ≤上限
     plan_host = options[plan_i].get('source') or _url_host(options[plan_i]['url'])
     plan_alive = True                   # 计划源是否还能出正文；某段正文全 4xx/预览（付费墙）后置否，后续段不再重复探计划源
+    plan_tried = False                  # bodydead1110：计划源是否真被请求过正文
     no_fill = len(plan['names']) < douban_list.CONTENT_TOC_MIN_MATCH
     if no_fill:
         # 计划源纯编号目录：目录信号不可判 → same_book 必判否（rvlblseg R2-6 裁定 3）→ 不换源、标缺段。
@@ -2716,6 +2733,7 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
         #    计划源已判死（付费墙）则不再重复探——但仍会在补段判同里向前探紧邻窗口的可读章。
         plan_win_hits: list[dict] = []
         if plan_alive and deadline - clock() >= SEG_MIN_REQUEST_S:
+            plan_tried = True
             p_res = fetch_segment(engine_cli, plan['chapters'], {**win}, deadline, clock)
             p_ok, p_why = segment_usable(p_res, win['target'], first_segment=win['no'] == 1)
             # 计划源本段窗口内真实可读章（滤掉预览/空章）作窗口内判同参照，并入 plan_ch_cache 供向前探复用。
@@ -2855,6 +2873,10 @@ def fetch_book_text_segmented(engine_cli, book: dict, tracker: SourceGiveupTrack
         seg_diag.append(seg_entry)
     sampling = {'mode': 'segmented', 'fetch_secs': round(clock() - started, 1),
                 'segments': seg_diag}
+    if plan_tried:
+        # bodydead1110：只在计划源真被请求过正文时计（取文时限在目录阶段就耗尽不算）
+        tracker.record_body(plan_host, any(s.get('source') == plan_host and not s.get('missing')
+                                           for s in seg_diag))
     if not raw_total:
         raise EngineSourceGaveUp(primary['source'], 'no_source', '分段取文各段均未取到正文')
     return '\n\n'.join(pieces), raw_total, options[plan_i], sampling
@@ -2886,6 +2908,20 @@ def format_failure_kinds(kinds: dict) -> str:
     """{类别: 次数} → 「失败分类: A 3 / B 1」（按次数降序，同数按类别名）。"""
     items = sorted(((k, v) for k, v in kinds.items() if v), key=lambda kv: (-kv[1], kv[0]))
     return '失败分类: ' + ' / '.join(f'{k} {v}' for k, v in items)
+
+
+def _note_fetch_result(memo, key: tuple[str, str] | None, error: BaseException | None) -> None:
+    """fetchfail1110：引擎条目取文源失效放弃 → 记一次退避；打标成功 → 清除。即时落盘（轮中被杀不丢）。"""
+    if memo is None or key is None:
+        return
+    if error is None:
+        memo.clear_fetch_fail(*key)
+    else:
+        n = memo.record_fetch_fail(*key)
+        if n:
+            print(f'  取文退避: 第 {n} 次源失效放弃，'
+                  f'{memo.fetch_backoff_sec(n) / 3600:g}h 内不再选这本')
+    memo.save()
 
 
 def _clean_engine_author(raw: str) -> str:
@@ -4107,6 +4143,7 @@ def main() -> int:
     # 726：跨轮冷却载体在选书前装载（见选书装配处）；--book 调试模式没有选书阶段，
     # 保持 None，打标阶段按原路径补载。先在此初始化，避免 --book 分支引用未绑定名。
     dead_host_memory = None
+    engine_miss = None          # fetchfail1110：名单线才装载（见选书装配处），打标循环按它记取文退避
     # lblreplay42：被拒冷却（近 cooldown 秒内被拒过的书移到队尾，不跳过）。显式求出再传下去，
     # 与 dead_host_ttl 同理：默认参数在 def 时求值，显式传才是「改配置即生效」。
     reject_cooldown = resolve_reject_cooldown(env)
@@ -4218,7 +4255,8 @@ def main() -> int:
             # engmiss1104：近期干净 miss 的书跨轮不再重搜引擎（LABELER_ENGINE_MISS_TTL_SEC=0 关闭）
             engine_miss = douban_list.EngineMissMemo.load(
                 data_path(douban_list.ENGINE_MISS_FILENAME),
-                douban_list.resolve_engine_miss_ttl(env))
+                douban_list.resolve_engine_miss_ttl(env),
+                fetch_fail_base_sec=douban_list.resolve_fetch_fail_base(env))
             # listdeep1105/plat1105：固定名单打干后队列不足下限 ⇒ 各平台完结书库按游标轮转往后翻
             # （LABELER_LIST_DEEPEN_MIN=0 关闭）；每轮入队上限 LABELER_LIST_QUEUE_MAX（0 不限）
             list_cursor = douban_list.ListCursor.load(data_path(douban_list.LIST_CURSOR_FILENAME))
@@ -4373,6 +4411,8 @@ def main() -> int:
         print(f'[{i}/{len(queue)}] {b.get("title")} ...')
         fetch_stats: dict = {}      # 引擎取文统计（lbladfix41：跳过的公告条目 / 试读章数）
         sampling: dict | None = None    # lblseg41：分段取文诊断；非 None ⇔ 本书走了分布式采样
+        # fetchfail1110：取文退避键 = 选书时的（名单书名, 名单作者），在作者回写改 b 之前取
+        fetch_key = (b.get('list_title') or b.get('title', ''), b.get('author', '')) if b.get('engine') else None
         try:
             # 引擎兜底条目走 CLI 取正文（toc/content，不过 clean_chapter_text）；
             # rank/分类线走 book15 惰性元数据路径；douban/webnovel 候选已带元数据、--book
@@ -4613,6 +4653,7 @@ def main() -> int:
                 f.write(json.dumps(b_out, ensure_ascii=False) + '\n')
             ok += 1
             llm_streak = 0
+            _note_fetch_result(engine_miss, fetch_key, None)
             # 即时导入书库。import_record 内部吞掉所有异常并记 fail log，
             # 这里的 try/except 只是最后一道保险：导入问题绝不能让打标循环中断。
             if importer is not None and importer.enabled:
@@ -4660,6 +4701,8 @@ def main() -> int:
             fail += 1
             failure_kind = classify_failure(e)
             count_failure(failure_kind)
+            if isinstance(e, EngineSourceGaveUp):
+                _note_fetch_result(engine_miss, fetch_key, e)
             if failure_kind == 'LLM链耗尽':
                 llm_streak += 1
                 if detail_exit and llm_streak >= LLM_FAIL_BREAK:

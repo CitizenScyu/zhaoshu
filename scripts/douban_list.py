@@ -1170,6 +1170,29 @@ ENGINE_MISS_TTL_SEC = 6 * 3600
 ENGINE_MISS_TTL_ENV = 'LABELER_ENGINE_MISS_TTL_SEC'
 ENGINE_MISS_FILENAME = 'labels-engine-miss.json'
 ENGINE_MISS_MAX = 20000
+# fetchfail1110：引擎搜得到、打标取文却「源失效放弃」的书。2026-11-08～10 local-server gate.log：
+# 同一批书每轮重搜重取（单本两天 21–23 次），每次耗满约 240s 取文时限、零产出。同一记忆文件另存
+# fetch_fail {键: [最近失败时刻, 连续次数]}：退避 base·2^(n-1)、封顶 7 天；打标成功即清除。
+# LABELER_FETCH_FAIL_BASE_SEC=0 关闭（行为同改前）。
+FETCH_FAIL_BASE_SEC = 12 * 3600
+FETCH_FAIL_BASE_ENV = 'LABELER_FETCH_FAIL_BASE_SEC'
+FETCH_FAIL_MAX_SEC = 7 * 86400
+
+
+def _resolve_int_env(env: dict | None, name: str, default: int) -> int:
+    raw = str((env or {}).get(name) or '').strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f'  提示: {name}=「{raw}」不是整数，已忽略（用默认 {default}）', file=sys.stderr)
+        return default
+
+
+def resolve_fetch_fail_base(env: dict | None = None) -> int:
+    """LABELER_FETCH_FAIL_BASE_SEC → 秒；空/非整数 → 默认；<=0 = 关闭。"""
+    return _resolve_int_env(env, FETCH_FAIL_BASE_ENV, FETCH_FAIL_BASE_SEC)
 
 
 def resolve_engine_miss_ttl(env: dict | None = None) -> int:
@@ -1186,13 +1209,16 @@ def resolve_engine_miss_ttl(env: dict | None = None) -> int:
 
 
 class EngineMissMemo:
-    """引擎干净 miss 的跨轮记忆：{"version":1,"misses":{键: 记录时刻}}。读坏/缺文件 = 空记忆。"""
+    """引擎干净 miss 的跨轮记忆：{"version":1,"misses":{键: 记录时刻},"fetch_fail":{键: [时刻, 次数]}}。
+    读坏/缺文件 = 空记忆。fetch_fail 见 fetchfail1110（与 misses 各自开关）。"""
 
     def __init__(self, path, ttl_sec: int = ENGINE_MISS_TTL_SEC, misses: dict | None = None,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, fetch_fail_base_sec: int = 0):
         self.path = Path(path)
         self.ttl_sec = ttl_sec
         self.misses: dict[str, float] = dict(misses or {})
+        self.fetch_fail_base_sec = fetch_fail_base_sec
+        self.fetch_fail: dict[str, list] = {}
         self._clock = clock
         self.dirty = False
 
@@ -1202,22 +1228,59 @@ class EngineMissMemo:
 
     @classmethod
     def load(cls, path, ttl_sec: int = ENGINE_MISS_TTL_SEC,
-             clock: Callable[[], float] = time.time) -> 'EngineMissMemo':
-        memo = cls(path, ttl_sec, clock=clock)
-        if ttl_sec <= 0:
+             clock: Callable[[], float] = time.time,
+             fetch_fail_base_sec: int = 0) -> 'EngineMissMemo':
+        memo = cls(path, ttl_sec, clock=clock, fetch_fail_base_sec=fetch_fail_base_sec)
+        if ttl_sec <= 0 and fetch_fail_base_sec <= 0:
             return memo
         try:
-            raw = json.loads(Path(path).read_text(encoding='utf-8')).get('misses')
+            data = json.loads(Path(path).read_text(encoding='utf-8'))
+            raw = data.get('misses') or {}
             entries = {str(k): float(v) for k, v in raw.items() if isinstance(v, (int, float))}
+            fails = {str(k): [float(v[0]), int(v[1])] for k, v in (data.get('fetch_fail') or {}).items()
+                     if isinstance(v, list) and len(v) == 2
+                     and isinstance(v[0], (int, float)) and isinstance(v[1], int) and v[1] > 0}
         except FileNotFoundError:
-            entries = {}
+            entries, fails = {}, {}
         except (OSError, ValueError, TypeError, AttributeError) as e:
             print(f'  提示: 引擎未命中记忆读取失败（按空处理）: {e}', file=sys.stderr)
-            entries = {}
+            entries, fails = {}, {}
         now = clock()
-        memo.misses = {k: t for k, t in entries.items() if 0 <= now - t < ttl_sec}
-        memo.dirty = memo.misses != entries
+        if ttl_sec > 0:
+            memo.misses = {k: t for k, t in entries.items() if 0 <= now - t < ttl_sec}
+        else:
+            memo.misses = entries                 # 关闭时原样保留（save 也不写，见 save）
+        if fetch_fail_base_sec > 0:
+            # 退避期过了仍保留次数（下次失败接着翻倍）；只丢超过封顶 2 倍仍无新失败的旧记录
+            memo.fetch_fail = {k: v for k, v in fails.items() if 0 <= now - v[0] < 2 * FETCH_FAIL_MAX_SEC}
+        else:
+            memo.fetch_fail = fails
+        memo.dirty = memo.misses != entries or memo.fetch_fail != fails
         return memo
+
+    def fetch_backoff_sec(self, n: int) -> float:
+        return min(self.fetch_fail_base_sec * 2 ** (max(n, 1) - 1), FETCH_FAIL_MAX_SEC)
+
+    def fetch_backoff(self, title: str, author: str) -> bool:
+        """fetchfail1110：近期取文源失效放弃过、仍在退避期内 → True（本轮不搜不取）。"""
+        if self.fetch_fail_base_sec <= 0:
+            return False
+        rec = self.fetch_fail.get(self.key(title, author))
+        return rec is not None and 0 <= self._clock() - rec[0] < self.fetch_backoff_sec(rec[1])
+
+    def record_fetch_fail(self, title: str, author: str) -> int:
+        """记一次取文源失效放弃，返回连续次数（关闭/空书名时返回 0）。"""
+        if self.fetch_fail_base_sec <= 0 or not _norm_title(title):
+            return 0
+        k = self.key(title, author)
+        n = (self.fetch_fail.get(k) or [0, 0])[1] + 1
+        self.fetch_fail[k] = [self._clock(), n]
+        self.dirty = True
+        return n
+
+    def clear_fetch_fail(self, title: str, author: str) -> None:
+        if self.fetch_fail.pop(self.key(title, author), None) is not None:
+            self.dirty = True
 
     def recent(self, title: str, author: str) -> bool:
         if self.ttl_sec <= 0:
@@ -1232,15 +1295,17 @@ class EngineMissMemo:
 
     def save(self) -> None:
         """原子写（临时文件 + os.replace）；超上限留最新的。失败只告警。"""
-        if self.ttl_sec <= 0 or not self.dirty:
+        if (self.ttl_sec <= 0 and self.fetch_fail_base_sec <= 0) or not self.dirty:
             return
         keep = dict(sorted(self.misses.items(), key=lambda kv: kv[1], reverse=True)[:ENGINE_MISS_MAX])
+        fails = dict(sorted(self.fetch_fail.items(), key=lambda kv: kv[1][0],
+                            reverse=True)[:ENGINE_MISS_MAX])
         tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix='.engine-miss-')
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump({'version': 1, 'misses': keep}, f, ensure_ascii=False)
+                json.dump({'version': 1, 'misses': keep, 'fetch_fail': fails}, f, ensure_ascii=False)
             os.replace(tmp, self.path)
             tmp = None
             self.dirty = False
@@ -2343,7 +2408,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
 
     engine_miss（engmiss1104）：引擎干净 miss 的跨轮记忆；TTL 内同（名单书名, 名单作者）不再
     发引擎搜索、照常计入 miss。只记 search_engine 正常返回 None（不含 EngineUnavailable/输出坏）。
-    None 时行为不变；保存由调用方负责。
+    None 时行为不变；保存由调用方负责。fetchfail1110：同一记忆里取文退避期内的书也不搜（另计数）。
 
     limit>0（plat1105）：入队满 limit 本、或引擎实搜满 LIST_SEARCH_BUDGET_FACTOR×limit 次即停，
     剩余候选不搜（留待下轮）——后者防低命中名单（如晋江）每轮把建队拖成几小时；0 = 不限（旧行为）。
@@ -2354,6 +2419,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     miss: list[str] = []
     skipped = 0
     engine_miss_skipped = 0
+    fetch_fail_skipped = 0
     book15_hits = 0
     engine_hits = 0
     resolved_done = 0                       # resolvedone1104：引擎命中后判已打标/本轮重复
@@ -2434,6 +2500,13 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
             continue
         engine_hit = None
         engine_clean_miss = False
+        if (engine_miss is not None and engine_cli is not None and not engine_disabled
+                and engine_miss.fetch_backoff(b['title'], list_author)):
+            # fetchfail1110：近期引擎命中但取文源失效放弃，退避期内不搜不取（不计 miss）
+            fetch_fail_skipped += 1
+            if not book15_skipped:
+                time.sleep(SEARCH_DELAY)
+            continue
         if (engine_miss is not None and engine_cli is not None and not engine_disabled
                 and engine_miss.recent(b['title'], list_author)):
             # engmiss1104：TTL 内已干净搜不到 ⇒ 本轮不再发引擎搜索（照常计入 miss 汇总）
@@ -2534,6 +2607,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         engine_note += f'（{paywall_only} 本只有付费墙源，未打标）'
     if engine_miss_skipped:
         engine_note += f'（{engine_miss_skipped} 本近期已搜无果，本轮未重搜）'
+    if fetch_fail_skipped:
+        engine_note += f'（{fetch_fail_skipped} 本近期取文源失效，退避中未重搜）'
     if engine_stats.get('http_only'):
         engine_note += f'（跳过非 HTTPS 源候选 {engine_stats["http_only"]} 条）'
     # 未熔断时本行逐字不变；熔断后补一段「熔断跳过 book15 搜索 N 本」。
