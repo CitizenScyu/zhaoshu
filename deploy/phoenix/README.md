@@ -262,6 +262,8 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
 - 动机：11-08～11-10 共 526 份 preview_truncated 清单抓了约 8.57 万章，其中 274 本首章就是长章、
   只有尾段是预览，要逐章抓完全书才判；biquge.site 两天在这类书上耗约 3.4 万次请求，撞 2 万/天上限。
 - 探测章失败不计连败，主循环按目录序重抓；探测成功的章不重复抓。
+- 30a7027（同日 21:26 上线）：探测章撞规则类失败（`empty_content_page` 等，同源重抓必然同错）就跳过、继续往前探，
+  凑满 5 个成功章或探满 10 章为止；瞬时类失败（网络/超时）即放弃先探，交主循环。
 - 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
 
 ## release 目录布局 / 回滚
