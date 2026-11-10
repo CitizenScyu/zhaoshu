@@ -254,6 +254,16 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   「任务失租约，交回收器」{taskId}。
 - 关闭复用：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
 
+## 书尾预览先探（tailprobe1110，2026-11-10）
+
+- drop-in `zhaoshu-download-b@.service.d/91-tailprobe.conf`：`DOWNLOAD_PREVIEW_TAIL_PROBE=1`（tailwall 也须开着）。
+  正文首轮前先抓书尾 5 个非公告章；全是短章（< 500 字）就顺序抓到第一个非公告长章即判 `preview_truncated`。
+  这时收尾的 tailwall 判据必然命中，只是不再抓完整本；书是否发布不变。
+- 动机：11-08～11-10 共 526 份 preview_truncated 清单抓了约 8.57 万章，其中 274 本首章就是长章、
+  只有尾段是预览，要逐章抓完全书才判；biquge.site 两天在这类书上耗约 3.4 万次请求，撞 2 万/天上限。
+- 探测章失败不计连败，主循环按目录序重抓；探测成功的章不重复抓。
+- 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
+
 ## release 目录布局 / 回滚
 
 ```
