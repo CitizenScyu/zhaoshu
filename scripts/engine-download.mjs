@@ -179,6 +179,13 @@ export function previewTailRun(chapters) {
   }
   return false;
 }
+// tailprobe1110：DOWNLOAD_PREVIEW_TAIL_PROBE=1 时（且 tailwall 开）正文首轮前先抓书尾 5 个非公告章；全是短章则顺序抓到
+// 第一个非公告长章即判 preview_truncated——此时收尾 previewTailRun 必判，后面的章只是白抓。缺省/其他值 = 关（零行为变化）。
+// 动机（2026-11-10 phoenix 只读，2 天）：526 份 preview_truncated 清单共抓约 8.57 万章，其中 274 本首章即长章、尾段预览，
+// 逐章抓完全书才判；biquge.site 一个 host 两天在预览书上耗约 3.4 万次请求，撞 2 万/天上限。
+export function tailProbe(env = process.env) {
+  return env.DOWNLOAD_PREVIEW_TAIL_PROBE?.trim() === '1';
+}
 // stub1105：全书 done 正文合计 < 3000 字即判 preview_truncated（源站只给简介/首章预览，如 2026-11-05 phoenix 只读：
 // 9 本 1 章 < 500 字、另有 1 章 2653 字 / 19 章 1103 字的「完整」本被发布 done；书库 chars_labeled 最小 11059，
 // 已发布正常本最小 5436 字）。按 preview_truncated 换源（零发布）。DOWNLOAD_PREVIEW_STUB=1 开（缺省/其他值 = 关，零行为变化）。
@@ -674,10 +681,29 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       }
       await checkpoint(false);
     };
+    // 探测章失败不计连败（主循环会按目录序重抓）；探测成功的章主循环不再抓。
+    const probed = new Set();
+    let tailShort = false;
+    if (previewTail() && tailProbe() && manifest.chapters.length > PREVIEW_TAIL_RUN) {
+      const tail = [];
+      for (let i = manifest.chapters.length - 1; i >= 0 && tail.length < PREVIEW_TAIL_RUN; i--) {
+        if (!TAIL_ASIDE_TITLE.test(manifest.chapters[i].title ?? '')) tail.unshift(manifest.chapters[i]);
+      }
+      for (const chapter of tail) {
+        failStreak = 0;
+        await fetchChapter(chapter);
+        probed.add(chapter.index);
+      }
+      failStreak = 0;
+      tailShort = tail.length === PREVIEW_TAIL_RUN && tail.every(c => c.status === 'done' && c.chars < PREVIEW_MAX_CHARS);
+    }
     const earlyPreview = previewEarly();
     let doneCount = 0, shortCount = 0, anyLong = false;
     for (const chapter of manifest.chapters) {
-      await fetchChapter(chapter);
+      if (!(probed.has(chapter.index) && chapter.status === 'done')) await fetchChapter(chapter);
+      if (tailShort && chapter.status === 'done' && chapter.chars >= PREVIEW_MAX_CHARS && !TAIL_ASIDE_TITLE.test(chapter.title ?? '')) {
+        throw new Error('preview_truncated');
+      }
       if (!earlyPreview || chapter.status !== 'done') continue;
       doneCount += 1;
       if (chapter.chars < PREVIEW_MAX_CHARS) shortCount += 1; else anyLong = true;

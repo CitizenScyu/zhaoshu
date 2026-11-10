@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf, tailProbe } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -868,6 +868,83 @@ describe('previewearly1031 付费墙预览提前收口', () => {
       expect(r.manifest.status).toBe('done');
       expect(reads(f)).toBe(total);
     }
+  }, 60_000);
+});
+
+// tailprobe1110：先探书尾 5 个非公告章，全短则抓到首个长章即收口（DOWNLOAD_PREVIEW_TAIL_PROBE，缺省关）。
+describe('tailprobe1110 书尾预览先探', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  /** total 章书；章名 title(n)、第 n 章（1 起）正文 body(n, 第几次抓) 字。 */
+  const wrap = (f: ReturnType<typeof setup>, total: number, body: (n: number, hit: number) => number, title = (n: number) => `第${n}章`) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      const catalog = `<div class="d-chapter-list" id="full-catalog">${Array.from({ length: total }, (_, i) => `<dd><a href="/read/${i + 1}">${title(i + 1)}</a></dd>`).join('')}</div>`;
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲">` + catalog };
+    }
+    if (url.includes('/read/')) {
+      const hit = f.calls.filter(u => u === url).length;
+      f.calls.push(url);
+      return { url, text: `<li class="chapter-content" id="article-content"><p>${'文'.repeat(body(Number(url.split('/read/')[1]), hit))}</p></li>` };
+    }
+    return f.transport(url, opts);
+  };
+  const reads = (f: ReturnType<typeof setup>) => f.calls.filter(url => url.includes('/read/'));
+  const count = (r: { manifest: { chapters: { status: string }[] } }, status: string) => r.manifest.chapters.filter(c => c.status === status).length;
+  const halfFree = (n: number) => n <= 60 ? 2200 : 200;
+
+  it('DOWNLOAD_PREVIEW_TAIL_PROBE=1 开，缺省/其他值关', () => {
+    expect(tailProbe()).toBe(false);
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL_PROBE', 'on');
+    expect(tailProbe()).toBe(false);
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL_PROBE', ' 1 ');
+    expect(tailProbe()).toBe(true);
+  });
+
+  it('开：免费前段 + 预览尾段 ⇒ 探 5 章尾 + 第 1 章即收口、零 book.txt', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL_PROBE', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, 120, halfFree));
+    expect(r.code).toBe(1);
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(reads(f).map(u => Number(u.split('/read/')[1]))).toEqual([116, 117, 118, 119, 120, 1]);
+    expect(count(r, 'pending')).toBe(114);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+  }, 60_000);
+
+  it('关：同一本照旧抓完全书再判 preview_truncated', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f, 120, halfFree));
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(reads(f)).toHaveLength(120);
+  }, 60_000);
+
+  it('开：正常长章书每章只抓一次、照常 done', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL_PROBE', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, 60, () => 2200));
+    expect(r.manifest.status).toBe('done');
+    expect(reads(f)).toHaveLength(60);
+    expect(new Set(reads(f)).size).toBe(60);
+  }, 60_000);
+
+  it('开：书尾公告章不计入探测；全书皆短照常抓完不误判', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL_PROBE', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, 30, n => n <= 20 ? 2200 : 200, n => n === 30 ? '完本感言' : `第${n}章`));
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(reads(f).map(u => Number(u.split('/read/')[1]))).toEqual([25, 26, 27, 28, 29, 1]);
+    const g = setup();
+    const s = await g.run(wrap(g, 30, () => 200));
+    expect(s.manifest.status).toBe('done');
+    expect(reads(g)).toHaveLength(30);
+  }, 60_000);
+
+  it('开：探测章失败不判短尾，主循环按序重抓后照常 done', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL_PROBE', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, 60, (n, hit) => n === 60 && hit === 0 ? 0 : 2200));
+    expect(r.manifest.status).toBe('done');
+    expect(reads(f)).toHaveLength(61);
+    expect(reads(f).at(-1)).toContain('/read/60');
   }, 60_000);
 });
 
