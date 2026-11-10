@@ -905,7 +905,7 @@ describe('tailprobe1110 书尾预览先探', () => {
     const r = await f.run(wrap(f, 120, halfFree));
     expect(r.code).toBe(1);
     expect(r.manifest.errors).toEqual(['preview_truncated']);
-    expect(reads(f).map(u => Number(u.split('/read/')[1]))).toEqual([116, 117, 118, 119, 120, 1]);
+    expect(reads(f).map(u => Number(u.split('/read/')[1]))).toEqual([120, 119, 118, 117, 116, 1]);
     expect(count(r, 'pending')).toBe(114);
     expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
   }, 60_000);
@@ -931,7 +931,7 @@ describe('tailprobe1110 书尾预览先探', () => {
     const f = setup();
     const r = await f.run(wrap(f, 30, n => n <= 20 ? 2200 : 200, n => n === 30 ? '完本感言' : `第${n}章`));
     expect(r.manifest.errors).toEqual(['preview_truncated']);
-    expect(reads(f).map(u => Number(u.split('/read/')[1]))).toEqual([25, 26, 27, 28, 29, 1]);
+    expect(reads(f).map(u => Number(u.split('/read/')[1]))).toEqual([29, 28, 27, 26, 25, 1]);
     const g = setup();
     const s = await g.run(wrap(g, 30, () => 200));
     expect(s.manifest.status).toBe('done');
@@ -945,6 +945,15 @@ describe('tailprobe1110 书尾预览先探', () => {
     expect(r.manifest.status).toBe('done');
     expect(reads(f)).toHaveLength(61);
     expect(reads(f).at(-1)).toContain('/read/60');
+  }, 60_000);
+
+  it('开：书尾空页章（规则类失败）跳过续往前探，凑满 5 个短章即收口', async () => {
+    vi.stubEnv('DOWNLOAD_PREVIEW_TAIL_PROBE', '1');
+    const f = setup();
+    const r = await f.run(wrap(f, 120, n => n <= 60 ? 2200 : n <= 115 ? 200 : 0));
+    expect(r.manifest.errors).toEqual(['preview_truncated']);
+    expect(reads(f).map(u => Number(u.split('/read/')[1]))).toEqual([120, 119, 118, 117, 116, 115, 114, 113, 112, 111, 1]);
+    expect(r.manifest.chapters[119].error).toBe('empty_content_page');
   }, 60_000);
 });
 

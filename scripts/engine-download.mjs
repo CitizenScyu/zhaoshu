@@ -681,21 +681,24 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       }
       await checkpoint(false);
     };
-    // 探测章失败不计连败（主循环会按目录序重抓）；探测成功的章主循环不再抓。
+    // 探测章失败不计连败（主循环会按目录序重抓）；探测成功的章主循环不再抓。规则类失败（empty_content_page 等，
+    // 同源重抓必然同错、补抓轮也不补）收尾时不在 done 里、不影响 tailwall，跳过续往前探；瞬时类失败即放弃先探。
     const probed = new Set();
     let tailShort = false;
     if (previewTail() && tailProbe() && manifest.chapters.length > PREVIEW_TAIL_RUN) {
-      const tail = [];
-      for (let i = manifest.chapters.length - 1; i >= 0 && tail.length < PREVIEW_TAIL_RUN; i--) {
-        if (!TAIL_ASIDE_TITLE.test(manifest.chapters[i].title ?? '')) tail.unshift(manifest.chapters[i]);
-      }
-      for (const chapter of tail) {
+      let done = 0, allShort = true;
+      for (let i = manifest.chapters.length - 1; i >= 0 && done < PREVIEW_TAIL_RUN && probed.size < PREVIEW_TAIL_RUN * 2; i--) {
+        const chapter = manifest.chapters[i];
+        if (TAIL_ASIDE_TITLE.test(chapter.title ?? '')) continue;
         failStreak = 0;
         await fetchChapter(chapter);
         probed.add(chapter.index);
+        if (chapter.status === 'done') { done += 1; if (chapter.chars >= PREVIEW_MAX_CHARS) allShort = false; }
+        else if (RETRYABLE_CHAPTER_ERRORS.has(chapter.error)) break;
+        if (!allShort) break;
       }
       failStreak = 0;
-      tailShort = tail.length === PREVIEW_TAIL_RUN && tail.every(c => c.status === 'done' && c.chars < PREVIEW_MAX_CHARS);
+      tailShort = done === PREVIEW_TAIL_RUN && allShort;
     }
     const earlyPreview = previewEarly();
     let doneCount = 0, shortCount = 0, anyLong = false;
