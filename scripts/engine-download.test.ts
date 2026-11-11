@@ -2163,11 +2163,12 @@ describe('titleclean1111 章名附言剥离', () => {
   });
 
   it('开关解析：缺省/0 关，1/true/on 开；非字符串章名原样返回', () => {
-    expect(titleClean({})).toBe(false);
-    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: '0' })).toBe(false);
-    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: '1' })).toBe(true);
-    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: ' On ' })).toBe(true);
-    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: 'TRUE' })).toBe(true);
+    const env = (flag?: string) => (flag === undefined ? {} : { DOWNLOAD_TITLE_CLEAN: flag }) as NodeJS.ProcessEnv;
+    expect(titleClean(env())).toBe(false);
+    expect(titleClean(env('0'))).toBe(false);
+    expect(titleClean(env('1'))).toBe(true);
+    expect(titleClean(env(' On '))).toBe(true);
+    expect(titleClean(env('TRUE'))).toBe(true);
     expect(cleanChapterHeading(undefined)).toBeUndefined();
   });
 
