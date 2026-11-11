@@ -388,7 +388,9 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
   it('无台账行 / 无 books 目录：不写、不谎报 0', async () => {
     // repo-b 无台账行 → no-ledger（不 INSERT）
     await pg.exec(`DELETE FROM repository_capacity_ledger WHERE repository_id = 2;`);
-    // repo-a 树里没有 books 段 → no-tree-root（不把「目录没了/仓空」写成 0 容量）
+    // repo-a 台账记着 777 字节、树里却没有 books 段 → no-tree-root（不把「目录没了」写成 0 容量）。
+    // 台账本就是 0 的空仓缺目录另算（emptyrepo1112，见下方心跳用例）。
+    await pg.exec(`UPDATE repository_capacity_ledger SET registered_bytes = 777 WHERE repository_id = 1;`);
     const noRoot = {
       ...trees,
       '/repos/fixture/repo-a/git/trees/main?recursive=1': { truncated: false, tree: [blob('README.md', 42)] },
@@ -397,13 +399,14 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     // no-tree-root 仍如实报出本轮量到的压缩值（只是不写库），便于运维对照；
     // 但不报 bytes——没有可信的逻辑和就不给数，避免被当成 0 抄进别处。
     expect(report.repositories[0]).toMatchObject({
-      status: 'no-tree-root', fileCount: 0, previousBytes: '0',
+      status: 'no-tree-root', fileCount: 0, previousBytes: '777',
       previousGithubSizeBytes: '0', githubSizeBytes: '102400', admissionRenewal: 'not-verified',
     });
     expect(report.repositories[0]).not.toHaveProperty('bytes');
     expect(report.repositories[1]).toMatchObject({ status: 'no-ledger', admissionRenewal: 'not-verified' });
+    expect(report.heartbeat).toBe('skipped-not-verified');
     // 两仓的字节账都保持原值：no-tree-root 不写 0、no-ledger 不 INSERT。
-    expect(await capacity()).toEqual([{ repository_id: 1, registered_bytes: '0', github_size_bytes: '0' }]);
+    expect(await capacity()).toEqual([{ repository_id: 1, registered_bytes: '777', github_size_bytes: '0' }]);
   });
 
   it('输出不含任何秘密字面量（连接串 / token 都不进报告）', async () => {
@@ -510,6 +513,26 @@ maybe('runSync（PGlite 真表 + 合成 GitHub 桩）', () => {
     expect(report.repositories[1]).toMatchObject({ status: 'no-ledger', admissionRenewal: 'not-verified' });
     expect(report.heartbeat).toBe('skipped-not-verified');
     expect(await heartbeatRows()).toHaveLength(0);
+  });
+
+  // emptyrepo1112：滚仓预建的备用仓在首本书落盘前没有 books/，台账也是 0。此前被判 no-tree-root，
+  // 整轮心跳停写（2026-11-11 repo 18 预建后 ledger_sync 停在 15:38 UTC），26h 后误告警。
+  it('台账为 0 的预建空仓缺 books/ ⇒ 按核对成功：续期 + 写心跳，字节仍 0', async () => {
+    await clearHeartbeat();
+    await pg.exec(`UPDATE repository_capacity_ledger SET admission_status='granted', admission_valid_until=NOW()+INTERVAL '5 days' WHERE repository_id = 1;`);
+    const standby = {
+      ...trees,
+      '/repos/fixture/repo-a/git/trees/main?recursive=1': { truncated: false, tree: [blob('README.md', 42)] },
+      '/repos/fixture/repo-a': { size: 0 },
+    };
+    const report = await runSync({ sql, request: stubRequest(standby), mode: 'apply' });
+    expect(report.repositories[0]).toMatchObject({
+      status: 'unchanged', fileCount: 0, previousBytes: '0', bytes: '0', githubSizeBytes: '0',
+      admissionRenewal: 'renewed', note: expect.stringContaining('空仓'),
+    });
+    expect(report.heartbeat).toBe('recorded');
+    expect(await heartbeatRows()).toHaveLength(1);
+    expect((await capacity())[0]).toEqual({ repository_id: 1, registered_bytes: '0', github_size_bytes: '0' });
   });
 
   it('重跑 upsert 同一行：心跳不随轮次或仓数累积', async () => {

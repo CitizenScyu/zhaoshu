@@ -381,7 +381,7 @@ export const LEDGER_SYNC_HEALTH_ROW = 'ledger_sync';
  * 健康端点 /api/health/sources 透传本行，GitHub Actions 探针按 CRON_ALERT_HOURS 判龄开单。
  *
  * 记与不记的判据 = **本轮有没有仓没被核对成功**（admissionRenewal='not-verified'，即
- * failed / no-ledger / no-tree-root 三种）：那三种仓的准入这一轮没续上，30 天后照样到期。
+ * failed / no-ledger / no-tree-root 三种；台账为 0 的空仓缺目录不算，见 emptyrepo1112）：那三种仓的准入这一轮没续上，30 天后照样到期。
  * 按「有仓没续上」告警比按「进程跑完了没」告警更贴近真实风险——脚本 exit 0 但某仓一直
  * 404 的形态，正是悬崖会悄悄回来的形态。
  *
@@ -438,7 +438,10 @@ export async function runSync(options) {
     }
     const before = ledgerRow.registeredBytes;
     const beforeCompressed = ledgerRow.githubSizeBytes;
-    if (measured.missingRoot) {
+    // emptyrepo1112：台账本就记 0 的仓（滚仓预建的备用空仓，首本书落盘前没有 books/）缺目录是常态，
+    // 写回 0 不会低估任何东西，按核对成功走（续期 + 计入心跳）。2026-11-11 repo 18 预建后
+    // ledger_sync 心跳因此停写，26h 后会误告警。台账非 0 却缺目录仍是 no-tree-root 失败关闭。
+    if (measured.missingRoot && before !== BigInt(0)) {
       results.push({ ...base, status: 'no-tree-root', fileCount: 0, previousBytes: before.toString(),
         previousGithubSizeBytes: beforeCompressed.toString(), githubSizeBytes: githubSizeBytes.toString(),
         admissionRenewal: 'not-verified', note: `仓内没有 ${treeRoot}/ 目录；不把缺目录写成 0 容量` });
@@ -457,6 +460,7 @@ export async function runSync(options) {
       previousBytes: before.toString(), bytes: measured.bytes.toString(),
       previousGithubSizeBytes: beforeCompressed.toString(), githubSizeBytes: githubSizeBytes.toString(),
       admissionRenewal,
+      ...(measured.missingRoot ? { note: `仓内尚无 ${treeRoot}/ 目录，台账为 0：按空仓核对成功` } : {}),
     };
     if (before === measured.bytes && beforeCompressed === githubSizeBytes) {
       results.push({ ...base, status: 'unchanged', ...observed });
