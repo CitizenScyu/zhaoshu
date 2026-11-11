@@ -258,11 +258,12 @@ export interface WorkerOptions {
   relocateArtifacts?: boolean;
   /**
    * tocfloor1111：章数下限闸门（engine-download tocBelowFloor）的任务层配套，与引擎读同一个 DOWNLOAD_TOC_FLOOR。
-   * 下限取自任务行 chapters_done，而它是进度通道的最新值：每条腿取到目录后先报 0，闸门拒绝、换源、重领都会把
+   * 下限取自任务行 chapters_done，而它原是进度通道的最新值：每条腿取到目录后先报 0，闸门拒绝、换源、重领都会把
    * 本行抓到过的章数冲掉。开则：
    * - 腿内进度即时抬高 task.chapter_floor（回退层每条腿都从同一个 task 对象展开，后面的腿用得到新下限）；
-   * - 未完成收口（partial/failed/放回 pending）前，把本行写回历次最高的那一份进度快照。
-   * complete 不写回：done 行的章数必须是发布的那一版（gapfill、书库统计都读它）。
+   * - 进度回调写行时写「领取时的行」与本次各腿进度中章数最高的一份，行在领取期间任何时刻都不低于历次最高
+   *   （崩溃、失租约、限速反馈收口都不丢）；代价是新腿追平前，行上显示的是此前最高的那份进度。
+   * - 完成登记成功后、写 done 前，把行改写成本次发布的章数（gapfill、书库统计都读 done 行）。
    * 缺省关 = 与引入前逐字一致。
    */
   tocFloor?: boolean;
@@ -446,19 +447,12 @@ export async function runDownloadTask(
   };
   let sawProgress = 0;
   let leaseLostObserved = false;
-  // tocfloor1111（options.tocFloor）：best = 本行历次最高进度快照（初值取领取时的行），last = 本次领取最后写入的一份。
+  // tocfloor1111（options.tocFloor）：本行进度只升不降。每次进度回调写的是「领取时的行」与本次各腿进度里
+  // 章数最高的一份，被拒那次的目录（腿开头先报 0）、崩溃、失租约都不会把下限依据写低；完成登记后另写本次实得章数。
   type ProgressSnapshot = { chaptersDone: number; chaptersTotal: number; charsTotal: number };
   let bestProgress: ProgressSnapshot | null = options.tocFloor && (task.chapters_done ?? 0) > 0
     ? { chaptersDone: task.chapters_done!, chaptersTotal: Math.max(task.chapters_total ?? 0, task.chapters_done!), charsTotal: task.chars_total ?? 0 }
     : null;
-  let lastProgress: ProgressSnapshot | null = null;
-  // 写回失败不影响收口：随后的 finish/defer 自己判租约。
-  const keepBestProgress = async () => {
-    if (!bestProgress || !lastProgress || leaseLostObserved || bestProgress.chaptersDone <= lastProgress.chaptersDone) return;
-    const best = bestProgress;
-    lastProgress = best;
-    await storage.progress(lease, best).catch(() => false);
-  };
   let feedbackError: unknown;
   let feedbackSettlementStarted = false;
   let feedbackSettlement: Promise<WorkerResult> | undefined;
@@ -508,12 +502,13 @@ export async function runDownloadTask(
       async progress(update) {
         // adapter 进度即心跳数据通道：写失败（失租约）立即中断抓取。
         sawProgress = update.chaptersDone;
+        let row = update;
         if (options.tocFloor) {
-          lastProgress = update;
-          if (!bestProgress || update.chaptersDone > bestProgress.chaptersDone) bestProgress = update;
+          if (!bestProgress || update.chaptersDone >= bestProgress.chaptersDone) bestProgress = update;
+          row = bestProgress;
           if (typeof task.chapter_floor === 'number' && update.chaptersDone > task.chapter_floor) task.chapter_floor = update.chaptersDone;
         }
-        const alive = await storage.progress(lease, update);
+        const alive = await storage.progress(lease, row);
         if (!alive) {
           leaseLostObserved = true;
           throw new TaskLeaseLostError();
@@ -522,7 +517,6 @@ export async function runDownloadTask(
     });
     if (feedbackError !== undefined) return await settleFeedback();
     inLeg = false;
-    if (outcome.kind !== 'complete') await keepBestProgress();
     if (shutdown?.aborted && !signal.aborted && outcome.kind !== 'complete') return await releaseOnShutdown();
 
     if (outcome.kind === 'incomplete') {
@@ -707,6 +701,10 @@ export async function runDownloadTask(
     if (registered === 'lost') throw new TaskLeaseLostError();
     if (registered === 'mismatch') throw new Error('ARTIFACT_REGISTRATION_MISMATCH');
     if (registered !== 'registered' && registered !== 'already') throw new Error('ARTIFACT_REGISTRATION_INVALID_RESULT');
+    // tocfloor1111：行里此时是历次最高进度，done 行改记本次发布的章数（gapfill 按它判缺章）；写库出错不拦 done。
+    if (options.tocFloor && !(await storage.progress(lease, {
+      chaptersDone: outcome.chaptersDone, chaptersTotal: outcome.chaptersTotal, charsTotal: outcome.charsTotal,
+    }).catch(() => true))) throw new TaskLeaseLostError();
     const written = await storage.finish(lease, { status: 'done', error: '' });
     if (!written) throw new TaskLeaseLostError();
     return { processed: true, terminal: 'done' };
@@ -714,17 +712,13 @@ export async function runDownloadTask(
     // 最终拒绝可能是含清理错误的 G，优先于先前回调记录的 F；收口开始后不再改引用。
     if (!feedbackSettlementStarted && isFeedbackFailure(error)) feedbackError = error;
     if (feedbackError !== undefined) return await settleFeedback(error);
-    if (inLeg && shutdown?.aborted && !signal.aborted && !isLeaseLostError(error)) {
-      await keepBestProgress(); // 放回 pending 的行下次领取时用它作历次最高进度的初值
-      return await releaseOnShutdown();
-    }
+    if (inLeg && shutdown?.aborted && !signal.aborted && !isLeaseLostError(error)) return await releaseOnShutdown();
     await heartbeat.stop();
     if (isLeaseLostError(error) || signal.reason instanceof TaskLeaseLostError || signal.reason instanceof LeaseLostError) {
       // 失租约：不写终态（行已不属于本租约），让接管者/回收器决定后续。
       return { processed: false, reason: 'lease_lost' };
     }
     // 其余异常：failed（租约条件写；失败不影响单写者——本租约仍持有）。
-    if (inLeg) await keepBestProgress();
     await storage.finish(lease, {
       status: 'failed',
       error: cleanPgText((error instanceof Error ? error.message : String(error)).slice(0, 4000)),

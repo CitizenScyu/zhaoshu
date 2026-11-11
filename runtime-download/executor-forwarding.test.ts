@@ -53,7 +53,7 @@ describe('relocate1105 执行器透传', () => {
   });
 });
 
-// tocfloor1111：tocFloor 透传给 worker（开 = 非完成收口前多一次写回历次最高进度）。
+// tocfloor1111：tocFloor 透传给 worker（开 = 进度回调写的是本次领取里章数最高的一份）。
 describe('tocfloor1111 执行器透传', () => {
   const rejected = (): SourceAdapter => ({
     kind: 'engine',
@@ -64,10 +64,10 @@ describe('tocfloor1111 执行器透传', () => {
     },
   });
 
-  it('tocFloor 开：failed 收口前把最高那份进度写回', async () => {
+  it('tocFloor 开：腿报 0 时写的仍是最高那份进度', async () => {
     const { run, progress } = harness({ tocFloor: true }, rejected());
     expect(await run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
-    expect(progress.mock.calls.map(call => call[1].chaptersDone)).toEqual([120, 0, 120]);
+    expect(progress.mock.calls.map(call => call[1].chaptersDone)).toEqual([120, 120]);
   });
 
   it('缺省关：只有腿自己报的两次', async () => {

@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({
   resolveSource: vi.fn(), transport: vi.fn(), adapter: vi.fn(), executor: vi.fn(),
 }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
-vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn() }));
+vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn(), tocFloor: () => false }));
 vi.mock('../src/lib/download-worker', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/lib/download-worker')>()), createEngineAdapter: mocks.adapter,
 }));

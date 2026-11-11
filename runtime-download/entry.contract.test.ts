@@ -4,10 +4,10 @@ import type { GitHubContents } from '../src/lib/download-publisher';
 
 const mocks = vi.hoisted(() => ({
   neon: vi.fn(), sql: vi.fn(), storage: vi.fn(), github: vi.fn(), modules: vi.fn(),
-  resolveSource: vi.fn(), transport: vi.fn(), adapter: vi.fn(), executor: vi.fn(),
+  resolveSource: vi.fn(), transport: vi.fn(), adapter: vi.fn(), executor: vi.fn(), tocFloor: vi.fn(),
 }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
-vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn() }));
+vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn(), tocFloor: mocks.tocFloor }));
 vi.mock('../src/lib/download-worker', () => ({ createEngineAdapter: mocks.adapter, WORKER_TASK_TIMEOUT_MS: 123_000 }));
 vi.mock('./storage', () => ({ createWorkerStorage: mocks.storage }));
 vi.mock('./github-contents', () => ({ createGitHubContents: mocks.github }));
@@ -153,4 +153,14 @@ describe('createDownloadExecutor显式存储目标合同', () => {
         .rejects.toEqual(new Error('INVALID_STORAGE_REPOSITORY_ID'));
       noAssembly();
     });
+
+  // tocfloor1111：任务层配套按 options.env 的 DOWNLOAD_TOC_FLOOR 判（与引擎共用 tocFloor），开才透传给执行器。
+  it.each([true, false])('tocFloor(options.env) 为 %s ⇒ 执行器的 tocFloor 透传与否', async (on) => {
+    mocks.tocFloor.mockReturnValue(on);
+    const floorEnv = { NODE_ENV: 'test' as const, DOWNLOAD_TOC_FLOOR: on ? '1' : '0' };
+    await createDownloadExecutor(options({ github, repositoryId: 17, storage, env: floorEnv }));
+    expect(mocks.tocFloor).toHaveBeenCalledWith(floorEnv);
+    const deps = mocks.executor.mock.calls[0][0] as Record<string, unknown>;
+    expect(deps.tocFloor).toBe(on ? true : undefined);
+  });
 });

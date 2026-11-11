@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
   identityPrecheck: vi.fn(), createHostOccupancy: vi.fn(), createBuiltinFallback: vi.fn(),
 }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
-vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn() }));
+vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn(), tocFloor: () => false }));
 vi.mock('../src/lib/download-worker', () => ({ createEngineAdapter: mocks.adapter, WORKER_TASK_TIMEOUT_MS: 123_000 }));
 vi.mock('./storage', () => ({ createWorkerStorage: mocks.storage }));
 vi.mock('./github-contents', () => ({ createGitHubContents: mocks.github }));

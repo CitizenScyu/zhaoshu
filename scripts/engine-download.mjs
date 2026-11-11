@@ -272,7 +272,8 @@ export function tocShapeError(titles) {
   const nums = titles.map(chapterNumberOf).filter(n => n !== null);
   if (nums.length < 3 || nums.length < titles.length * 0.6) return null;
   const small = nums.length < 10;
-  if (!small && 1 - new Set(nums).size / nums.length >= 0.05) return null;
+  // 重复编号 ≥ 5%（分卷各自从 1 编、正文前后重复挂章）只豁免乱序判定；尾段判定不受影响（分卷重编的最小编号必然 ≤ 20）。
+  const dupHeavy = !small && 1 - new Set(nums).size / nums.length >= 0.05;
   let descents = 0, min = Infinity, max = -Infinity;
   const tails = []; // 最长非降子序列（耐心排序，取第一个 > x 的位置）
   nums.forEach((x, i) => {
@@ -283,19 +284,19 @@ export function tocShapeError(titles) {
     while (lo < hi) { const mid = (lo + hi) >> 1; if (tails[mid] <= x) lo = mid + 1; else hi = mid; }
     tails[lo] = x;
   });
-  if (!small && (descents / (nums.length - 1) > 0.3 || tails.length / nums.length < 0.8)) return 'toc_disordered';
+  if (!small && !dupHeavy && (descents / (nums.length - 1) > 0.3 || tails.length / nums.length < 0.8)) return 'toc_disordered';
   if (min > 20 && titles.length < max * 0.5 && (!small || min > titles.length * 10)) return 'toc_incomplete';
   return null;
 }
 
 // tocfloor1111：章数下限闸门。任务层把下限作 args['chapter-floor'] 传入；目录章数 < 下限 × 0.7 ⇒ toc_below_floor
 // （与形态闸门的 toc_incomplete 分开记，便于统计误判），按源级失败换源（零正文请求）。下限 < 30 或不是整数不判。
-// 下限 = 这本书各任务行 chapters_done 的最大值（runtime-download/storage.ts taskRow）。任务行的 chapters_done 是
-// 进度通道的最新值，本闸门拒绝时也会被写成 0；所以开关开着时任务层（download-worker runDownloadTask）把它保持为
-// 本行历次抓到的最高值，并在同一次领取的各回退腿之间即时抬高下限。
+// 下限 = 这本书各任务行 chapters_done 的最大值（runtime-download/storage.ts taskRow）。任务行的 chapters_done 原是
+// 进度通道的最新值，本闸门拒绝时也会被写成 0；所以开关开着时任务层（download-worker runDownloadTask）写行时只升不降，
+// 并在同一次领取的各回退腿之间即时抬高下限。
 // 局限：下限只认「抓到过多少章」，不验内容；某个源的目录虚高（重复卷、乱章）且抓过大半时，正常源会被它拒掉。
 // 此时任务以 toc_below_floor 或 no_candidates 收口，不自动删书（nosrc-tool.sh gc 的 held_gated）；
-// 用 source_revision 以 nofloor- 开头的重排任务可对这本书关掉下限。
+// 重排任务时 source_revision 以 nofloor- 开头，该任务不带下限（只对那一条任务，之后的补抓、追更任务照常带）。
 // 动机（2026-11-11 phoenix 只读）：164 本 done 的章数不到同书另一任务已抓章数的七成；抽查已发布清单 163 本，
 // 121 本自身编号连续到末章而官方目录超其 1.3 倍——源站目录只到中途，被当整本发布。
 // DOWNLOAD_TOC_FLOOR 缺省关；1/true/on 开（引擎与 runtime-download/entry.ts 读同一个判定）。

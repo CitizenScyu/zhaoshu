@@ -413,7 +413,7 @@ describe('41-T8FB builtin-fallback', () => {
     expect(floors).toEqual([['a.example', 1200]]);
   });
 
-  it('tocshape1107：引擎腿 toc_disordered ⇒ 标 temporary 失败记忆并换下一候选源', async () => {
+  it.each(['toc_disordered', 'toc_below_floor'])('tocshape1107 / tocfloor1111：引擎腿 %s ⇒ 标 temporary 失败记忆并换下一候选源', async code => {
     const state = {
       usable: [
         { source_url: 'https://engine-a.example/b1', host: 'engine-a.example' },
@@ -427,12 +427,45 @@ describe('41-T8FB builtin-fallback', () => {
       .toEqual({ ok: true, reason: 'engine_source_candidates' });
     const calls: string[] = [];
     const out = await h.fallback.wrapAdapter(adapter({}, calls), adapter({
-      'engine-a.example': { kind: 'failure', code: 'toc_disordered' },
+      'engine-a.example': { kind: 'failure', code },
       'engine-b.example': { kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1 },
     }, calls), 'engine').download(engineTask, context());
     expect(out.kind).toBe('complete');
     expect(calls).toEqual(['engine-a.example', 'engine-b.example']);
-    expect(state.failures).toContainEqual([1, 'https://engine-a.example/b1', 'temporary', 'toc_disordered']);
+    // nosrc-tool.sh gcrun 以候选行的 failure_reason = toc_below_floor 作 held_gated 证据。
+    expect(state.failures).toContainEqual([1, 'https://engine-a.example/b1', 'temporary', code]);
+  });
+
+  // tocfloor1111：worker 的进度回调把已抓章数抬进任务行的 chapter_floor（同一对象），回退腿每换一个源都
+  // 现取 task 展开，后一个源拿到的是刷新后的下限，不是领取时的旧值。
+  it('tocfloor1111：前一个源抓到的章数抬高了下限 ⇒ 后一个源拿到刷新后的 chapter_floor', async () => {
+    const state = {
+      usable: [
+        { source_url: 'https://engine-a.example/b1', host: 'engine-a.example' },
+        { source_url: 'https://engine-b.example/b1', host: 'engine-b.example' },
+      ],
+      stored: [] as [number, string[]][], failures: [] as [number, string, string, string][],
+    };
+    const h = candidatesHarness(state);
+    const engineTask = task({ source_kind: 'engine', source_url: 'https://origin.example/rules', chapter_floor: 100 });
+    expect(await h.fallback.wrapPrecheck(async () => UNAVAILABLE)(engineTask, signal()))
+      .toEqual({ ok: true, reason: 'engine_source_candidates' });
+    const floors: unknown[] = [];
+    const engine: SourceAdapter = {
+      kind: 'engine',
+      async download(t, ctx) {
+        floors.push([hostOf(t.source_url), t.chapter_floor]);
+        if (hostOf(t.source_url) === 'engine-b.example') return { kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1 };
+        await ctx.progress({ chaptersDone: 300, chaptersTotal: 400, charsTotal: 9000 });
+        return { kind: 'failure', code: 'preview_truncated' };
+      },
+    };
+    const progress = async (update: { chaptersDone: number }) => {
+      if (typeof engineTask.chapter_floor === 'number' && update.chaptersDone > engineTask.chapter_floor) engineTask.chapter_floor = update.chaptersDone;
+    };
+    const out = await h.fallback.wrapAdapter(adapter({}, []), engine, 'engine').download(engineTask, { signal: signal(), progress });
+    expect(out.kind).toBe('complete');
+    expect(floors).toEqual([['engine-a.example', 100], ['engine-b.example', 300]]);
   });
 
   // paywall1026：原源 host 在 PAYWALL_HOSTS ⇒ 预检与下载腿都不碰原源，零出网直接走引擎回退。

@@ -1,6 +1,6 @@
 #!/bin/bash
 # nosrc-tool.sh: back up and delete books that cannot be downloaded (see deploy/phoenix/README.md).
-# usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [mode] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run] | gapfill [--dry-run]
+# usage: select p1|cohort|p2|gc|gclast|gated <out> | backup <ids> <dir> [mode] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run] | gapfill [--dry-run]
 # ZS_DB / ZS_BASE override the database and backup root (scratch-copy tests only).
 set -euo pipefail
 umask 077
@@ -56,7 +56,10 @@ SQL
 # (or that never got a task). delkind = the failure means no usable source; final = this was already the second
 # attempt (a lastcall revision, or >= 2 failed tasks with the latest started in the last 14 days).
 # gated = a source was turned down by the chapter-floor gate (toc_below_floor, tocfloor1111): sources exist, the
-# gate judged them truncated, so the book is never deleted automatically (reported as held_gated).
+# gate judged them truncated, so the book is never deleted automatically (reported as held_gated). The evidence is
+# the candidate row's latest failure reason or a task error; a later different failure on the same source replaces
+# it (that source no longer counts). A high chapters_done alone is no evidence: preview sites (biquge.site/.xin)
+# list the full TOC and are later judged preview_truncated. `select gated` lists them for a nofloor- requeue.
 gc_sql() {
 cat <<'SQL'
 CREATE TEMP TABLE gc AS
@@ -115,6 +118,7 @@ cmd_select() {
         cohort=$(ids_literal "$COHORT") ;;
     gc) gen=gc_sql; where="$GC_DELETE_WHERE" ;;
     gclast) gen=gc_sql; where="$GC_LAST_WHERE"; tail=" LIMIT $GC_MAX_ENQUEUE" ;;
+    gated) gen=gc_sql; where="gated" ;;
     *) die "unknown select mode $mode" ;;
   esac
   { $gen; printf 'COPY (SELECT id FROM %s WHERE %s ORDER BY id%s) TO STDOUT;\n' "${gen%_sql}" "$where" "$tail"; } \
@@ -433,5 +437,5 @@ case ${1:-} in
   p2run) cmd_p2run ;;
   gcrun) cmd_gcrun "${2:-}" ;;
   gapfill) cmd_gapfill "${2:-}" ;;
-  *) die "usage: select p1|cohort|p2|gc|gclast <out> | backup <ids> <dir> [nosrc|gc] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run] | gapfill [--dry-run]" ;;
+  *) die "usage: select p1|cohort|p2|gc|gclast|gated <out> | backup <ids> <dir> [nosrc|gc] | delete <dir> | enqueue <ids> <rev> | status | p2run | gcrun [--dry-run] | gapfill [--dry-run]" ;;
 esac

@@ -777,40 +777,46 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       ({ kind: 'builtin', download: leg });
     const progressState = async (id: number) =>
       (await pg.query('SELECT status, error, chapters_done, chapters_total, chars_total FROM download_tasks WHERE id = $1', [id])).rows[0];
-    // 一条腿抓到 120 章后，下一条腿取到 40 章的目录先报 0，再被闸门拒。
-    const rejectedAfterProgress = (floors: unknown[], outcome: AdapterOutcome) => legAdapter(async (task, context) => {
+    // 一条腿抓到 120 章后，下一条腿取到 40 章的目录先报 0，再被闸门拒。rows 记下每次进度回调返回后行上的章数。
+    const rejectedAfterProgress = (floors: unknown[], outcome: AdapterOutcome, rows: unknown[] = []) => legAdapter(async (task, context) => {
       floors.push(task.chapter_floor);
       await context.progress({ chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 });
       floors.push(task.chapter_floor);
+      rows.push((await progressState(task.id)).chapters_done);
       await context.progress({ chaptersDone: 0, chaptersTotal: 40, charsTotal: 0 });
       floors.push(task.chapter_floor);
+      rows.push((await progressState(task.id)).chapters_done);
       return outcome;
     });
 
-    it('开：failed 收口前写回历次最高进度；腿内已抓章数即时抬高 task.chapter_floor', async () => {
+    it('开：行上进度只升不降（腿报 0 后行即刻仍是 120，此刻崩溃也不丢）；腿内已抓章数即时抬高 task.chapter_floor', async () => {
       const id = await insertTask();
       const floors: unknown[] = [];
+      const rows: unknown[] = [];
       const result = await runDownloadTask(
-        options([rejectedAfterProgress(floors, { kind: 'failure', code: 'toc_below_floor' })], { storage: floorStorage(), tocFloor: true }),
+        options([rejectedAfterProgress(floors, { kind: 'failure', code: 'toc_below_floor' }, rows)], { storage: floorStorage(), tocFloor: true }),
         (await claimDownloadTask(sql as never, 'worker-a'))!,
       );
       expect(result.terminal).toBe('failed');
       expect(floors).toEqual([0, 120, 120]);
+      expect(rows).toEqual([120, 120]);
       expect(await progressState(id)).toMatchObject({ status: 'failed', error: 'toc_below_floor', chapters_done: 120, chapters_total: 200, chars_total: 9000 });
     });
 
     it('关（缺省）：行留最后一次进度、下限不动，与引入前一致', async () => {
       const id = await insertTask();
       const floors: unknown[] = [];
+      const rows: unknown[] = [];
       await runDownloadTask(
-        options([rejectedAfterProgress(floors, { kind: 'failure', code: 'toc_below_floor' })], { storage: floorStorage() }),
+        options([rejectedAfterProgress(floors, { kind: 'failure', code: 'toc_below_floor' }, rows)], { storage: floorStorage() }),
         (await claimDownloadTask(sql as never, 'worker-a'))!,
       );
       expect(floors).toEqual([0, 0, 0]);
+      expect(rows).toEqual([120, 0]);
       expect(await progressState(id)).toMatchObject({ status: 'failed', chapters_done: 0, chapters_total: 40, chars_total: 0 });
     });
 
-    it('开：partial 与放回 pending（书源不可达退避）同样写回', async () => {
+    it('开：partial、放回 pending（书源不可达退避）、限速反馈收口都留最高进度', async () => {
       const partial = await insertTask();
       await runDownloadTask(
         options([rejectedAfterProgress([], { kind: 'incomplete', reason: 'missing_chapters', chaptersTotal: 40, chaptersDone: 0, charsTotal: 0 })], { storage: floorStorage(), tocFloor: true }),
@@ -824,6 +830,18 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       );
       expect(result).toMatchObject({ processed: true, reason: 'source_unavailable' });
       expect(await progressState(deferred)).toMatchObject({ status: 'pending', chapters_done: 120, chapters_total: 200 });
+      await pg.query(`UPDATE download_tasks SET status = 'failed' WHERE id = $1`, [deferred]); // 同书只许一条活跃系统任务
+      const limited = await insertTask();
+      const feedback = await runDownloadTask(
+        options([legAdapter(async (task, context) => {
+          await rejectedAfterProgress([], { kind: 'failure', code: 'download_failed' }).download(task, context);
+          context.onFeedbackFailure?.({ code: 'LIMITER_FEEDBACK_UNAVAILABLE', origin: 'limiter-feedback' });
+          return { kind: 'failure', code: 'download_failed' };
+        })], { storage: floorStorage(), tocFloor: true }),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(feedback).toMatchObject({ reason: 'limiter_feedback_unavailable' });
+      expect(await progressState(limited)).toMatchObject({ status: 'failed', error: 'limiter_feedback_unavailable', chapters_done: 120 });
     });
 
     it('开：领取时行上已有的进度是历次最高的初值（上次领取抓到 120，这次的腿只报 0 就被拒）', async () => {
@@ -841,7 +859,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       expect(await progressState(id)).toMatchObject({ status: 'failed', chapters_done: 120, chapters_total: 200, chars_total: 9000 });
     });
 
-    it('开：腿没报过进度就失败 ⇒ 不写回（行原样）；腿抛异常 ⇒ failed 前写回', async () => {
+    it('开：腿没报过进度就失败 ⇒ 不写行（行原样）；腿抛异常 ⇒ failed 行留最高进度', async () => {
       const silent = await insertTask('pending', { chapters_done: 120, chapters_total: 200, chars_total: 9000 });
       let writes = 0;
       const counting = floorStorage({ progress: async (lease, update) => { writes += 1; return updateDownloadTaskProgress(sql as never, lease, update); } });
@@ -864,22 +882,37 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       expect(await progressState(thrown)).toMatchObject({ status: 'failed', chapters_done: 120, chapters_total: 200 });
     });
 
-    it('开：complete 不写回——done 行的章数是发布的那一版', async () => {
+    it('开：complete 登记后把行改写成本次发布的章数（领取期间行上一直是 120）', async () => {
       const id = await insertTask();
       const txt = completeText('测试书', 3);
+      const rows: unknown[] = [];
       const result = await runDownloadTask(
-        options([legAdapter(async (_task, context) => {
+        options([legAdapter(async (task, context) => {
           await context.progress({ chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 });
           await context.progress({ chaptersDone: 3, chaptersTotal: 3, charsTotal: 3 * 810 });
+          rows.push((await progressState(task.id)).chapters_done);
           return { kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 };
         })], { storage: floorStorage(), tocFloor: true }),
         (await claimDownloadTask(sql as never, 'worker-a'))!,
       );
       expect(result.terminal).toBe('done');
-      expect(await progressState(id)).toMatchObject({ status: 'done', chapters_done: 3, chapters_total: 3 });
+      expect(rows).toEqual([120]);
+      expect(await progressState(id)).toMatchObject({ status: 'done', chapters_done: 3, chapters_total: 3, chars_total: 3 * 810 });
     });
 
-    it('开：停机中止放回 pending 前写回（重领时作初值）', async () => {
+    it('开：整本复用（腿不报进度直接 complete）⇒ done 行是本次发布的章数，不是上次领取留下的', async () => {
+      const id = await insertTask('pending', { chapters_done: 120, chapters_total: 200, chars_total: 9000 });
+      const txt = completeText('测试书', 3);
+      const result = await runDownloadTask(
+        options([legAdapter(async () => ({ kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 }))],
+          { storage: floorStorage(), tocFloor: true }),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(result.terminal).toBe('done');
+      expect(await progressState(id)).toMatchObject({ status: 'done', chapters_done: 3, chapters_total: 3, chars_total: 3 * 810 });
+    });
+
+    it('开：停机中止放回 pending 的行留最高进度（重领时作初值）', async () => {
       const id = await insertTask();
       const stop = new AbortController();
       const real = createWorkerStorage(sql as never);
@@ -896,7 +929,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       expect(await progressState(id)).toMatchObject({ status: 'pending', chapters_done: 120, chapters_total: 200 });
     });
 
-    it('nofloor- 任务（chapter_floor 为 null）：照常写回最高进度，但不生成下限', async () => {
+    it('nofloor- 任务（chapter_floor 为 null）：行上照样留最高进度，但不生成下限', async () => {
       const id = await insertTask('pending', { source_revision: 'nofloor-20261111' });
       const floors: unknown[] = [];
       await runDownloadTask(

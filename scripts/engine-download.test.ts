@@ -828,8 +828,9 @@ describe('tocshape1107 目录形态闸门', () => {
     expect(tocShapeError(titles(range(21, 29)))).toBeNull(); // 9 条、最小编号 21 ≤ 90
     expect(tocShapeError(titles(range(51, 55)))).toBe('toc_incomplete'); // 边界：最小编号 51 > 5 × 10
     expect(tocShapeError(titles(range(50, 54)))).toBeNull(); // 最小编号 50 不大于 5 × 10
-    // ≥ 10 个编号章的判据逐字不变：重复编号 ≥ 5% 仍豁免。
-    expect(tocShapeError(titles([...range(500, 509), 509, 509]))).toBeNull();
+    // ≥ 10 个编号章：重复编号 ≥ 5% 只豁免乱序判定，只剩尾段照样判（原先整段豁免，尾段 + 重复挂章能漏过）。
+    expect(tocShapeError(titles([...range(500, 509), 509, 509]))).toBe('toc_incomplete');
+    expect(tocShapeError(titles([...range(51, 100), ...range(1, 50), ...range(1, 10)]))).toBeNull();
   });
   it('smalltoc1111 整本：最新 5 章目录 ⇒ toc_incomplete、零正文请求', async () => {
     const f = setup(); const reads: string[] = [];
