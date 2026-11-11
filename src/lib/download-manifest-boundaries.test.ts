@@ -248,8 +248,8 @@ describe('gappub1109 少量缺章端到端', () => {
 
 // titleclean1111：开 DOWNLOAD_TITLE_CLEAN 后整本与清单章名都是剥后的，引擎边界照样对得上（不退回二次解析）。
 describe('titleclean1111 章名附言剥离端到端', () => {
-  const RAW = ['第1章 起（求月票）', '第2章 承', '第3章 转（三更）APP免费', '第4章 （求月票）'];
-  const CLEAN = ['第1章 起', '第2章 承', '第3章 转', '第4章 （求月票）'];
+  const RAW = ['第1章 起（求月票）', '第2章 承', '第3章 转（第三更）APP免费', '第4章 （求月票）', '完本感言（求月票）'];
+  const CLEAN = ['第1章 起', '第2章 承', '第3章 转', '第4章 （求月票）', '完本感言'];
   const adCatalog = RAW.map((title, i) => `<dd><a href="/chapter/index1-${i + 1}.html">${title}</a></dd>`).join('');
   const body = (n: string) => `第${n}章合成正文。`;
   async function adTransport(url: string, options: { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> }) {

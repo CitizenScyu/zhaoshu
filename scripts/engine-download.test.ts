@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterNumberOf, cleanChapterHeading, checkPagePath, rejectLanding, tocBelowFloor, tocFloor, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf, tailProbe, titleClean } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterNumberOf, cleanChapterHeading, cleanChapterHeadings, checkPagePath, rejectLanding, tocBelowFloor, tocFloor, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf, tailProbe, titleClean } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -2094,15 +2094,33 @@ describe('titleclean1111 章名附言剥离', () => {
     ['第8章 风起（求鲜花收藏~）', '第8章 风起'],
     ['第3章 夜（求追读）', '第3章 夜'],
     ['第4章 晨（求首订！）', '第4章 晨'],
-    ['第6章 战（三更）', '第6章 战'],
     ['第9章 雨（第二更）', '第9章 雨'],
-    ['第7章 和（4k）', '第7章 和'],
-    ['第13章 雪(1.5W)', '第13章 雪'],
     ['第10章 云【二合一】', '第10章 云'],
     ['第187章:魏韩对峙 三 二合一', '第187章:魏韩对峙 三'],
     ['第11章 风 更新时间：2024-01-02 12:30', '第11章 风'],
     ['第12章 回家 （求月票） （第三更）', '第12章 回家'],
     ['第24章 夜行（求月票） ', '第24章 夜行'],
+    ['第一卷 第1章 起（求月票）', '第一卷 第1章 起'],
+    // 歧义段与确定附言同括号、片段相连、致谢/进度数字等陪衬段随附言一起剥
+    ['第5章 归（三更，求月票）', '第5章 归'],
+    ['第9章 雨（第二更！求收藏）', '第9章 雨'],
+    ['第6章 夜（万赏加更）', '第6章 夜'],
+    ['第7章 晴（求收藏求推荐）', '第7章 晴'],
+    ['第14章 霜（5000字大章）', '第14章 霜'],
+    ['第15章 露（双倍月票求月票）', '第15章 露'],
+    ['第16章 冰（三千字）', '第16章 冰'],
+    ['第17章 霞【一更求票】', '第17章 霞'],
+    ['第18章 虹（感谢某某，盟主加更）', '第18章 虹'],
+    ['第19章 雾（感谢某某的盟主喵）', '第19章 雾'],
+    ['第20章 霁（加更3/10）', '第20章 霁'],
+    ['第21章 晖（保底更求月票）', '第21章 晖'],
+    ['第22章 曦【日万求订】', '第22章 曦'],
+    ['第23章 昕（二合一4000字章节）', '第23章 昕'],
+    ['第25章 晓（求收藏丶求推荐票丶求追读）', '第25章 晓'],
+    ['第26章 曙（为某某丶加更！）', '第26章 曙'],
+    ['第27章 旭（求月票、推荐票）', '第27章 旭'],
+    ['第28章 昊（月底求票！）', '第28章 昊'],
+    ['第29章 暮（补更）', '第29章 暮'],
   ])('剥：%s → %s', (raw, clean) => {
     expect(cleanChapterHeading(raw)).toBe(clean);
   });
@@ -2110,10 +2128,38 @@ describe('titleclean1111 章名附言剥离', () => {
   it.each([
     '求生（上）', '大战(二)', '第21章 求生（求生）', '第8章 武林大会（盟主之争）', 'APP免费的秘密', '求月票的少年与剑', '天地二合一', '第23章 二合一之战',
     '第99章 终章（大结局）', '第20章 交锋（1/2）', '第22章 归来（完）',
-    // 剥完只剩编号（或什么都不剩）⇒ 保留原章名
-    '第12章 （求月票）', '第2章 APP免费', '第8章 二合一', '第1章 【月票系统】', '序章 （求收藏）', '（求月票）',
+    // 剥完只剩编号（或什么都不剩）⇒ 保留原章名，编号前缀可多层
+    '第12章 （求月票）', '第2章 APP免费', '第8章 二合一', '第1章 【月票系统】', '序章 （求收藏）', '（求月票）', '第一卷 第3章 （求月票）',
+    // 整段不是附言：宾语不对、通配句式不成整段、「」『』是引语不当括号
+    '第3章 请求（请求支持）', '第4章 票房（追求票房）', '第5章 悬赏（悬赏十万赏金）', '第6章 系统【打赏系统】', '第7章 榜单（月票榜）',
+    '第8章 谢幕（谢谢你，盟主）', '第9章 门派（拜见掌门加更多）', '第10章 「求月票」', '第11章 『三更』',
+    // 歧义段单章出现、陪衬段单独出现、三合一及以上的括号外形态、前无标点的 APP免费
+    '第6章 战（三更）', '第7章 和（4k）', '第13章 雪(1.5W)', '第14章 夜半（三更）', '第15章 发布会（8K）', '第16章 终极形态 五合一', '第17章 这个APP免费',
+    '第18章 十连抽（保底）', '第19章 分身（2）', '第20章 归来（感谢有你）',
   ])('不动：%s', raw => {
     expect(cleanChapterHeading(raw)).toBe(raw);
+  });
+
+  it('超过 200 字的章名原样返回', () => {
+    const long = `第1章 ${'长'.repeat(200)}（求月票）`;
+    expect(cleanChapterHeading(long)).toBe(long);
+  });
+
+  it('整本：歧义尾巴 ≥ 3 章才全书按 loose 剥；陪衬段单独出现不计', () => {
+    expect(cleanChapterHeadings(['第1章 甲（一更）', '第2章 乙（二更）', '第3章 丙（三更）', '第4章 丁（4k）', '第5章 戊']))
+      .toEqual(['第1章 甲', '第2章 乙', '第3章 丙', '第4章 丁', '第5章 戊']);
+    expect(cleanChapterHeadings(['第1章 甲【保底一更】', '第2章 乙【保底二更】', '第3章 丙(1.5W)', '第4章 丁（保底）']))
+      .toEqual(['第1章 甲', '第2章 乙', '第3章 丙', '第4章 丁（保底）']);
+    const plot = ['第1章 夜半（三更）', '第2章 鸡鸣（五更）', '第3章 晨'];
+    expect(cleanChapterHeadings(plot)).toEqual(plot);
+  });
+
+  it('重复片段不会指数回溯', () => {
+    const started = performance.now();
+    for (const unit of ['求票月票加更', '求月票双倍月票', '三更5k', '求保底保底更', '加两']) {
+      cleanChapterHeadings([`第1章 甲（${unit.repeat(Math.floor(180 / unit.length))}x）`]);
+    }
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 
   it('开关解析：缺省/0 关，1/true/on 开；非字符串章名原样返回', () => {
@@ -2125,7 +2171,7 @@ describe('titleclean1111 章名附言剥离', () => {
     expect(cleanChapterHeading(undefined)).toBeUndefined();
   });
 
-  const RAW = ['第1章 起（求月票）', '第2章 承', '第3章 转（三更）APP免费', '第4章 （求月票）'];
+  const RAW = ['第1章 起（求月票）', '第2章 承', '第3章 转（第三更）APP免费', '第4章 （求月票）'];
   const CLEAN = ['第1章 起', '第2章 承', '第3章 转', '第4章 （求月票）'];
   const wrap = (f: ReturnType<typeof setup>) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
     if (url === 'https://book15.net/books/details1.html') {
@@ -2133,7 +2179,7 @@ describe('titleclean1111 章名附言剥离', () => {
     }
     return f.transport(url, opts);
   };
-  type CleanManifest = { chapters: { title: string; heading?: string; file: string }[]; artifact: { sha256: string } };
+  type CleanManifest = { chapters: { title: string; heading?: string; file: string }[]; artifact?: { sha256: string } };
   const bookOf = (r: { manifestPath: string }) => readFileSync(join(dirname(r.manifestPath), 'book.txt'), 'utf8');
   /** 照引擎口径用给定章名拼整本，逐字节比 book.txt。 */
   const joined = (r: { manifestPath: string; manifest: unknown }, titles: string[]) => (r.manifest as CleanManifest).chapters
@@ -2152,7 +2198,8 @@ describe('titleclean1111 章名附言剥离', () => {
 
     const again = await f.run(wrap(f));
     expect(again.code).toBe(0);
-    expect((again.manifest as CleanManifest).artifact.sha256).toBe(m.artifact.sha256);
+    expect(m.artifact?.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect((again.manifest as CleanManifest).artifact?.sha256).toBe(m.artifact?.sha256);
   });
 
   it('缺省关：book.txt 照原章名，manifest 无 heading', async () => {

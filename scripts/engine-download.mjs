@@ -313,41 +313,93 @@ export function tocBelowFloor(count, floor) {
 
 // titleclean1111：DOWNLOAD_TITLE_CLEAN=1 时，拼整本前剥掉章名尾部的站点广告和求票附言，写进 chapter.heading（只在与原章名
 // 不同时写）。book.txt 与发布清单的章名用 heading ?? title；title 原样留给续传、tocHash 和正文抓取。
-// 只剥尾部，循环剥到不再变；剥完去掉编号前缀后没有字（「第12章 （求月票）」「第1章 【月票系统】」）就保留原章名。
-// 表沿用打标机目录比对（scripts/douban_list.py _TOC_AD_SUFFIXES），收紧三处：括号里的「求」须接广告宾语（「（求生）」不剥），
-// 去掉单独的推荐/收藏/感谢，盟主/萌主/舵主须前有感谢类词（「（盟主之争）」不剥；「为盟主加更」由加更命中）。
-// 另加 phoenix 实见的无「第」更序「（三更）」与字数标注「（4k）」。
-// 分部标记（上/下/一/二、1/2）和（大结局）（完）不动；不做全半角折叠，表里两种都列。
+// 只剥尾部，循环剥到不再变；剥完去掉（可多层的）编号前缀后没有字（「第12章 （求月票）」「第一卷 第3章 （求月票）」）就保留原章名。
+// 尾部括号按分隔符切段，每段都整段是附言才剥：求X（X 限广告宾语）、第N更、N合一、…加更、补更、N万赏、感谢…盟主/打赏、双倍月票、
+// 字数标注带「字」、大章。「（请求支持）」「（追求票房）」「（悬赏十万赏金）」「【打赏系统】」「（月票榜）」这类整段不是附言，不动；
+// 「」『』是引语，不当括号。歧义段（无「第」的中文更序「（三更）」、不带「字」的「（4k）」「(1.5W)」）单独出现时不剥，
+// 同括号另有确定附言（「（三更，求月票）」）或整本 ≥ HEADING_LOOSE_MIN_CHAPTERS 章带同类尾巴（cleanChapterHeadings）才剥。
+// 陪衬段（致谢「感谢PINKSS」、光秃宾语「推荐票」、进度数字「3/10」里的数、保底/爆发/日万）只在同括号另有附言时随之剥，单独出现不剥
+// （「（保底）」「（2）」可能是剧情词或分部标记）；代价是「（2，求月票）」这类分部标记会随附言一起剥掉。
+// 括号外只剥三种：前有空白或标点的「APP免费」、「更新时间：…」、前有空白的「二合一」（站点把括号换成了空格）。
+// 分部标记（上/下/一/二、1/2）和（大结局）（完）不动；不做全半角折叠，表里两种都列。超过 200 字的章名不处理
+// （目录解析已丢弃更长的章名，这里另设上限，免得正则在异常长串上退化）。
 // 动机（2026-11-11 phoenix 只读，291 份 done 清单、13.3 万章）：70 本章名带求票尾巴（「（求月票）」1233 章、「（求追读）」125 章），
-// 另有 20 余本带更序、二合一；阅读目录整列是附言。缺省关；已发布的书不回改，之后重下（补抓、追更、重排）时生效。
-const AD_OPEN = '[(（【\\[［『「〔]';
-const AD_BODY = '[^()（）【】\\[\\]［］『』「」〔〕]*';
-const AD_CLOSE = '[)）】\\]］』」〕]';
-const adBracket = inner => new RegExp(`${AD_OPEN}${AD_BODY}(?:${inner})${AD_BODY}${AD_CLOSE}\\s*$`, 'i');
-const HEADING_AD_TAILS = [
-  /(?:APP|ＡＰＰ)\s*免费\s*$/i,
+// 另有 20 余本带更序、二合一；阅读目录整列是附言。同日扫全部 4759 个缓存目录（289 万章）：本规则剥 1965 本 12.8 万章，
+// 剥下的 5893 种不同尾巴里不含附言关键词的只有「（谢支持！）」一种（本身也是附言）。缺省关；已发布的书不回改，之后重下（补抓、追更、重排）时生效。
+const HEADING_MAX_LENGTH = 200;
+const HEADING_LOOSE_MIN_CHAPTERS = 3;
+const HEADING_TAIL_BRACKET = /[(（【[［〔]([^()（）【】[\]［］〔〕]*)[)）】\]］〕]\s*$/;
+const HEADING_SEGMENT_SEPARATOR = /[\s，,、;；!！~～。…·&＆+＋/／]+/;
+const HEADING_NUM = '0-9０-９零〇一二三四五六七八九十百千万两';
+// 段可由多个附言片段直接相连（「求收藏求推荐」「第三更求月票」「双倍月票求月票」「二合一4000字章节」），片段间可夹「丶」
+// （「求收藏丶求推荐票」；「丶」常见于书友名，不当分隔符，免得「为儍苽丶加更」被切开）。外层 + 失败时会把每种切法
+// 都试一遍，所以片段必须互不吞并：求X 的宾语串不能整个吞下另一个独立片段（宾语里没有「双倍」、加更前缀只有「盟主」），否则
+// 「求票月票加更」这类重复串会指数回溯；带通配的加更/致谢句式只认整段（HEADING_AD_PHRASE），不参与相连。
+// 段首可带一个陪衬前缀（保底、日万、进度数字）；数字用 (?![0-9]) 吃满，只有一种切法。
+// 歧义片段（HEADING_LOOSE_PIECES）整段只由它们（加前缀）组成时是歧义段，与确定片段相连（「三更求票」）才算附言。
+const HEADING_AD_OBJECTS = '月票|推荐|票|收藏|订阅|订|追读|追订|支持|首订|保底|评论|评价|打赏|鲜花|全订|自动订阅|打榜|下月票|个月票|一切|粉红';
+const HEADING_SEGMENT_PREFIX = '(?:保底|爆发|万更|日[0-9０-９.]*[万wW]|[0-9０-９]+(?![0-9０-９]))';
+const HEADING_LOOSE_PIECES = ['[一二三四五六七八九十两]+更', '[0-9０-９]+(?:\\.[0-9]+)?[kKｋＫwW]'];
+const HEADING_AD_PIECES = new RegExp(`^${HEADING_SEGMENT_PREFIX}?(?:丶?(?:${[
+  `(?:新书|新人|本书|月初|月中|月底|月末|周末|周[一二三四五六日]|双倍)?[跪求]?求(?:和?(?:${HEADING_AD_OBJECTS}))+[啊呀哦哈嘛啦喵]*`,
+  '求双倍月票',
+  `(?:今日|今天)?第[${HEADING_NUM}]+更`,
+  '[0-9０-９]+更',
+  '(?:[0-9０-９二三四五两]|[0-9０-９一二三四五两]+[更章])合一(?:章节)?',
+  `[${HEADING_NUM}]+万赏`,
+  '[0-9０-９.]+万?打赏值加?',
+  '双倍月票(?:期间|中)?|月票(?:翻倍|加倍)(?:期间|中)?',
+  '[0-9０-９.]+[kKｋＫwW万千]?字(?:章节)?|[一二三四五六七八九十两]*[千万][一二三四五六七八九十两百零]*字(?:章节)?',
+  '大章',
+  '(?:盟主)?加更',
+  '保底更',
+  '补更[0-9０-９]*(?![0-9０-９])',
+  '谢(?:打赏|月票|支持)',
+  ...HEADING_LOOSE_PIECES,
+].join('|')}))+$`, 'i');
+const HEADING_AD_PHRASE = /^(?:.{0,24}加[0-9０-９一二三四五两]*更[0-9０-９一二三四五六七八九十]*|(?:感谢|鸣谢|谢谢).{0,30}(?:盟主|萌主|舵主|堂主|掌门|白银盟|黄金盟|打赏|月票|万赏|推荐票)(?:的?(?:打赏|加更|支持))?)[啊呀哦哈嘛啦喵]*$/;
+const HEADING_LOOSE_SEGMENT = new RegExp(`^${HEADING_SEGMENT_PREFIX}?(?:${HEADING_LOOSE_PIECES.join('|')})+$`);
+const HEADING_FILLER_SEGMENT = new RegExp(`^(?:(?:感谢|鸣谢|谢谢|多谢).{0,20}|(?:和?(?:${HEADING_AD_OBJECTS}))+|${HEADING_SEGMENT_PREFIX})$`);
+const headingSegmentKind = s =>
+  (HEADING_AD_PIECES.test(s) && !HEADING_LOOSE_SEGMENT.test(s)) || HEADING_AD_PHRASE.test(s) ? 'ad'
+    : HEADING_LOOSE_SEGMENT.test(s) ? 'loose' : HEADING_FILLER_SEGMENT.test(s) ? 'filler' : null;
+const HEADING_PLAIN_TAILS = [
+  /(?<=[\s\p{P}])(?:APP|ＡＰＰ)\s*免费\s*$/iu,
   /更新时间[:：]\s*\d{4}-\d{1,2}-\d{1,2}(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$/,
-  adBracket(`求(?:月票|票|推荐|收藏|订阅|追读|支持|首订|保底|评论|打赏|鲜花|全订)|月票|订阅|加更|打赏|万赏|(?:感谢|鸣谢|谢谢)${AD_BODY}(?:盟主|萌主|舵主)`),
-  adBracket('第\\s*[0-9０-９一二三四五六七八九十两]+\\s*更|[0-9０-９二三四五两]\\s*合\\s*一'),
-  new RegExp(`${AD_OPEN}\\s*[0-9０-９一二三四五六七八九十两]+\\s*更[!！~～。…]*\\s*${AD_CLOSE}\\s*$`),
-  new RegExp(`${AD_OPEN}\\s*[0-9０-９]+(?:\\.[0-9]+)?\\s*[kKｋＫwW]\\s*${AD_CLOSE}\\s*$`),
-  // 括号被站点换成空格：「第187章:魏韩对峙 三 二合一」。须前有空白，「天地二合一」类章名不动。
-  /(?<=\s)[0-9０-９二三四五两]\s*合\s*一\s*$/,
+  // 括号被站点换成空格：「第187章:魏韩对峙 三 二合一」。须前有空白，「天地二合一」类章名不动；三合一及以上多是剧情词，不剥。
+  /(?<=\s)[2２二两]\s*合\s*一\s*$/,
 ];
-const HEADING_NUMBER_PREFIX = /^\s*(?:第\s*[0-9０-９零〇一二三四五六七八九十百千万两]+\s*[章节節回卷话話集部篇]|[0-9０-９]+\s*[.、,，:：]?|楔子|序[章言曲]?|引子|正文|番外)\s*/;
+const HEADING_NUMBER_PREFIX = /^\s*(?:(?:第\s*[0-9０-９零〇一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟]+\s*[章节節回卷话話集部篇天夜幕]|卷\s*[0-9０-９零〇一二三四五六七八九十百千万两]+|chapter\s*[0-9]+|[0-9０-９]+\s*[.、,，:：]?|楔子|序[章言曲幕]?|引子|正文|番外篇?)[\s.、,，:：—-]*)+/i;
 export function titleClean(env = process.env) {
   const raw = env.DOWNLOAD_TITLE_CLEAN?.trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'on';
 }
-export function cleanChapterHeading(title) {
-  if (typeof title !== 'string') return title;
-  const base = title.replace(/\s+$/, '');
+function stripHeadingTail(heading, loose) {
+  const bracket = HEADING_TAIL_BRACKET.exec(heading);
+  if (bracket) {
+    const kinds = bracket[1].split(HEADING_SEGMENT_SEPARATOR).filter(Boolean).map(headingSegmentKind);
+    if (kinds.length && !kinds.includes(null) && (kinds.includes('ad') || (loose && kinds.includes('loose')))) {
+      return heading.slice(0, bracket.index);
+    }
+  }
+  for (const tail of HEADING_PLAIN_TAILS) heading = heading.replace(tail, '');
+  return heading;
+}
+/** loose：歧义段（无「第」中文更序、不带「字」的字数）也剥；单章调用缺省不剥，整本由 cleanChapterHeadings 判。 */
+export function cleanChapterHeading(title, loose = false) {
+  if (typeof title !== 'string' || title.length > HEADING_MAX_LENGTH) return title;
+  const base = title.trimEnd();
   let heading = base;
   for (let previous; previous !== heading;) {
     previous = heading;
-    for (const tail of HEADING_AD_TAILS) heading = heading.replace(tail, '').replace(/\s+$/, '');
+    heading = stripHeadingTail(heading, loose).trimEnd();
   }
   return heading !== base && /[\p{L}\p{N}]/u.test(heading.replace(HEADING_NUMBER_PREFIX, '')) ? heading : title;
+}
+/** 整本：带歧义尾巴（只在 loose 下才剥得掉）的章数 ≥ HEADING_LOOSE_MIN_CHAPTERS 时，全书按 loose 剥。 */
+export function cleanChapterHeadings(titles) {
+  const loose = titles.filter(t => cleanChapterHeading(t, true) !== cleanChapterHeading(t)).length >= HEADING_LOOSE_MIN_CHAPTERS;
+  return titles.map(t => cleanChapterHeading(t, loose));
 }
 
 // chaperr1031：DOWNLOAD_CHAPTER_ERROR_KIND=1 时，白名单外的逐章失败（chapter.error='chapter_failed'）另记 chapter.error_kind =
@@ -817,10 +869,8 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       await checkpoint();
     }
     if (titleClean()) {
-      for (const c of manifest.chapters) {
-        const heading = cleanChapterHeading(c.title);
-        if (heading !== c.title) c.heading = heading;
-      }
+      const headings = cleanChapterHeadings(manifest.chapters.map(c => c.title));
+      manifest.chapters.forEach((c, i) => { if (headings[i] !== c.title) c.heading = headings[i]; });
     }
     const txt = manifest.chapters.map(c => `${c.heading ?? c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
     atomic(join(dir, 'book.txt'), txt);

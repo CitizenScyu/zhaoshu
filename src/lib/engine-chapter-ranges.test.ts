@@ -93,7 +93,7 @@ describe('engineChapterRanges:按引擎拼接方式还原章节字节边界', ()
     expect(engineChapterRanges(txt, records)?.map((range) => range.title)).toEqual(['第1章 起', '第2章 承']);
     const legacy = chapters.map(({ title, text }) => `${title}\n\n${text}\n\n`).join('');
     expect(engineChapterRanges(legacy, records)).toBeNull();
-    expect(engineChapterRanges(txt, records.map((record, i) => (i === 0 ? { ...record, heading: null } : record)))).toBeNull();
+    expect(engineChapterRanges(legacy, records.map((record, i) => (i === 0 ? { ...record, heading: null } : record)))).toBeNull();
   });
 });
 
