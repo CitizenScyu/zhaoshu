@@ -42,6 +42,14 @@ describe('cleanSearchTitle', () => {
     expect(cleanSearchTitle('书名（修订版)')).toBe('书名');
     expect(cleanSearchTitle('书名[典藏版]')).toBe('书名');
   });
+
+  it('bracket1111：整串外包书名号剥掉（站点书名自带《》）；内部还有书名号的不动', () => {
+    expect(cleanSearchTitle('《校花嫌弃刑天垃圾？我反手合体！》')).toBe('校花嫌弃刑天垃圾？我反手合体！');
+    expect(cleanSearchTitle(' 《维京生存指南》 ')).toBe('维京生存指南');
+    expect(cleanSearchTitle('《精灵宝钻（精装插图本）》')).toBe('精灵宝钻');
+    expect(cleanSearchTitle('《A》与《B》')).toBe('《A》与《B》');
+    expect(cleanSearchTitle('《》')).toBe('《》');
+  });
 });
 
 describe('cleanSearchAuthor', () => {

@@ -23,14 +23,18 @@ const VERSION_NOTE_MARKERS
 const isVersionNote = (content: string): boolean =>
   /\d/.test(content) || VERSION_NOTE_MARKERS.test(content) || /[版本译装订注校]$/.test(content);
 
+/** 整串外包书名号（bracket1111）：只认内部不再含书名号的一对，「《A》与《B》」这类不动。 */
+const OUTER_TITLE_BRACKETS = /^《([^《》]+)》$/u;
+
 /**
  * 去掉书名**末尾**的版本注记括号段（可连续多段：「书名（上）（精装版）」→「书名（上）」，
  * 卷号「（上）」不是版本注记不剥）。书名**中间**的括号内容一律不动（那是书名本体的一部分）。
- * 整串剥空（书名本身就是「（精装版）」）时返回原值 trim。
+ * 先剥整串外包的书名号（bracket1111：www.biquge.xin 的站点书名自带《》，打标后原样入库；身份键与
+ * 身份比对两侧都剥，只有搜索词没剥，镜像站按「《书名》」搜不到）。整串剥空时返回原值 trim。
  */
 export function cleanSearchTitle(title: string): string {
   const raw = title.trim();
-  let value = raw;
+  let value = raw.replace(OUTER_TITLE_BRACKETS, '$1').trim();
   for (;;) {
     const match = TRAILING_BRACKET_NOTE.exec(value);
     if (!match || !isVersionNote(match[1])) break;
