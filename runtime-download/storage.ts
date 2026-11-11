@@ -26,11 +26,15 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
     claim: owner => claimDownloadTask(sql, owner),
 
     // T3 WorkerStorage.taskRow 没有对应的导出函数（T3 测试绑定内联同一 SELECT）。
-    // tocfloor1111：chapter_floor = 同一本书全部任务（含本任务历次尝试）实际抓到过的最大章数。
+    // tocfloor1111：chapter_floor = 同一本书全部任务行（含本行）chapters_done 的最大值；source_revision 以 nofloor- 开头的
+    // 任务不带下限（NULL，供人工对个别书关掉下限闸门）。本行的 chapters_done/chapters_total/chars_total 一并取回，
+    // 任务层开着 tocFloor 时用它作「历次最高进度」的初值（见 download-worker runDownloadTask）。
     async taskRow(id) {
       const rows = await sql`
         SELECT t.id, t.book_id, t.title, t.author, t.status, t.source_url, t.source_kind, t.source_id, t.requested_by, t.attempt_count,
-          (SELECT max(o.chapters_done) FROM download_tasks o WHERE o.book_id = t.book_id)::int AS chapter_floor
+          t.chapters_done, t.chapters_total, t.chars_total,
+          CASE WHEN t.source_revision LIKE 'nofloor-%' THEN NULL
+               ELSE (SELECT max(o.chapters_done) FROM download_tasks o WHERE o.book_id = t.book_id)::int END AS chapter_floor
         FROM download_tasks t WHERE t.id = ${id}` as unknown as TaskRow[];
       return rows[0] ?? null;
     },

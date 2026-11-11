@@ -820,8 +820,16 @@ describe('tocshape1107 目录形态闸门', () => {
     expect(tocShapeError(titles(range(1, 5)))).toBeNull();
     expect(tocShapeError(titles(range(5, 1)))).toBeNull();
     expect(tocShapeError(titles([300, 301]))).toBeNull();
-    expect(tocShapeError(titles([300, 301, 301]))).toBeNull(); // 重复编号 ≥ 5%
     expect(tocShapeError([...titles([300, 301, 302]), '公告', '请假', '感言'])).toBeNull(); // 编号章占比 < 60%
+  });
+  it('smalltoc1111：编号章 < 10 时重复编号不豁免；编号接着上一卷排的短篇（最小编号 ≤ 条数 × 10）不判', () => {
+    expect(tocShapeError(titles([300, 301, 301]))).toBe('toc_incomplete'); // 同章发两遍
+    expect(tocShapeError(titles([1201, 1202, 1202, 1203, 1204]))).toBe('toc_incomplete');
+    expect(tocShapeError(titles(range(21, 29)))).toBeNull(); // 9 条、最小编号 21 ≤ 90
+    expect(tocShapeError(titles(range(51, 55)))).toBe('toc_incomplete'); // 边界：最小编号 51 > 5 × 10
+    expect(tocShapeError(titles(range(50, 54)))).toBeNull(); // 最小编号 50 不大于 5 × 10
+    // ≥ 10 个编号章的判据逐字不变：重复编号 ≥ 5% 仍豁免。
+    expect(tocShapeError(titles([...range(500, 509), 509, 509]))).toBeNull();
   });
   it('smalltoc1111 整本：最新 5 章目录 ⇒ toc_incomplete、零正文请求', async () => {
     const f = setup(); const reads: string[] = [];
@@ -841,13 +849,13 @@ describe('tocshape1107 目录形态闸门', () => {
     for (const raw of ['0', 'yes', '']) { vi.stubEnv('DOWNLOAD_TOC_FLOOR', raw); expect(tocFloor()).toBe(false); }
     for (const raw of [' On ', 'true', '1']) { vi.stubEnv('DOWNLOAD_TOC_FLOOR', raw); expect(tocFloor()).toBe(true); }
   });
-  it('tocfloor1111 整本：开且目录 12 章 < 下限 100 的七成 ⇒ toc_incomplete、零正文请求', async () => {
+  it('tocfloor1111 整本：开且目录 12 章 < 下限 100 的七成 ⇒ toc_below_floor、零正文请求', async () => {
     vi.stubEnv('DOWNLOAD_TOC_FLOOR', '1');
     const f = setup(); const reads: string[] = [];
     f.options['chapter-floor'] = 100;
     const r = await run(f, titles(range(1, 12)), reads);
     expect(r.code).toBe(1);
-    expect(r.manifest.errors).toEqual(['toc_incomplete']);
+    expect(r.manifest.errors).toEqual(['toc_below_floor']);
     expect(reads).toEqual([]);
     expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
   }, 60_000);

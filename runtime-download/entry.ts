@@ -6,7 +6,7 @@
 
 import { join } from 'node:path';
 import { neon } from '@neondatabase/serverless';
-import { downloadBook } from '../scripts/engine-download.mjs';
+import { downloadBook, tocFloor } from '../scripts/engine-download.mjs';
 import {
   createEngineAdapter, type EngineDownloadLike, type PublicationRolloverSeam, type SourceAdapter, type WorkerStorage,
   WORKER_TASK_TIMEOUT_MS,
@@ -470,6 +470,8 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     ...(env.DOWNLOAD_PREPUBLISH_CHECK === '1' ? { prePublishCheck: true } : {}),
     // relocate1105：旧落位在已满旧仓时发布到决策仓并登记搬迁（见 WorkerOptions.relocateArtifacts）。缺省关。
     ...(env.DOWNLOAD_ARTIFACT_RELOCATE === '1' ? { relocateArtifacts: true } : {}),
+    // tocfloor1111：章数下限闸门的任务层配套（见 WorkerOptions.tocFloor），与引擎共用 DOWNLOAD_TOC_FLOOR 的判定。缺省关。
+    ...(tocFloor(env) ? { tocFloor: true } : {}),
     // 数据库配额（Neon 402）长退避：默认 30 分钟，env DB_QUOTA_BACKOFF_MS 覆盖；恢复后在 cron_health 补记。
     quotaBackoffMs: dbQuotaBackoffMs(env),
     recordQuotaSeen: quotaSql ? (seenAt => recordDbQuotaSeen(quotaSql, seenAt)) : undefined,

@@ -151,9 +151,13 @@ const isPreviewTruncated = (outcome: AdapterOutcome) =>
   (outcome.kind === 'incomplete' && outcome.reason === 'preview_truncated')
   || (outcome.kind === 'failure' && outcome.code === 'preview_truncated');
 
-/** tocshape1107：原源目录形态缺陷（倒序/轮转/只剩尾段，engine-download tocShapeError）同源重试不变，同样换源。 */
+/**
+ * tocshape1107：原源目录形态缺陷（倒序/轮转/只剩尾段，engine-download tocShapeError）同源重试不变，同样换源。
+ * tocfloor1111：章数不到下限七成（toc_below_floor，engine-download tocBelowFloor）同理。
+ */
 const isTocDefect = (outcome: AdapterOutcome) =>
-  outcome.kind === 'failure' && (outcome.code === 'toc_disordered' || outcome.code === 'toc_incomplete');
+  outcome.kind === 'failure'
+  && (outcome.code === 'toc_disordered' || outcome.code === 'toc_incomplete' || outcome.code === 'toc_below_floor');
 
 /**
  * resolvemiss1104：原源 host 不在下载池（resolveSource code=1 no_engine_source_for_host，零出网）。

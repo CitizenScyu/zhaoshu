@@ -16,7 +16,7 @@ const atomic = (path, data) => {
   try { writeFileSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(temp, path);
 };
-const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|preview_truncated|interrupted|budget_exhausted|operation_timeout|empty_content|toc_disordered|toc_incomplete)$/;
+const knownError = /^(identity_mismatch_or_no_candidate|empty_toc|empty_toc_page|pagination_cycle|toc_limit|unsupported_toc_rule|invalid_chapter|invalid_next_page|empty_content_page|content_page_limit|unsupported_content_rule|max_chapters|size_limit|toc_changed|missing_chapters|preview_truncated|interrupted|budget_exhausted|operation_timeout|empty_content|toc_disordered|toc_incomplete|toc_below_floor)$/;
 const isLimiterFeedbackError = error => error?.code === 'LIMITER_FEEDBACK_UNAVAILABLE'
   && error?.origin === 'limiter-feedback';
 const isHostGateError = error => error?.code === 'HOST_OCCUPIED'
@@ -246,6 +246,9 @@ export function gapEligible(missing, total) {
 // DOWNLOAD_TOC_SHAPE=0 关（缺省开）。
 // smalltoc1111：toc_incomplete 的编号章下限放到 3（倒序/轮转仍要 ≥ 10）。动机（2026-11-11 phoenix 只读）：
 // m.biquge5200.cc 目录只给最新 5 章，57 本被当整本发布 done，原 ≥ 10 的门槛拦不到。
+// 编号章 < 10 时另有两点不同（≥ 10 的判据逐字不变）：
+// - 重复编号不豁免：3 个里重复 1 个就过 5%，「最新几章」里同章发两遍的目录会整个漏判；
+// - 另须最小编号 > 目录条数 × 10：编号接着上一卷往下排的短篇（如第 21–29 章共 9 条）不判。
 const TOC_SHAPE_NUMBER = /第\s*([0-9０-９]+|[零〇一二两三四五六七八九十百千万]+)\s*[章节回]/;
 const CN_DIGIT = new Map([['零', 0], ['〇', 0], ['一', 1], ['二', 2], ['两', 2], ['三', 3], ['四', 4], ['五', 5], ['六', 6], ['七', 7], ['八', 8], ['九', 9]]);
 const CN_UNIT = new Map([['十', 10], ['百', 100], ['千', 1000]]);
@@ -268,7 +271,8 @@ export function chapterNumberOf(title) {
 export function tocShapeError(titles) {
   const nums = titles.map(chapterNumberOf).filter(n => n !== null);
   if (nums.length < 3 || nums.length < titles.length * 0.6) return null;
-  if (1 - new Set(nums).size / nums.length >= 0.05) return null;
+  const small = nums.length < 10;
+  if (!small && 1 - new Set(nums).size / nums.length >= 0.05) return null;
   let descents = 0, min = Infinity, max = -Infinity;
   const tails = []; // 最长非降子序列（耐心排序，取第一个 > x 的位置）
   nums.forEach((x, i) => {
@@ -279,16 +283,22 @@ export function tocShapeError(titles) {
     while (lo < hi) { const mid = (lo + hi) >> 1; if (tails[mid] <= x) lo = mid + 1; else hi = mid; }
     tails[lo] = x;
   });
-  if (nums.length >= 10 && (descents / (nums.length - 1) > 0.3 || tails.length / nums.length < 0.8)) return 'toc_disordered';
-  if (min > 20 && titles.length < max * 0.5) return 'toc_incomplete';
+  if (!small && (descents / (nums.length - 1) > 0.3 || tails.length / nums.length < 0.8)) return 'toc_disordered';
+  if (min > 20 && titles.length < max * 0.5 && (!small || min > titles.length * 10)) return 'toc_incomplete';
   return null;
 }
 
-// tocfloor1111：章数下限闸门。任务层把同一本书历次任务实际抓到过的最大章数作 args['chapter-floor'] 传入；
-// 目录章数 < 下限 × 0.7 ⇒ toc_incomplete，按源级失败换源（零正文请求）。下限 < 30 或不是整数不判。
+// tocfloor1111：章数下限闸门。任务层把下限作 args['chapter-floor'] 传入；目录章数 < 下限 × 0.7 ⇒ toc_below_floor
+// （与形态闸门的 toc_incomplete 分开记，便于统计误判），按源级失败换源（零正文请求）。下限 < 30 或不是整数不判。
+// 下限 = 这本书各任务行 chapters_done 的最大值（runtime-download/storage.ts taskRow）。任务行的 chapters_done 是
+// 进度通道的最新值，本闸门拒绝时也会被写成 0；所以开关开着时任务层（download-worker runDownloadTask）把它保持为
+// 本行历次抓到的最高值，并在同一次领取的各回退腿之间即时抬高下限。
+// 局限：下限只认「抓到过多少章」，不验内容；某个源的目录虚高（重复卷、乱章）且抓过大半时，正常源会被它拒掉。
+// 此时任务以 toc_below_floor 或 no_candidates 收口，不自动删书（nosrc-tool.sh gc 的 held_gated）；
+// 用 source_revision 以 nofloor- 开头的重排任务可对这本书关掉下限。
 // 动机（2026-11-11 phoenix 只读）：164 本 done 的章数不到同书另一任务已抓章数的七成；抽查已发布清单 163 本，
 // 121 本自身编号连续到末章而官方目录超其 1.3 倍——源站目录只到中途，被当整本发布。
-// DOWNLOAD_TOC_FLOOR 缺省关；1/true/on 开。
+// DOWNLOAD_TOC_FLOOR 缺省关；1/true/on 开（引擎与 runtime-download/entry.ts 读同一个判定）。
 const TOC_FLOOR_RATIO = 0.7;
 const TOC_FLOOR_MIN = 30;
 export function tocFloor(env = process.env) {
@@ -627,7 +637,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
     const shapeError = tocShape() ? tocShapeError(manifest.chapters.map(c => c.title)) : null;
     if (shapeError) throw new Error(shapeError);
-    if (tocFloor() && tocBelowFloor(chapters.length, args['chapter-floor'])) throw new Error('toc_incomplete');
+    if (tocFloor() && tocBelowFloor(chapters.length, args['chapter-floor'])) throw new Error('toc_below_floor');
     const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
     const sameBook = chapterResume() && previous?.sourceRevision === manifest.sourceRevision && previous?.bookUrl === manifest.bookUrl;
     stage = 'content';

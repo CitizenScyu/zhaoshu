@@ -390,7 +390,7 @@ describe('41-T8FB builtin-fallback', () => {
 
   // tocshape1107：引擎适配器把 preview_truncated 与目录形态缺陷归 failure（不在 incomplete 白名单），
   // 旧判据只认 incomplete ⇒ 原源预览/倒序目录直接 failed 终态、从不换源。
-  it.each(['preview_truncated', 'toc_disordered', 'toc_incomplete'])('tocshape1107：原源 failure %s ⇒ 改走引擎回退并成功', async code => {
+  it.each(['preview_truncated', 'toc_disordered', 'toc_incomplete', 'toc_below_floor'])('tocshape1107：原源 failure %s ⇒ 改走引擎回退并成功', async code => {
     const h = harness({ pool: ['https://a.example/', 'https://b.example/'] });
     const calls: string[] = [];
     const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': { kind: 'failure', code } }, calls), adapter({ 'a.example': {

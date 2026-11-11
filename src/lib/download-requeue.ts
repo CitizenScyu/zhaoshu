@@ -20,7 +20,7 @@ const REVISION_PATTERN = /^[a-z0-9][a-z0-9._-]{2,63}$/;
 /** 失败原因码（从 error 文本里取第一个已知码）；未知归 other。 */
 export const REQUEUE_REASONS = [
   'preview_truncated', 'no_candidates', 'source_unavailable', 'missing_chapters', 'invalid_chapter',
-  'host_breaker', 'host_occupied', 'download_failed',
+  'host_breaker', 'host_occupied', 'download_failed', 'toc_below_floor',
 ] as const;
 
 export interface RequeueOptions {

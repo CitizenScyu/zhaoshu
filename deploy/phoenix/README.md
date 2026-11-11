@@ -202,7 +202,8 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
     并且没有未试过的免费候选。
   - **末次搜索**：其余还没排过末次搜索的书，每天最多排 300 本（`source_revision=gc-lastcall-YYYYMMDD`）。
   - **保留**：partial（缺章）、`source_unavailable`（源站临时不可用）、有免费候选的书，末次之后也不自动删；
-    日志里按 `held_*` 计数，留给人工决定。
+    有源被章数下限闸门拒过的书（候选或任务行记着 `toc_below_floor`，见 tocfloor1111）同样不自动删：源是有的，
+    只是被判成截断，记 `held_gated`。日志里按 `held_*` 计数，留给人工决定。
   - 单次删除超过 2000 本就拒绝执行（`ZS_GC_MAX_DELETE` 可手工放宽）。`gcrun --dry-run` 只打印分桶计数。
   - 日志：`journalctl -u zhaoshu-nosrc-gc`（分桶计数、备份目录、删除与排队数）。
     关停：`systemctl disable --now zhaoshu-nosrc-gc.timer`。
@@ -276,6 +277,24 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   占 scan-miss 26.4 万中的 10.1 万、当天 13.3 万次请求。上线后每次选源约跳过 170 个池源。
 - 自愈：被跳的 host 不再产生 miss，24h 后计数掉到门槛下会重新扫；每天每 host 约留 200 本书的探测。
 - 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
+
+## 目录章数下限与小目录尾段（tocfloor1111 / smalltoc1111，2026-11-11）
+
+- **smalltoc1111**（随 `DOWNLOAD_TOC_SHAPE`，缺省开）：目录只给最新几章的源（编号章 3–9 个、最小编号 > 20、
+  章数不到最大编号一半、且最小编号 > 目录条数 × 10）判 `toc_incomplete` 换源，零正文请求。原门槛是 ≥ 10 个编号章，
+  拦不到恒给 5 章的 m.biquge5200.cc。编号接着上一卷往下排的短篇（如第 21–29 章共 9 条）不判。
+- **tocfloor1111**：drop-in `zhaoshu-download-b@.service.d/93-tocfloor.conf`：`DOWNLOAD_TOC_FLOOR=1`（缺省关）。
+  - 判据：目录章数 < 同一本书历次任务行 `chapters_done` 最大值的七成（下限 ≥ 30 才判）⇒ `toc_below_floor`，
+    按源级失败换源，零正文请求。与目录形态的 `toc_incomplete` 分开记码，便于统计误判。
+  - 开着时任务层另做两件事：非完成收口前把本行历次最高进度写回（被拒那次的目录不会把下限依据覆写成 0）；
+    同一次领取里各换源腿之间按已抓章数刷新下限。完成收口不写回。
+  - 局限：下限取自历史任务行，源站把目录灌水（重复章、公告章）抬高过章数的书，之后正常的源可能被误拒。
+  - 个别书关闸门：重排任务时 `source_revision` 用 `nofloor-` 开头（如 `nofloor-20261111`），该任务不带下限。
+  - 所有源都被拒的书不会被每日清理删除（gcrun 记 `held_gated`）；`/api/admin/download-requeue` 的 `reasons`
+    支持 `toc_below_floor`。
+- 动机（11-11 只读核对）：4606 本已发布书里，137 本可确认是截断版（已发布章数远少于该书历次抓到过的章数或
+  官方总章数），其中 106 本用本闸门能拦住；m.biquge5200.cc 发布的 57 本全是 5 章的「最新章节」目录。
+- 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`；smalltoc 随 `DOWNLOAD_TOC_SHAPE=0` 关。
 
 ## release 目录布局 / 回滚
 

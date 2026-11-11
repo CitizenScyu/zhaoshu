@@ -135,6 +135,19 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     expect(await storage.taskRow(fresh)).toMatchObject({ chapter_floor: 0 });
   });
 
+  it('tocfloor1111 taskRow：source_revision 以 nofloor- 开头不带下限；本行进度快照一并取回', async () => {
+    const storage = createWorkerStorage(sql);
+    const earlier = await insertTask('partial', 1);
+    const escaped = await insertTask('pending', 1);
+    const normal = await insertTask('pending', 1);
+    await pg.query('UPDATE download_tasks SET chapters_total = 500, chapters_done = 120, chars_total = 9000 WHERE id = $1', [earlier]);
+    await pg.query(`UPDATE download_tasks SET source_revision = 'nofloor-20261111' WHERE id = $1`, [escaped]);
+    await pg.query(`UPDATE download_tasks SET source_revision = 'requeue-nofloor-1' WHERE id = $1`, [normal]);
+    expect(await storage.taskRow(escaped)).toMatchObject({ id: escaped, chapter_floor: null, chapters_done: 0 });
+    expect(await storage.taskRow(normal)).toMatchObject({ chapter_floor: 120 }); // 只认前缀
+    expect(await storage.taskRow(earlier)).toMatchObject({ chapter_floor: 120, chapters_done: 120, chapters_total: 500, chars_total: 9000 });
+  });
+
   const registration = async () => {
     const id = await insertTask();
     const storage = createWorkerStorage(sql);

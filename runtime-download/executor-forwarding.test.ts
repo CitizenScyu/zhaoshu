@@ -12,13 +12,14 @@ const row: TaskRow = {
 };
 const complete: AdapterOutcome = { kind: 'complete', txt: '合成正文', chaptersTotal: 1, chaptersDone: 1, charsTotal: 4 };
 
-function harness(flags: { prePublishCheck?: boolean }) {
+function harness(flags: { prePublishCheck?: boolean; tocFloor?: boolean }, adapter: SourceAdapter = { kind: 'engine', download: async () => complete }) {
   const findArtifactIdentityOwner = vi.fn<NonNullable<WorkerStorage['findArtifactIdentityOwner']>>().mockResolvedValue(null);
+  const progress = vi.fn<WorkerStorage['progress']>().mockResolvedValue(true);
   const storage: WorkerStorage = {
     claim: async () => lease,
     taskRow: async () => row,
     heartbeat: async () => true,
-    progress: async () => true,
+    progress,
     finish: async () => true,
     defer: async () => null,
     reserveArtifactPath: async () => 1,
@@ -30,13 +31,12 @@ function harness(flags: { prePublishCheck?: boolean }) {
     read: async () => ({ used: 0, limit: 5 }),
     consume: async () => ({ allowed: true, date: '2026-11-05' }),
   };
-  const adapter: SourceAdapter = { kind: 'engine', download: async () => complete };
   const executor = createExecutor({
     storage, github: { put: async () => {}, getBytes: async () => null }, adapters: [adapter], budget,
     repositoryId: 1, branch: 'main', owner: 'owner', decisions: DEFAULT_DECISIONS,
     ...flags,
   });
-  return { run: () => executor.runOnce(), findArtifactIdentityOwner };
+  return { run: () => executor.runOnce(), findArtifactIdentityOwner, progress };
 }
 
 describe('relocate1105 执行器透传', () => {
@@ -50,5 +50,29 @@ describe('relocate1105 执行器透传', () => {
     const { run, findArtifactIdentityOwner } = harness({});
     expect(await run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     expect(findArtifactIdentityOwner).not.toHaveBeenCalled();
+  });
+});
+
+// tocfloor1111：tocFloor 透传给 worker（开 = 非完成收口前多一次写回历次最高进度）。
+describe('tocfloor1111 执行器透传', () => {
+  const rejected = (): SourceAdapter => ({
+    kind: 'engine',
+    async download(_task, context) {
+      await context.progress({ chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 });
+      await context.progress({ chaptersDone: 0, chaptersTotal: 40, charsTotal: 0 });
+      return { kind: 'failure', code: 'toc_below_floor' };
+    },
+  });
+
+  it('tocFloor 开：failed 收口前把最高那份进度写回', async () => {
+    const { run, progress } = harness({ tocFloor: true }, rejected());
+    expect(await run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    expect(progress.mock.calls.map(call => call[1].chaptersDone)).toEqual([120, 0, 120]);
+  });
+
+  it('缺省关：只有腿自己报的两次', async () => {
+    const { run, progress } = harness({}, rejected());
+    expect(await run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
+    expect(progress.mock.calls.map(call => call[1].chaptersDone)).toEqual([120, 0]);
   });
 });

@@ -16,7 +16,7 @@ GAP_MAX_TRIES=${ZS_GAP_MAX_TRIES:-6}
 GAP_MAX_ENQUEUE=${ZS_GAP_MAX_ENQUEUE:-100}
 GAP_BASE_HOURS=${ZS_GAP_BASE_HOURS:-24}
 [[ $GAP_MAX_TRIES =~ ^[0-9]+$ && $GAP_MAX_ENQUEUE =~ ^[0-9]+$ && $GAP_BASE_HOURS =~ ^[0-9]+$ ]] || { echo "bad ZS_GAP_*" >&2; exit 3; }
-GC_DELETE_WHERE="delkind AND final AND NOT freeok"
+GC_DELETE_WHERE="delkind AND final AND NOT freeok AND NOT gated"
 GC_LAST_WHERE="NOT ($GC_DELETE_WHERE) AND NOT had_last"
 REV=lastcall-20261109
 COHORT=$BASE/nosrc-$REV/cohort-ids.txt
@@ -55,6 +55,8 @@ SQL
 # gc: every book with no artifact, no done/pending/running task and no user request, whose latest task failed
 # (or that never got a task). delkind = the failure means no usable source; final = this was already the second
 # attempt (a lastcall revision, or >= 2 failed tasks with the latest started in the last 14 days).
+# gated = a source was turned down by the chapter-floor gate (toc_below_floor, tocfloor1111): sources exist, the
+# gate judged them truncated, so the book is never deleted automatically (reported as held_gated).
 gc_sql() {
 cat <<'SQL'
 CREATE TEMP TABLE gc AS
@@ -70,6 +72,8 @@ SELECT lb.id,
   COALESCE(f.had_last, false) AS had_last,
   EXISTS (SELECT 1 FROM download_source_candidates c WHERE c.book_id = lb.id AND c.failure = ''
           AND c.host NOT IN ('book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com')) AS freeok,
+  (EXISTS (SELECT 1 FROM download_source_candidates c WHERE c.book_id = lb.id AND c.failure_reason = 'toc_below_floor')
+   OR EXISTS (SELECT 1 FROM download_tasks g WHERE g.book_id = lb.id AND g.error = 'toc_below_floor')) AS gated,
   COALESCE((l.status = 'failed' AND l.error ~ '^(identity_mismatch|identity_mismatch_or_no_candidate|download_failed|invalid_next_page|invalid_chapter|unsupported_toc_rule|preview_truncated|toc_limit)$')
            OR l.error LIKE '源不可用（search 阶段，已连续 % 次，停止自动重试）：no_candidates', false) AS delkind,
   COALESCE(l.source_revision LIKE 'lastcall-%' OR l.source_revision LIKE 'gc-lastcall-%'
@@ -91,9 +95,10 @@ SQL
 gc_report() {
   { gc_sql; cat <<'SQL'
 SELECT bucket || ' ' || count(*) FROM (
-  SELECT CASE WHEN delkind AND final AND NOT freeok THEN 'delete_' || kind
+  SELECT CASE WHEN delkind AND final AND NOT freeok AND NOT gated THEN 'delete_' || kind
               WHEN NOT had_last THEN 'lastcall_' || kind
               WHEN freeok THEN 'held_freeok'
+              WHEN gated THEN 'held_gated'
               ELSE 'held_' || kind END AS bucket FROM gc) s
 GROUP BY bucket ORDER BY bucket;
 SQL
