@@ -77,6 +77,7 @@ class PaywallSkipTest(unittest.TestCase):
         memo = mock.Mock()
         memo.recent.return_value = False
         memo.fetch_backoff.return_value = False
+        memo.resolved_recent.return_value = False
         self.assertEqual(self.resolve(['book.qq.com', 'yunqi.qq.com'], memo), [])
         memo.record.assert_called_once_with('合成书', '甲作者')
         self.assertIn('只有付费墙源', self.out.getvalue())

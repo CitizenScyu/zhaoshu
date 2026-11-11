@@ -176,7 +176,8 @@ class EngineMissMemoTest(unittest.TestCase):
         saves = [node for node in ast.walk(main) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute) and node.func.attr == 'save'
                  and isinstance(node.func.value, ast.Name) and node.func.value.id == 'engine_miss']
-        self.assertEqual(len(saves), 1)
+        # 选书后一次 + resolvedmemo1112 split_queue 后记终态一次
+        self.assertEqual(len(saves), 2)
 
 
 class FetchFailBackoffTest(EngineMissMemoTest):
@@ -257,6 +258,91 @@ class FetchFailBackoffTest(EngineMissMemoTest):
         self.assertFalse(self.memo().fetch_backoff('合成书', '甲作者'))
         labeler._note_fetch_result(None, ('合成书', '甲作者'), None)
         labeler._note_fetch_result(memo, None, None)
+
+
+
+class ResolvedMemoTest(EngineMissMemoTest):
+    """resolvedmemo1112：引擎命中即已打标/钉子户的名单书，有效期内不再发引擎搜索。"""
+
+    def memo(self, ttl=3600, resolved=100):
+        return dl.EngineMissMemo.load(self.path, ttl, clock=self.clock, resolved_ttl_sec=resolved)
+
+    def done_index(self):
+        # 已打标记录按站点书名「合成书」记；名单书名「合成书·卷一」搜索前判不成已打标
+        return {dl._norm_title('合成书'): {'甲作者'}}
+
+    def resolve_done(self, cli, memo):
+        return dl._resolve_candidates([{'title': '合成书·卷一', 'author': '甲作者'}], self.http,
+                                      engine_cli=cli, source_policy=self.policy, engine_miss=memo,
+                                      done_index=self.done_index())
+
+    def site_cli(self):
+        return Cli(author='甲作者', stdout=json.dumps([
+            {'title': '合成书', 'author': '甲作者', 'source': 'synthetic.example',
+             'bookUrl': 'https://synthetic.example/books/1'}]))
+
+    def test_done_hit_recorded_then_skipped_until_ttl(self):
+        memo = self.memo()
+        first = self.site_cli()
+        self.assertEqual(self.resolve_done(first, memo), [])
+        self.assertEqual(len(first.calls), 1)
+        self.assertIn('引擎命中书已打标或本轮已入队，跳过', self.out.getvalue())
+        self.assertTrue(memo.resolved_recent('合成书·卷一', '甲作者'))
+        memo.save()
+        # 下轮：有效期内不搜、不计 miss，摘要带计数
+        self.out.seek(0)
+        self.out.truncate(0)
+        again = self.site_cli()
+        self.assertEqual(self.resolve_done(again, self.memo()), [])
+        self.assertEqual(again.calls, [])
+        self.assertIn('1 本近期命中即已打标/终态，本轮未重搜', self.out.getvalue())
+        self.assertIn('未命中 0 本', self.out.getvalue())
+        # 过期后重搜
+        self.clock.now += 101
+        late = self.site_cli()
+        self.resolve_done(late, self.memo())
+        self.assertEqual(len(late.calls), 1)
+
+    def test_queued_duplicate_not_recorded(self):
+        memo = self.memo()
+        books = [{'title': '合成书·卷一', 'author': '甲作者'}, {'title': '合成书·卷二', 'author': '甲作者'}]
+        cli = self.site_cli()
+        queue = dl._resolve_candidates([dict(b) for b in books], self.http, engine_cli=cli,
+                                       source_policy=self.policy, engine_miss=memo)
+        self.assertEqual(len(queue), 1)
+        self.assertIn('本轮已入队', self.out.getvalue())
+        self.assertEqual(memo.resolved, {})
+
+    def test_disabled_and_persist(self):
+        self.assertEqual(dl.resolve_resolved_ttl({}), dl.RESOLVED_TTL_SEC)
+        self.assertEqual(dl.resolve_resolved_ttl({dl.RESOLVED_TTL_ENV: '0'}), 0)
+        off = self.memo(resolved=0)
+        off.record_resolved('甲', '乙')
+        self.assertFalse(off.resolved_recent('甲', '乙'))
+        self.assertFalse(off.dirty)
+        # 仅 resolved 开（miss/fetch_fail 关）也读写
+        only = dl.EngineMissMemo.load(self.path, 0, clock=self.clock, resolved_ttl_sec=100)
+        only.record_resolved('甲', '乙')
+        only.save()
+        self.assertTrue(dl.EngineMissMemo.load(self.path, 0, clock=self.clock,
+                                               resolved_ttl_sec=100).resolved_recent('甲', '乙'))
+        # 旧记忆文件（无 resolved 键）与坏条目
+        key = dl.EngineMissMemo.key('甲', '乙')
+        self.path.write_text(json.dumps({'version': 1, 'misses': {},
+                                         'resolved': {key: self.clock.now - 1, 'x': 'bad',
+                                                      'old': self.clock.now - 1000}}), encoding='utf-8')
+        self.assertEqual(set(self.memo().resolved), {key})
+        self.path.write_text(json.dumps({'version': 1, 'misses': {}}), encoding='utf-8')
+        self.assertEqual(self.memo().resolved, {})
+
+    def test_main_records_terminal_engine_items_after_split(self):
+        src = Path(__file__).with_name('labeler.py').read_text(encoding='utf-8')
+        i = src.index('queue = queue[:args.limit]')
+        tail = src[i:i + 900]
+        self.assertIn('skipped_done + skipped_pinned', tail)
+        self.assertIn("b.get('engine')", tail)
+        self.assertIn('record_resolved', tail)
+        self.assertIn('resolved_ttl_sec=douban_list.resolve_resolved_ttl(env)', src)
 
 
 if __name__ == '__main__':

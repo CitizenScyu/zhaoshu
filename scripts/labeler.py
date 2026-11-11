@@ -95,7 +95,7 @@ REQUIRED_DOUBAN_LIST_API = (
     'engine_fallback_enabled', 'fetch_content_fingerprint', 'is_placeholder_author',
     'load_done_index', 'resolve_book15_breaker', 'resolve_douban_pages',
     'resolve_engine_miss_ttl', 'resolve_fetch_fail_base', 'resolve_list_deepen_min',
-    'resolve_list_queue_max', 'same_book',
+    'resolve_list_queue_max', 'resolve_resolved_ttl', 'same_book',
     'search_engine', 'title_compatible', 'validate_engine',
 )
 REQUIRED_SOURCE_POLICY_API = (
@@ -4261,7 +4261,8 @@ def main() -> int:
             engine_miss = douban_list.EngineMissMemo.load(
                 data_path(douban_list.ENGINE_MISS_FILENAME),
                 douban_list.resolve_engine_miss_ttl(env),
-                fetch_fail_base_sec=douban_list.resolve_fetch_fail_base(env))
+                fetch_fail_base_sec=douban_list.resolve_fetch_fail_base(env),
+                resolved_ttl_sec=douban_list.resolve_resolved_ttl(env))
             # listdeep1105/plat1105：固定名单打干后队列不足下限 ⇒ 各平台完结书库按游标轮转往后翻
             # （LABELER_LIST_DEEPEN_MIN=0 关闭）；每轮入队上限 LABELER_LIST_QUEUE_MAX（0 不限）
             list_cursor = douban_list.ListCursor.load(data_path(douban_list.LIST_CURSOR_FILENAME))
@@ -4334,6 +4335,14 @@ def main() -> int:
             pinned | _pinned_keys,
             deferred=_deferred_keys)
         queue = queue[:args.limit]
+        # resolvedmemo1112：引擎命中、进队后才被判已完成/钉子户终态的名单书记进 resolved 记忆，
+        # 有效期内下轮不再发引擎全池搜索（键同取文退避 fetch_key：名单书名 + 条目作者）。
+        if engine_miss is not None:
+            for b in skipped_done + skipped_pinned:
+                if b.get('engine'):
+                    engine_miss.record_resolved(b.get('list_title') or b.get('title', ''),
+                                                b.get('author', ''))
+            engine_miss.save()
         # 后移计数：冷却期内被拒、且在切 --limit 后仍真正进入本轮待处理队列的本数。
         # 必须切片**之后**统计——后移的书都在队尾，limit 一截多半先被剔掉，所以「本轮待处理
         # N 本，其中 M 本后移」里的 M 必须与切片后的 N 同口径，否则 M 可能 > N，「其中」不成立。

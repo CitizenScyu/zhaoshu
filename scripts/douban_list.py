@@ -1177,6 +1177,14 @@ ENGINE_MISS_MAX = 20000
 FETCH_FAIL_BASE_SEC = 12 * 3600
 FETCH_FAIL_BASE_ENV = 'LABELER_FETCH_FAIL_BASE_SEC'
 FETCH_FAIL_MAX_SEC = 7 * 86400
+# resolvedmemo1112：引擎命中后判「已打标」（resolvedone1104）或进队后判钉子户终态/已完成的名单书，
+# 同一记忆文件另存 resolved {键: 时刻}，有效期内不再发引擎搜索。2026-11-11 local-server gate.log：
+# 每轮固定 20 本命中后判已打标（十日终焉·不息/三体Ⅲ 等多卷名单书映射到已打标的站点书名）、另 4–7 本
+# 命中进队又被钉子户终态剔除——每轮约 27 次全池搜索（每次约 17s、每次问遍约 800 个源站）零产出，
+# 还占 LIST_SEARCH_BUDGET_FACTOR 的实搜额度。只记已证终态（已打标 / 钉子户 / 已完成），「本轮已入队」
+# 的重复不记（那本这轮未必打标成功）。LABELER_ENGINE_RESOLVED_TTL_SEC=0 关闭（行为同改前）。
+RESOLVED_TTL_SEC = 3 * 86400
+RESOLVED_TTL_ENV = 'LABELER_ENGINE_RESOLVED_TTL_SEC'
 
 
 def _resolve_int_env(env: dict | None, name: str, default: int) -> int:
@@ -1195,6 +1203,11 @@ def resolve_fetch_fail_base(env: dict | None = None) -> int:
     return _resolve_int_env(env, FETCH_FAIL_BASE_ENV, FETCH_FAIL_BASE_SEC)
 
 
+def resolve_resolved_ttl(env: dict | None = None) -> int:
+    """LABELER_ENGINE_RESOLVED_TTL_SEC → 秒；空/非整数 → 默认；<=0 = 关闭。"""
+    return _resolve_int_env(env, RESOLVED_TTL_ENV, RESOLVED_TTL_SEC)
+
+
 def resolve_engine_miss_ttl(env: dict | None = None) -> int:
     """LABELER_ENGINE_MISS_TTL_SEC → 秒；空/非整数 → 默认；<=0 = 关闭。"""
     raw = str((env or {}).get(ENGINE_MISS_TTL_ENV) or '').strip()
@@ -1209,16 +1222,20 @@ def resolve_engine_miss_ttl(env: dict | None = None) -> int:
 
 
 class EngineMissMemo:
-    """引擎干净 miss 的跨轮记忆：{"version":1,"misses":{键: 记录时刻},"fetch_fail":{键: [时刻, 次数]}}。
-    读坏/缺文件 = 空记忆。fetch_fail 见 fetchfail1110（与 misses 各自开关）。"""
+    """引擎干净 miss 的跨轮记忆：{"version":1,"misses":{键: 记录时刻},"fetch_fail":{键: [时刻, 次数]},
+    "resolved":{键: 记录时刻}}。读坏/缺文件 = 空记忆。fetch_fail 见 fetchfail1110、resolved 见
+    resolvedmemo1112（三者各自开关）。"""
 
     def __init__(self, path, ttl_sec: int = ENGINE_MISS_TTL_SEC, misses: dict | None = None,
-                 clock: Callable[[], float] = time.time, fetch_fail_base_sec: int = 0):
+                 clock: Callable[[], float] = time.time, fetch_fail_base_sec: int = 0,
+                 resolved_ttl_sec: int = 0):
         self.path = Path(path)
         self.ttl_sec = ttl_sec
         self.misses: dict[str, float] = dict(misses or {})
         self.fetch_fail_base_sec = fetch_fail_base_sec
         self.fetch_fail: dict[str, list] = {}
+        self.resolved_ttl_sec = resolved_ttl_sec
+        self.resolved: dict[str, float] = {}
         self._clock = clock
         self.dirty = False
 
@@ -1229,9 +1246,10 @@ class EngineMissMemo:
     @classmethod
     def load(cls, path, ttl_sec: int = ENGINE_MISS_TTL_SEC,
              clock: Callable[[], float] = time.time,
-             fetch_fail_base_sec: int = 0) -> 'EngineMissMemo':
-        memo = cls(path, ttl_sec, clock=clock, fetch_fail_base_sec=fetch_fail_base_sec)
-        if ttl_sec <= 0 and fetch_fail_base_sec <= 0:
+             fetch_fail_base_sec: int = 0, resolved_ttl_sec: int = 0) -> 'EngineMissMemo':
+        memo = cls(path, ttl_sec, clock=clock, fetch_fail_base_sec=fetch_fail_base_sec,
+                   resolved_ttl_sec=resolved_ttl_sec)
+        if memo._all_off():
             return memo
         try:
             data = json.loads(Path(path).read_text(encoding='utf-8'))
@@ -1240,11 +1258,13 @@ class EngineMissMemo:
             fails = {str(k): [float(v[0]), int(v[1])] for k, v in (data.get('fetch_fail') or {}).items()
                      if isinstance(v, list) and len(v) == 2
                      and isinstance(v[0], (int, float)) and isinstance(v[1], int) and v[1] > 0}
+            resolved = {str(k): float(v) for k, v in (data.get('resolved') or {}).items()
+                        if isinstance(v, (int, float))}
         except FileNotFoundError:
-            entries, fails = {}, {}
+            entries, fails, resolved = {}, {}, {}
         except (OSError, ValueError, TypeError, AttributeError) as e:
             print(f'  提示: 引擎未命中记忆读取失败（按空处理）: {e}', file=sys.stderr)
-            entries, fails = {}, {}
+            entries, fails, resolved = {}, {}, {}
         now = clock()
         if ttl_sec > 0:
             memo.misses = {k: t for k, t in entries.items() if 0 <= now - t < ttl_sec}
@@ -1255,8 +1275,27 @@ class EngineMissMemo:
             memo.fetch_fail = {k: v for k, v in fails.items() if 0 <= now - v[0] < 2 * FETCH_FAIL_MAX_SEC}
         else:
             memo.fetch_fail = fails
-        memo.dirty = memo.misses != entries or memo.fetch_fail != fails
+        if resolved_ttl_sec > 0:
+            memo.resolved = {k: t for k, t in resolved.items() if 0 <= now - t < resolved_ttl_sec}
+        else:
+            memo.resolved = resolved
+        memo.dirty = memo.misses != entries or memo.fetch_fail != fails or memo.resolved != resolved
         return memo
+
+    def _all_off(self) -> bool:
+        return self.ttl_sec <= 0 and self.fetch_fail_base_sec <= 0 and self.resolved_ttl_sec <= 0
+
+    def resolved_recent(self, title: str, author: str) -> bool:
+        """resolvedmemo1112：有效期内已证引擎命中即终态（已打标/钉子户/已完成）→ True（本轮不搜）。"""
+        if self.resolved_ttl_sec <= 0:
+            return False
+        t = self.resolved.get(self.key(title, author))
+        return t is not None and 0 <= self._clock() - t < self.resolved_ttl_sec
+
+    def record_resolved(self, title: str, author: str) -> None:
+        if self.resolved_ttl_sec > 0 and _norm_title(title):
+            self.resolved[self.key(title, author)] = self._clock()
+            self.dirty = True
 
     def fetch_backoff_sec(self, n: int) -> float:
         return min(self.fetch_fail_base_sec * 2 ** (max(n, 1) - 1), FETCH_FAIL_MAX_SEC)
@@ -1295,17 +1334,19 @@ class EngineMissMemo:
 
     def save(self) -> None:
         """原子写（临时文件 + os.replace）；超上限留最新的。失败只告警。"""
-        if (self.ttl_sec <= 0 and self.fetch_fail_base_sec <= 0) or not self.dirty:
+        if self._all_off() or not self.dirty:
             return
         keep = dict(sorted(self.misses.items(), key=lambda kv: kv[1], reverse=True)[:ENGINE_MISS_MAX])
         fails = dict(sorted(self.fetch_fail.items(), key=lambda kv: kv[1][0],
                             reverse=True)[:ENGINE_MISS_MAX])
+        resolved = dict(sorted(self.resolved.items(), key=lambda kv: kv[1], reverse=True)[:ENGINE_MISS_MAX])
         tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix='.engine-miss-')
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump({'version': 1, 'misses': keep, 'fetch_fail': fails}, f, ensure_ascii=False)
+                json.dump({'version': 1, 'misses': keep, 'fetch_fail': fails, 'resolved': resolved},
+                          f, ensure_ascii=False)
             os.replace(tmp, self.path)
             tmp = None
             self.dirty = False
@@ -2424,6 +2465,7 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
     skipped = 0
     engine_miss_skipped = 0
     fetch_fail_skipped = 0
+    resolved_skipped = 0                    # resolvedmemo1112：近期已证命中即终态，本轮不搜
     book15_hits = 0
     engine_hits = 0
     resolved_done = 0                       # resolvedone1104：引擎命中后判已打标/本轮重复
@@ -2512,6 +2554,13 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
                 time.sleep(SEARCH_DELAY)
             continue
         if (engine_miss is not None and engine_cli is not None and not engine_disabled
+                and engine_miss.resolved_recent(b['title'], list_author)):
+            # resolvedmemo1112：近期引擎命中后已判已打标/钉子户终态，有效期内不再搜（不计 miss）
+            resolved_skipped += 1
+            if not book15_skipped:
+                time.sleep(SEARCH_DELAY)
+            continue
+        if (engine_miss is not None and engine_cli is not None and not engine_disabled
                 and engine_miss.recent(b['title'], list_author)):
             # engmiss1104：TTL 内已干净搜不到 ⇒ 本轮不再发引擎搜索（照常计入 miss 汇总）
             engine_miss_skipped += 1
@@ -2546,10 +2595,13 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
             # （2026-11-04 实测 labels.jsonl 6370 行里 610 行是重复，剑来 58 次）。
             # 命中后按站点书名 + 作者再判一次已打标，并按同口径做本轮内去重（多卷名单同轮并进）。
             hit_author = list_author or engine_hit.get('author') or ''
-            if ((done_index is not None
-                    and is_done_candidate(engine_hit['title'], hit_author, done_index))
-                    or is_done_candidate(engine_hit['title'], hit_author, queued_index)):
+            hit_done = (done_index is not None
+                        and is_done_candidate(engine_hit['title'], hit_author, done_index))
+            if hit_done or is_done_candidate(engine_hit['title'], hit_author, queued_index):
                 resolved_done += 1
+                if hit_done and engine_miss is not None:
+                    # resolvedmemo1112：只记已打标（已证终态）；「本轮已入队」的重复不记
+                    engine_miss.record_resolved(b['title'], list_author)
                 print(f'  引擎命中书已打标或本轮已入队，跳过: 名单《{b.get("title", "")}》'
                       f'→ 候选《{engine_hit["title"]}》')
                 if not book15_skipped:
@@ -2613,6 +2665,8 @@ def _resolve_candidates(candidates: list[dict], http_get, origin: str = '',
         engine_note += f'（{engine_miss_skipped} 本近期已搜无果，本轮未重搜）'
     if fetch_fail_skipped:
         engine_note += f'（{fetch_fail_skipped} 本近期取文源失效，退避中未重搜）'
+    if resolved_skipped:
+        engine_note += f'（{resolved_skipped} 本近期命中即已打标/终态，本轮未重搜）'
     if engine_stats.get('http_only'):
         engine_note += f'（跳过非 HTTPS 源候选 {engine_stats["http_only"]} 条）'
     # 未熔断时本行逐字不变；熔断后补一段「熔断跳过 book15 搜索 N 本」。
