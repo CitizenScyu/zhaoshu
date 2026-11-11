@@ -3089,7 +3089,10 @@ LIST_DEEPEN_ENV = 'LABELER_LIST_DEEPEN_MIN'   # 队列下限；0 关闭加深
 # deep1110：10→30、每轮 4→6 页。2026-11-08～10 local-server：固定名单每轮 40–52 本入队、其中 35+ 本是
 # 每轮重复的取文失败，队列从没低于 10 ⇒ 加深一次都没触发（labels-list-cursor.json 不存在），每轮成功 3–12 本。
 # fetchfail1110 把重复失败的书退避出队后，靠加深从多平台完结书库补新书。
-LIST_DEEPEN_MIN = 30
+# deep1112：30→60。2026-11-12 固定名单已近搜尽（1356/1618 已打标，其余多在无果/退避记忆里），round 59 名单线
+# 只命中 7 本，加深 1 页（飞卢）命中 28/29；round 58 塔读 1 页 18/20。加深页命中率远高于名单线，
+# 每轮多翻 1–2 页把选书固定开销（拉名单 + 扫名单约 10 分钟）摊到更多本上；页数上限仍是 LIST_DEEPEN_MAX_PAGES。
+LIST_DEEPEN_MIN = 60
 LIST_DEEPEN_MAX_PAGES = 6                     # 每轮最多翻页数（每页 15 本）
 LIST_DEEPEN_PAGE_DELAY = 1.0
 LIST_DEEPEN_PAGE_CAP = 300                    # 游标超过此页回第 1 页（个别站越界页重复返回末页）
