@@ -123,8 +123,10 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     const first = await insertTask('partial', 1);
     const second = await insertTask('failed', 1);
     const current = await insertTask('pending', 1);
-    const other = await insertTask('done', 2);
-    const fresh = await insertTask('pending', 3);
+    const book = async (title: string) =>
+      Number(((await pg.query(`INSERT INTO labeled_books(title, author, source_url) VALUES ($1, '合成作者', '') RETURNING id`, [title])).rows[0] as { id: number }).id);
+    const other = await insertTask('done', await book('合成另一书'));
+    const fresh = await insertTask('pending', await book('合成新书'));
     await pg.query('UPDATE download_tasks SET chapters_total = 500, chapters_done = 120 WHERE id = $1', [first]);
     await pg.query('UPDATE download_tasks SET chapters_total = 40, chapters_done = 40 WHERE id = $1', [second]);
     await pg.query('UPDATE download_tasks SET chapters_total = 999, chapters_done = 999 WHERE id = $1', [other]);

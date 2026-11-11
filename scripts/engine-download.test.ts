@@ -837,11 +837,9 @@ describe('tocshape1107 目录形态闸门', () => {
     expect(tocBelowFloor(1, 29)).toBe(false);
     expect(tocBelowFloor(20, 30)).toBe(true);
     for (const floor of [undefined, null, '100', 100.5, NaN, Infinity, -100, 0]) expect(tocBelowFloor(1, floor)).toBe(false);
-    expect(tocFloor({})).toBe(false);
-    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: '0' })).toBe(false);
-    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: 'yes' })).toBe(false);
-    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: ' On ' })).toBe(true);
-    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: '1' })).toBe(true);
+    expect(tocFloor()).toBe(false);
+    for (const raw of ['0', 'yes', '']) { vi.stubEnv('DOWNLOAD_TOC_FLOOR', raw); expect(tocFloor()).toBe(false); }
+    for (const raw of [' On ', 'true', '1']) { vi.stubEnv('DOWNLOAD_TOC_FLOOR', raw); expect(tocFloor()).toBe(true); }
   });
   it('tocfloor1111 整本：开且目录 12 章 < 下限 100 的七成 ⇒ toc_incomplete、零正文请求', async () => {
     vi.stubEnv('DOWNLOAD_TOC_FLOOR', '1');
