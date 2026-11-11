@@ -58,6 +58,12 @@ export function scanConcurrency(env: Record<string, string | undefined> = proces
   return /^\d+$/.test(raw) ? Math.min(8, Math.max(1, Number(raw))) : 1;
 }
 
+/** zeromin1111：DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS = 零产出判定的失败书数门槛（见 zeroYieldHosts minBooks）。缺省/非法 = 5，夹到 2..1000。 */
+export function zeroYieldMinBooks(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS?.trim() ?? '';
+  return /^\d+$/.test(raw) ? Math.min(1000, Math.max(2, Number(raw))) : 5;
+}
+
 export function createHostPriority(
   sql: CandidateSql,
   env: Record<string, string | undefined> = process.env,
@@ -66,13 +72,14 @@ export function createHostPriority(
   const productive = productiveFirstEnabled(env);
   const demote = demoteZeroYieldEnabled(env);
   if (!productive && !demote) return undefined;
+  const minBooks = zeroYieldMinBooks(env);
   let memo: { at: number; value: ReadonlyMap<string, number> } | null = null;
   return async () => {
     if (memo && now() - memo.at < HOST_PRIORITY_TTL_MS) return memo.value;
     try {
       const [scores, zero] = await Promise.all([
         productive ? productiveHostScores(sql) : new Map<string, number>(),
-        demote ? zeroYieldHosts(sql) : new Map<string, number>(),
+        demote ? zeroYieldHosts(sql, 30, minBooks) : new Map<string, number>(),
       ]);
       const value = new Map(scores);
       for (const host of zero.keys()) if (!value.has(host)) value.set(host, -1);

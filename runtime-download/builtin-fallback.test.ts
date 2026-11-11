@@ -400,6 +400,19 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls).toEqual(['book15.net', 'a.example']);
   });
 
+  it('tocfloor1111：回退腿换源时任务行的 chapter_floor 原样带给引擎腿', async () => {
+    const h = harness({ pool: ['https://a.example/'] });
+    const floors: unknown[] = [];
+    const engine: SourceAdapter = {
+      kind: 'engine',
+      async download(t) { floors.push([hostOf(t.source_url), t.chapter_floor]); return { kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1 }; },
+    };
+    const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': { kind: 'failure', code: 'toc_incomplete' } }, []), engine)
+      .download(task({ chapter_floor: 1200 }), context());
+    expect(out.kind).toBe('complete');
+    expect(floors).toEqual([['a.example', 1200]]);
+  });
+
   it('tocshape1107：引擎腿 toc_disordered ⇒ 标 temporary 失败记忆并换下一候选源', async () => {
     const state = {
       usable: [

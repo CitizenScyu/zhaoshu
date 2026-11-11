@@ -48,6 +48,8 @@ export interface TaskRow {
   requested_by: 'user' | 'system';
   /** rotate1030：第几次尝试（DEFAULT 1，defer +1）。只给选源窗口轮转用；旧调用方/桩可不带。 */
   attempt_count?: number;
+  /** tocfloor1111：同一本书历次任务实际抓到过的最大章数（见 engine-download tocBelowFloor）；旧调用方/桩可不带。 */
+  chapter_floor?: number | null;
 }
 
 export type AdapterOutcome =
@@ -848,6 +850,7 @@ export function createEngineAdapter(options: EngineAdapterOptions): SourceAdapte
           'rate-ms': options.rateMs ?? 800,
           'timeout-ms': options.timeoutMs ?? 30000,
           'budget-ms': options.budgetMs ?? 19800000,
+          ...(typeof task.chapter_floor === 'number' ? { 'chapter-floor': task.chapter_floor } : {}),
         }, options.resolveSource, options.transport, {
           signal: context.signal,
           onProgress: update => context.progress(update),

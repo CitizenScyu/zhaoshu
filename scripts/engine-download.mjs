@@ -238,12 +238,14 @@ export function gapEligible(missing, total) {
 }
 
 // tocshape1107：目录形态闸门，抓正文前按章名编号（「第 N 章/节/回」，阿拉伯/全角/中文数字）判源站目录缺陷，
-// 按源级失败换源（零正文请求）。编号章 ≥ 10 且占目录 ≥ 60%、重复编号 < 5%（分卷重新编号的书不判）时：
-// - toc_disordered：相邻编号下降 > 30%（倒序），或最长非降子序列 < 80%（轮转/乱序）；
-// - toc_incomplete：最小编号 > 20 且章数 < 最大编号的一半（只剩尾段）。
+// 按源级失败换源（零正文请求）。编号章占目录 ≥ 60%、重复编号 < 5%（分卷重新编号的书不判）时：
+// - toc_disordered（编号章 ≥ 10）：相邻编号下降 > 30%（倒序），或最长非降子序列 < 80%（轮转/乱序）；
+// - toc_incomplete（编号章 ≥ 3）：最小编号 > 20 且章数 < 最大编号的一半（只剩尾段）。
 // 动机（2026-11-07 phoenix 只读，30 天 22882 份 manifest）：m.bqg9 目录只给最新 40 章且倒序，183 本被当整本发布 done；
 // 判据在 bqg9 命中 264/253/237 本，其余站只命中真实缺陷目录（itxtbook 轮转 3、ixdzs8 只剩尾段 1 等）。
 // DOWNLOAD_TOC_SHAPE=0 关（缺省开）。
+// smalltoc1111：toc_incomplete 的编号章下限放到 3（倒序/轮转仍要 ≥ 10）。动机（2026-11-11 phoenix 只读）：
+// m.biquge5200.cc 目录只给最新 5 章，57 本被当整本发布 done，原 ≥ 10 的门槛拦不到。
 const TOC_SHAPE_NUMBER = /第\s*([0-9０-９]+|[零〇一二两三四五六七八九十百千万]+)\s*[章节回]/;
 const CN_DIGIT = new Map([['零', 0], ['〇', 0], ['一', 1], ['二', 2], ['两', 2], ['三', 3], ['四', 4], ['五', 5], ['六', 6], ['七', 7], ['八', 8], ['九', 9]]);
 const CN_UNIT = new Map([['十', 10], ['百', 100], ['千', 1000]]);
@@ -265,7 +267,7 @@ export function chapterNumberOf(title) {
 }
 export function tocShapeError(titles) {
   const nums = titles.map(chapterNumberOf).filter(n => n !== null);
-  if (nums.length < 10 || nums.length < titles.length * 0.6) return null;
+  if (nums.length < 3 || nums.length < titles.length * 0.6) return null;
   if (1 - new Set(nums).size / nums.length >= 0.05) return null;
   let descents = 0, min = Infinity, max = -Infinity;
   const tails = []; // 最长非降子序列（耐心排序，取第一个 > x 的位置）
@@ -277,9 +279,24 @@ export function tocShapeError(titles) {
     while (lo < hi) { const mid = (lo + hi) >> 1; if (tails[mid] <= x) lo = mid + 1; else hi = mid; }
     tails[lo] = x;
   });
-  if (descents / (nums.length - 1) > 0.3 || tails.length / nums.length < 0.8) return 'toc_disordered';
+  if (nums.length >= 10 && (descents / (nums.length - 1) > 0.3 || tails.length / nums.length < 0.8)) return 'toc_disordered';
   if (min > 20 && titles.length < max * 0.5) return 'toc_incomplete';
   return null;
+}
+
+// tocfloor1111：章数下限闸门。任务层把同一本书历次任务实际抓到过的最大章数作 args['chapter-floor'] 传入；
+// 目录章数 < 下限 × 0.7 ⇒ toc_incomplete，按源级失败换源（零正文请求）。下限 < 30 或不是整数不判。
+// 动机（2026-11-11 phoenix 只读）：164 本 done 的章数不到同书另一任务已抓章数的七成；抽查已发布清单 163 本，
+// 121 本自身编号连续到末章而官方目录超其 1.3 倍——源站目录只到中途，被当整本发布。
+// DOWNLOAD_TOC_FLOOR 缺省关；1/true/on 开。
+const TOC_FLOOR_RATIO = 0.7;
+const TOC_FLOOR_MIN = 30;
+export function tocFloor(env = process.env) {
+  const raw = env.DOWNLOAD_TOC_FLOOR?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+export function tocBelowFloor(count, floor) {
+  return Number.isSafeInteger(floor) && floor >= TOC_FLOOR_MIN && count < floor * TOC_FLOOR_RATIO;
 }
 
 // chaperr1031：DOWNLOAD_CHAPTER_ERROR_KIND=1 时，白名单外的逐章失败（chapter.error='chapter_failed'）另记 chapter.error_kind =
@@ -610,6 +627,7 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
     if (chapters.length > args['max-chapters']) throw new Error('max_chapters');
     const shapeError = tocShape() ? tocShapeError(manifest.chapters.map(c => c.title)) : null;
     if (shapeError) throw new Error(shapeError);
+    if (tocFloor() && tocBelowFloor(chapters.length, args['chapter-floor'])) throw new Error('toc_incomplete');
     const resume = previous?.sourceRevision === manifest.sourceRevision && previous?.tocHash === manifest.tocHash && previous?.bookUrl === manifest.bookUrl;
     const sameBook = chapterResume() && previous?.sourceRevision === manifest.sourceRevision && previous?.bookUrl === manifest.bookUrl;
     stage = 'content';

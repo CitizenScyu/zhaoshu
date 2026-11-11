@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf, tailProbe } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocBelowFloor, tocFloor, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf, tailProbe } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -811,6 +811,64 @@ describe('tocshape1107 目录形态闸门', () => {
     expect(r.manifest.status).toBe('done');
     expect(reads).toHaveLength(40);
   }, 60_000);
+
+  // smalltoc1111：只给最新几章的目录（m.biquge5200.cc 恒 5 章）编号章不足 10，原门槛拦不到。
+  it('smalltoc1111：3–9 个编号章只剩尾段 ⇒ toc_incomplete（升序/倒序同判）；从头起的短目录、不足 3 个不判', () => {
+    expect(tocShapeError(titles(range(1201, 1205)))).toBe('toc_incomplete');
+    expect(tocShapeError(titles(range(1205, 1201)))).toBe('toc_incomplete');
+    expect(tocShapeError(titles([300, 301, 302]))).toBe('toc_incomplete');
+    expect(tocShapeError(titles(range(1, 5)))).toBeNull();
+    expect(tocShapeError(titles(range(5, 1)))).toBeNull();
+    expect(tocShapeError(titles([300, 301]))).toBeNull();
+    expect(tocShapeError(titles([300, 301, 301]))).toBeNull(); // 重复编号 ≥ 5%
+    expect(tocShapeError([...titles([300, 301, 302]), '公告', '请假', '感言'])).toBeNull(); // 编号章占比 < 60%
+  });
+  it('smalltoc1111 整本：最新 5 章目录 ⇒ toc_incomplete、零正文请求', async () => {
+    const f = setup(); const reads: string[] = [];
+    const r = await run(f, titles(range(1205, 1201)), reads);
+    expect(r.manifest.errors).toEqual(['toc_incomplete']);
+    expect(reads).toEqual([]);
+  }, 60_000);
+
+  // tocfloor1111：目录章数不到同书已抓最大章数的七成 ⇒ 源站目录只到中途，换源（DOWNLOAD_TOC_FLOOR 缺省关）。
+  it('tocfloor1111 判据：章数 < 下限 × 0.7 才判；下限 < 30 或非整数不判；开关 1/true/on', () => {
+    expect(tocBelowFloor(69, 100)).toBe(true);
+    expect(tocBelowFloor(70, 100)).toBe(false);
+    expect(tocBelowFloor(1, 29)).toBe(false);
+    expect(tocBelowFloor(20, 30)).toBe(true);
+    for (const floor of [undefined, null, '100', 100.5, NaN, Infinity, -100, 0]) expect(tocBelowFloor(1, floor)).toBe(false);
+    expect(tocFloor({})).toBe(false);
+    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: '0' })).toBe(false);
+    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: 'yes' })).toBe(false);
+    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: ' On ' })).toBe(true);
+    expect(tocFloor({ DOWNLOAD_TOC_FLOOR: '1' })).toBe(true);
+  });
+  it('tocfloor1111 整本：开且目录 12 章 < 下限 100 的七成 ⇒ toc_incomplete、零正文请求', async () => {
+    vi.stubEnv('DOWNLOAD_TOC_FLOOR', '1');
+    const f = setup(); const reads: string[] = [];
+    f.options['chapter-floor'] = 100;
+    const r = await run(f, titles(range(1, 12)), reads);
+    expect(r.code).toBe(1);
+    expect(r.manifest.errors).toEqual(['toc_incomplete']);
+    expect(reads).toEqual([]);
+    expect(existsSync(join(dirname(r.manifestPath), 'book.txt'))).toBe(false);
+  }, 60_000);
+  it('tocfloor1111 整本：关（缺省）⇒ 同一目录照旧 done；开但章数够七成 / 没带下限 ⇒ done', async () => {
+    const off = setup(); const offReads: string[] = [];
+    off.options['chapter-floor'] = 100;
+    const a = await run(off, titles(range(1, 12)), offReads);
+    expect(a.manifest.status).toBe('done');
+    expect(offReads).toHaveLength(12);
+    vi.stubEnv('DOWNLOAD_TOC_FLOOR', '1');
+    const enough = setup(); const enoughReads: string[] = [];
+    enough.options['chapter-floor'] = 17; // 12 ≥ 17 × 0.7，且 17 < 30 本就不判
+    expect((await run(enough, titles(range(1, 12)), enoughReads)).manifest.status).toBe('done');
+    const ok = setup(); const okReads: string[] = [];
+    ok.options['chapter-floor'] = 40; // 28 ≥ 40 × 0.7
+    expect((await run(ok, titles(range(1, 28)), okReads)).manifest.status).toBe('done');
+    const none = setup(); const noneReads: string[] = [];
+    expect((await run(none, titles(range(1, 12)), noneReads)).manifest.status).toBe('done');
+  }, 120_000);
 });
 
 // previewearly1031：付费墙预览首轮提前收口（DOWNLOAD_PREVIEW_EARLY，缺省关）。

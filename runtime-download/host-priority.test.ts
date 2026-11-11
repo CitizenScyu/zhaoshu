@@ -7,7 +7,7 @@ vi.mock('../src/lib/download-source-candidates', () => ({ productiveHostScores: 
 
 import {
   createHostPriority, dedupeVariantsEnabled, demoteZeroYieldEnabled, HOST_PRIORITY_TTL_MS, productiveFirstEnabled, scanConcurrency, scanRotateEnabled,
-  skipStrictTocEnabled, skipZeroYieldEnabled,
+  skipStrictTocEnabled, skipZeroYieldEnabled, zeroYieldMinBooks,
 } from './host-priority';
 
 const sql = {} as never;
@@ -98,6 +98,20 @@ describe('yield1030 host-priority', () => {
     zero.mockClear();
     expect(await productiveOnly(signal)).toEqual(new Map([['a.example', 2]]));
     expect(zero).not.toHaveBeenCalled();
+  });
+
+  it('zeromin1111：DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS 缺省/非法 = 5，夹到 2..1000，并传给 zeroYieldHosts', async () => {
+    expect(zeroYieldMinBooks({})).toBe(5);
+    for (const raw of ['three', '-3', '2.5', '']) expect(zeroYieldMinBooks({ DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS: raw })).toBe(5);
+    expect(zeroYieldMinBooks({ DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS: ' 3 ' })).toBe(3);
+    expect(zeroYieldMinBooks({ DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS: '0' })).toBe(2);
+    expect(zeroYieldMinBooks({ DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS: '1' })).toBe(2);
+    expect(zeroYieldMinBooks({ DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS: '99999999999999999999999' })).toBe(1000);
+    zero.mockResolvedValue(new Map());
+    await createHostPriority(sql, { DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD: '1' }, () => 0)!(signal);
+    expect(zero).toHaveBeenLastCalledWith(sql, 30, 5);
+    await createHostPriority(sql, { DOWNLOAD_SCAN_DEMOTE_ZERO_YIELD: '1', DOWNLOAD_SCAN_ZERO_YIELD_MIN_BOOKS: '3' }, () => 0)!(signal);
+    expect(zero).toHaveBeenLastCalledWith(sql, 30, 3);
   });
 
   it('zeroyield1102：任一查询失败 ⇒ 空表且不缓存', async () => {

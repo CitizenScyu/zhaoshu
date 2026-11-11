@@ -118,6 +118,21 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     expect(await storage.taskRow(999999)).toBeNull();
   });
 
+  it('tocfloor1111 taskRow.chapter_floor：同书全部任务已抓章数的最大值（不跨书），无进度为 0', async () => {
+    const storage = createWorkerStorage(sql);
+    const first = await insertTask('partial', 1);
+    const second = await insertTask('failed', 1);
+    const current = await insertTask('pending', 1);
+    const other = await insertTask('done', 2);
+    const fresh = await insertTask('pending', 3);
+    await pg.query('UPDATE download_tasks SET chapters_total = 500, chapters_done = 120 WHERE id = $1', [first]);
+    await pg.query('UPDATE download_tasks SET chapters_total = 40, chapters_done = 40 WHERE id = $1', [second]);
+    await pg.query('UPDATE download_tasks SET chapters_total = 999, chapters_done = 999 WHERE id = $1', [other]);
+    expect(await storage.taskRow(current)).toMatchObject({ id: current, book_id: 1, chapter_floor: 120 });
+    expect(await storage.taskRow(other)).toMatchObject({ chapter_floor: 999 });
+    expect(await storage.taskRow(fresh)).toMatchObject({ chapter_floor: 0 });
+  });
+
   const registration = async () => {
     const id = await insertTask();
     const storage = createWorkerStorage(sql);

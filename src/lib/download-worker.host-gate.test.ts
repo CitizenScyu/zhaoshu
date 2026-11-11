@@ -61,6 +61,16 @@ afterEach(() => {
 });
 
 describe('engine adapter 物理 host 占位门拒绝分类', () => {
+  it('tocfloor1111：任务行带 chapter_floor ⇒ 透传 chapter-floor 参数；不带/为 null ⇒ 参数里没有这一项', async () => {
+    const seen: Record<string, unknown>[] = [];
+    const capture = (async (_m: unknown, args: Record<string, unknown>) => { seen.push(args); throw new Error('toc_incomplete'); }) as never as EngineDownloadLike;
+    for (const floor of [1200, 0, null, undefined]) {
+      expect(await adapter(capture).download({ ...task, chapter_floor: floor }, context())).toEqual({ kind: 'failure', code: 'toc_incomplete' });
+    }
+    expect(seen.map(args => args['chapter-floor'])).toEqual([1200, 0, undefined, undefined]);
+    expect(seen.map(args => 'chapter-floor' in args)).toEqual([true, true, false, false]);
+    expect(seen[0]).toMatchObject({ source: task.source_url, 'max-chapters': 20000 });
+  });
   it.each(['HOST_OCCUPIED', 'HOST_OCCUPANCY_UNAVAILABLE'] as const)('%s ⇒ incomplete/source_unavailable + 对应 retryCause', async code => {
     const outcome = await adapter(rejecting(gateError(code))).download(task, context());
     expect(outcome).toEqual({
