@@ -4418,6 +4418,18 @@ def main() -> int:
         with open(data_path('labels-stub.jsonl'), 'a', encoding='utf-8') as f:
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
+    # llmgap1112：LLM_INTERVAL_SEC 按「距上次模型调用结束」计，调用前补足差额。旧写法每本书末尾
+    # 固定睡 30s，与下一本的取文（实测 35–150s）串行叠加——2026-11-12 round 58 共 32 本白等约 16 分钟，
+    # 连没调模型的源失效书也睡。两次模型调用间隔下限不变；书站请求节流不靠这里（取文自带章间隔）。
+    llm_clock: dict = {'last_end': None}
+
+    def pace_llm() -> None:
+        last_end = llm_clock['last_end']
+        if last_end is not None:
+            wait = LLM_INTERVAL_SEC - (time.monotonic() - last_end)
+            if wait > 0:
+                time.sleep(wait)
+
     detail_exit = os.environ.get(DETAIL_EXIT_ENV) == '1'
     llm_streak = 0          # srcfail1105：连续模型链耗尽本数（成功清零，书源失败不清零）
     llm_tripped = False
@@ -4541,11 +4553,15 @@ def main() -> int:
             # --book 的 title 是详情页路径，不作为可核验的站点书名。
             site_title = '' if args.book else (b.get('title') or '').strip()
             llm_meta: dict = {}
-            labels, calls = label_book(
-                text, env['LLM_API_KEY'], models,
-                site_title=site_title, site_author=b.get('author', ''),
-                max_tokens=max_tokens, meta=llm_meta, llm_url=llm_url,
-                **({'system_prompt': SYSTEM_PROMPT + SEGMENTED_PROMPT_SUFFIX} if sampling else {}))
+            pace_llm()
+            try:
+                labels, calls = label_book(
+                    text, env['LLM_API_KEY'], models,
+                    site_title=site_title, site_author=b.get('author', ''),
+                    max_tokens=max_tokens, meta=llm_meta, llm_url=llm_url,
+                    **({'system_prompt': SYSTEM_PROMPT + SEGMENTED_PROMPT_SUFFIX} if sampling else {}))
+            finally:
+                llm_clock['last_end'] = time.monotonic()
             if sampling:
                 # lblseg41：arc 证据只认送入文本里找得到的原文（text 即本次送模文本），不足即降 unknown
                 labels['arc'] = normalize_arc(labels.get('arc'), text)
@@ -4574,7 +4590,6 @@ def main() -> int:
                 write_rejection(rej_path, _attach_identity(reject, b))
                 fail += 1
                 count_failure('书名核验不符')
-                time.sleep(LLM_INTERVAL_SEC)
                 continue
             # 归一后写回：`正常 `/` 含广告注入` 按枚举值处理；缺失/空串 → TEXT_QUALITY_MISSING，下面按异常拒收
             quality = labels['text_quality'] = normalize_text_quality(labels.get('text_quality'))
@@ -4605,7 +4620,6 @@ def main() -> int:
                 write_rejection(rej_path, _attach_identity(reject, b))
                 fail += 1
                 count_failure('内容质量拒收')
-                time.sleep(LLM_INTERVAL_SEC)
                 continue
             # 引擎兜底条目：source 记引擎源 host（如 www.yingsx.com）、url 记引擎源 bookUrl
             # （已是绝对，BOOK15.absolute 对 http 开头原样透传）；book15 条目现状不变。
@@ -4724,7 +4738,6 @@ def main() -> int:
                           f'（余 {len(queue) - i} 本下轮再跑）')
                     llm_tripped = True
                     break
-        time.sleep(LLM_INTERVAL_SEC)
     print(f'\n完成: 成功 {ok} / 失败 {fail} / 残本候选跳过 {stub_skipped}，结果在 labels.jsonl')
     if fail:
         print(format_failure_kinds(fail_kinds))

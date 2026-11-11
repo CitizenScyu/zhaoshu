@@ -32,6 +32,11 @@ import import_one  # noqa: E402
 import labeler  # noqa: E402
 
 
+def _fake_time():
+    """整体替换 labeler.time 的桩：sleep 等全是 no-op，monotonic 给数值（llmgap1112 按它算模型调用间隔）。"""
+    return mock.Mock(monotonic=mock.Mock(return_value=0.0))
+
+
 # ---- 离线守卫 ----
 # 为什么在 TCP 层拦、且为什么继承 BaseException 而不是 Exception：
 #   1) 出网入口远不止 labeler.http_get 一个——fetch_label_model_from_db（NEON /sql）、
@@ -230,7 +235,7 @@ class MainHarness(OfflineGuardMixin, unittest.TestCase):
                 mock.patch.object(labeler, 'label_book',
                                   side_effect=lambda text, key, models, site_title='', **kw:
                                   (labels_for(site_title), 1)), \
-                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(labeler, 'time', _fake_time()), \
                 mock.patch.object(import_one, 'AutoImporter', FakeAutoImporter), \
                 mock.patch.object(sys, 'argv', ['labeler.py'] + argv), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -367,7 +372,7 @@ class TestAutoImportDisabled(MainHarness):
                                   return_value=('正文' * 30000, 60000)), \
                 mock.patch.object(labeler, 'label_book',
                                   return_value=({'title_guess': '单本', 'text_quality': '正常'}, 1)), \
-                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(labeler, 'time', _fake_time()), \
                 mock.patch.object(import_one, 'AutoImporter', FakeAutoImporter), \
                 mock.patch.object(sys, 'argv',
                                   ['labeler.py', '--book', '/books/details9.html', '--no-db-model']), \
@@ -438,7 +443,7 @@ class TestOfflineGuardIsEffective(OfflineGuardMixin, unittest.TestCase):
                                   return_value=('正文' * 30000, 60000)), \
                 mock.patch.object(labeler, 'label_book',
                                   return_value=(labels_for('书甲'), 1)), \
-                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(labeler, 'time', _fake_time()), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             with self.assertRaises(OfflineViolation) as ctx:
@@ -478,7 +483,7 @@ class TestOfflineGuardIsEffective(OfflineGuardMixin, unittest.TestCase):
                                   return_value=('正文' * 30000, 60000)), \
                 mock.patch.object(labeler, 'label_book',
                                   return_value=(labels_for('书甲'), 1)), \
-                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(labeler, 'time', _fake_time()), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = labeler.main()
@@ -570,7 +575,7 @@ class TestWrittenTitleIsSiteTitle(MainHarness):
                                   return_value=('正文' * 30000, 60000)), \
                 mock.patch.object(labeler, 'label_book',
                                   side_effect=self._labels_with_guess('模型猜的另一个名字')), \
-                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(labeler, 'time', _fake_time()), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             self.stub_http({labeler.BOOK15.absolute(b['url']): _detail_page() for b in self.books})
@@ -636,7 +641,7 @@ class TestLabelMetadataFields(MainHarness):
                 mock.patch.object(labeler, 'fetch_book_text',
                                   return_value=('正文' * 30000, 60000)), \
                 mock.patch.object(labeler, 'label_book', side_effect=fake_label), \
-                mock.patch.object(labeler, 'time', mock.Mock()), \
+                mock.patch.object(labeler, 'time', _fake_time()), \
                 mock.patch.object(sys, 'argv', ['labeler.py', '--no-db-model']), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.stub_http({labeler.BOOK15.absolute(b['url']): _detail_page() for b in self.books})
