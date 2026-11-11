@@ -89,7 +89,7 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     expect(await storage.progress(lease, { chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 })).toBe(true);
     expect(await storage.finish(lease, { status: 'done', error: '', progress: { chaptersDone: 90, chaptersTotal: 90, charsTotal: 4000 } })).toBe(true);
     expect(await counts(withProgress)).toMatchObject({ status: 'done', chapters_done: 90, chapters_total: 90, chars_total: 4000 });
-    const without = await insertTask('pending', 2);
+    const without = await insertTask(); // 上一条已 done，同书再排不违反「同书只许一条活跃系统任务」
     const second = (await storage.claim('owner-a'))!;
     expect(await storage.progress(second, { chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 })).toBe(true);
     expect(await storage.finish(second, { status: 'done', error: '' })).toBe(true);
