@@ -181,7 +181,8 @@ for bid in todo:
     try:
         r = download(bid)
     except Exception as e:
-        r = {'status': 'error', 'reason': 'exception: %s' % str(e)[:200]}
+        # WebDriver 400 (click intercepted) usually means a dialog covers the UI: keep a screenshot and the page text
+        r = {'status': 'error', 'reason': 'exception: %s' % str(e)[:200], 'ui': snap(bid)}
     r['book_id'] = bid
     if r['status'] == 'done':
         try:

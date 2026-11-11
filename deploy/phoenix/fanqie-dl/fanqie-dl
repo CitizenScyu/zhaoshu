@@ -19,13 +19,17 @@ current_tag() { docker images fanqie-dl --format '{{.Tag}}' | grep -v '<none>' |
 
 update() {
   local info tag url ver
+  # Newest by publish time: the API lists by tag creation, so 2026.11.9-47 sat above the newer 9-342 and we stayed
+  # on the old build; its release-notes dialog then failed every download with WebDriver 400 for two days (11-09..11).
   info=$(curl -fsS -m 30 "https://api.github.com/repos/$REPO/releases?per_page=10" | python3 -c '
 import json,sys
+best=None
 for r in json.load(sys.stdin):
     if r["draft"]: continue
     for a in r["assets"]:
-        if a["name"]=="FanqieNovelDownloader-tauri-linux-arm64.deb":
-            print(r["tag_name"], a["browser_download_url"]); sys.exit()')
+        if a["name"]=="FanqieNovelDownloader-tauri-linux-arm64.deb" and (best is None or r["published_at"]>best[0]):
+            best=(r["published_at"], r["tag_name"], a["browser_download_url"])
+if best: print(best[1], best[2])')
   tag=${info%% *}; url=${info#* }
   [ -n "$tag" ] || { echo "no arm64 release found" >&2; exit 1; }
   ver=$(echo "$tag" | sed -E 's/^unsigned-v//; s/-r[0-9]+$//')
