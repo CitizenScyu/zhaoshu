@@ -400,6 +400,26 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls).toEqual(['book15.net', 'a.example']);
   });
 
+  // rulefail1112：原源规则/页面结构缺陷同源重试不变（2026-11-12 m.douyinxs.com 14 本 invalid_next_page 首试即终态）。
+  it.each(['invalid_next_page', 'invalid_chapter', 'empty_content_page', 'pagination_cycle', 'unsupported_toc_rule'])('rulefail1112：原源 failure %s ⇒ 改走引擎回退并成功', async code => {
+    const h = harness({ pool: ['https://a.example/'] });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': { kind: 'failure', code } }, calls), adapter({ 'a.example': {
+      kind: 'complete', txt: 'x', chaptersTotal: 1, chaptersDone: 1, charsTotal: 1,
+    } }, calls)).download(task(), context());
+    expect(out.kind).toBe('complete');
+    expect(calls).toEqual(['book15.net', 'a.example']);
+  });
+
+  it.each(['max_chapters', 'size_limit', 'toc_limit'])('rulefail1112：原源 failure %s（书本身体量上限）⇒ 原样收口，不换源', async code => {
+    const h = harness({ pool: ['https://a.example/'] });
+    const calls: string[] = [];
+    const out = await h.fallback.wrapAdapter(adapter({ 'book15.net': { kind: 'failure', code } }, calls), adapter({}, calls))
+      .download(task(), context());
+    expect(out).toEqual({ kind: 'failure', code });
+    expect(calls).toEqual(['book15.net']);
+  });
+
   it('tocfloor1111：回退腿换源时任务行的 chapter_floor 原样带给引擎腿', async () => {
     const h = harness({ pool: ['https://a.example/'] });
     const floors: unknown[] = [];

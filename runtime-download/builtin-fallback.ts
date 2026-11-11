@@ -160,6 +160,18 @@ const isTocDefect = (outcome: AdapterOutcome) =>
   && (outcome.code === 'toc_disordered' || outcome.code === 'toc_incomplete' || outcome.code === 'toc_below_floor');
 
 /**
+ * rulefail1112：原源规则/页面结构缺陷（engine-download 的 strict 判据：下一页链接过不了 host 门、章节链接非法、
+ * 空目录/空正文页、分页成环或超限、规则写法不受支持）同源重试结果不变，同样换源。
+ * 2026-11-12 phoenix 只读：近 7 天 m.douyinxs.com 14 本 attempt 1 即 invalid_next_page 终态、一个别的源都没试过，
+ * 无一后来完成。书本身的体量上限（toc_limit / max_chapters / size_limit）换源也一样超，不在此列。
+ */
+const RULE_DEFECT_CODES: ReadonlySet<string> = new Set([
+  'invalid_next_page', 'invalid_chapter', 'empty_toc', 'empty_toc_page', 'empty_content', 'empty_content_page',
+  'pagination_cycle', 'content_page_limit', 'unsupported_toc_rule', 'unsupported_content_rule',
+]);
+const isRuleDefect = (outcome: AdapterOutcome) => outcome.kind === 'failure' && RULE_DEFECT_CODES.has(outcome.code);
+
+/**
  * resolvemiss1104：原源 host 不在下载池（resolveSource code=1 no_engine_source_for_host，零出网）。
  * 打标池比下载池宽——2026-11-04 shudugu 等 74 本 attempt 1 即 download_failed 终态、从没试过别的源。
  * 与身份缺失同样走引擎回退；选不到/候选全失败仍按原 failure 收口（终态语义不变）。
@@ -395,7 +407,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
      * - kind='failure' 或源级 incomplete（source_unavailable / missing_chapters / toc_changed /
      *   operation_timeout / preview_truncated）⇒ 标失败记忆（identity ⇒ permanent，其余 temporary）
      *   后换下一个源；白名单外的未知 incomplete 不标失败、不换源；未知异常按原语义上抛。
-     *   builtin 原源 preview_truncated / 目录形态缺陷同样触发回退（见 isPreviewTruncated / isTocDefect）。
+     *   builtin 原源 preview_truncated / 目录形态缺陷 / 规则结构缺陷同样触发回退（见 isPreviewTruncated / isTocDefect / isRuleDefect）。
      * 全部候选失败回 book15 的 source_unavailable 退避语义（不落 failed）。
      */
     wrapAdapter(builtin: SourceAdapter, engine: SourceAdapter, kind: SourceAdapter['kind'] = 'builtin'): SourceAdapter {
@@ -438,7 +450,7 @@ export function createBuiltinFallback(options: BuiltinFallbackOptions) {
               // preview_truncated（原源是付费墙预览）：不 return primary——同源重试无意义，改走引擎回退换免费源。
               // resolvemiss1104：原源 host 不在下载池同样回退（见 isUnresolvedHost）。
               if (!isSourceUnavailable(primary) && !isIdentityMiss(primary) && !isPreviewTruncated(primary)
-                && !isTocDefect(primary) && !isUnresolvedHost(primary)) return primary;
+                && !isTocDefect(primary) && !isRuleDefect(primary) && !isUnresolvedHost(primary)) return primary;
               // 930 确认点 2：原源被物理门拒绝（host_occupied / host_occupancy_unavailable）按原
               // 可重试分类收口，不触发扫池——“host 正被占用”对选新源的出网请求同样生效。
               if (primary.kind === 'incomplete' && primary.retryCause) return primary;
