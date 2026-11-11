@@ -45,6 +45,13 @@ IDLE_SLEEP = 3600
 EXIT_SOURCE_ONLY = 7
 EXIT_PARTIAL = 8
 DETAIL_EXIT_ENV = 'LABELER_EXIT_DETAIL'
+# roundgap1112：一轮跑完（0/8）后的间隔。旧逻辑固定睡 PROBE_INTERVAL（10 分钟），而 labeler
+# 是全链路瓶颈（2026-11-12 实测：下载 worker 多数时间空等新书，每轮都白等这 10 分钟）。
+# 长轮（≥ SHORT_ROUND_SECS）只歇 ROUND_GAP；短轮仍按旧节奏睡 PROBE_INTERVAL，防「很快跑完→立刻
+# 再跑」的紧循环反复刷选源搜索。
+ROUND_GAP = 60
+SHORT_ROUND_SECS = 600
+_last_round_secs = 0.0       # launch_labeler 记录的上一轮用时（秒），供 standby_after 判长短轮
 # 探测链要不要带上数据库 app_settings.label_model（链首）？labeler 启动时走
 # `resolve_models(env, use_db=not args.no_db_model)`，而 LABELER_CMD 未带 `--no-db-model`，
 # 所以 labeler 实际 use_db=True。门卫探测必须用同一条链，否则「探测的就是要跑的」不成立
@@ -181,7 +188,9 @@ def launch_labeler() -> int:
     # opt-in 空队列退出码（见 labeler.EXIT_IDLE）；旧 labeler 不认这个变量，照旧返回 0。
     r = subprocess.run(LABELER_CMD, cwd=str(DIR),
                        env={**os.environ, IDLE_EXIT_ENV: '1', DETAIL_EXIT_ENV: '1'})
-    mins = (time.time() - t0) / 60
+    global _last_round_secs
+    _last_round_secs = time.time() - t0
+    mins = _last_round_secs / 60
     print(f'labeler 退出: code={r.returncode} 用时 {mins:.0f} 分钟', flush=True)
     return r.returncode
 
@@ -201,7 +210,8 @@ def standby_after(code: int) -> tuple[int, str] | None:
         return IDLE_SLEEP, '书源失败'
     if code in (0, EXIT_PARTIAL):
         print('一轮跑完（本轮已证渠道可用），下一轮不探测', flush=True)
-        return PROBE_INTERVAL, '一轮跑完'
+        gap = ROUND_GAP if _last_round_secs >= SHORT_ROUND_SECS else PROBE_INTERVAL
+        return gap, '一轮跑完'
     return None
 
 

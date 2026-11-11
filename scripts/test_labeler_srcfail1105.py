@@ -95,9 +95,14 @@ class LabelerDetailExitTest(MainHarness):
 
 
 class GatekeeperDetailTest(unittest.TestCase):
-    def _main(self, codes):
-        """codes 依次作 labeler 退出码；用完即停。返回 (事件序列 probe / sleep:N / run, 子进程环境列表)。"""
+    def _main(self, codes, round_secs=0.0):
+        """codes 依次作 labeler 退出码；用完即停。返回 (事件序列 probe / sleep:N / run, 子进程环境列表)。
+        round_secs：每轮 labeler 的假用时（roundgap1112 按长短轮决定跑完后的间隔）。"""
         events, envs = [], []
+        clock = [0.0]
+
+        def fake_time():
+            return clock[0]
         queue = list(codes)
 
         class _Stop(Exception):
@@ -108,6 +113,7 @@ class GatekeeperDetailTest(unittest.TestCase):
                 raise _Stop
             events.append('run')
             envs.append(kw.get('env') or {})
+            clock[0] += round_secs
             return SimpleNamespace(returncode=queue.pop(0))
 
         def fake_probe(api_key, models, llm_url):
@@ -118,6 +124,7 @@ class GatekeeperDetailTest(unittest.TestCase):
                                return_value={'LLM_API_KEY': 'k', 'LLM_MODELS': 'm-1'}), \
              mock.patch.object(gatekeeper, 'probe', side_effect=fake_probe), \
              mock.patch.object(gatekeeper.subprocess, 'run', side_effect=fake_run), \
+             mock.patch.object(gatekeeper.time, 'time', side_effect=fake_time), \
              mock.patch.object(gatekeeper.time, 'sleep', lambda s: events.append(f'sleep:{s}')):
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(_Stop):
@@ -151,6 +158,20 @@ class GatekeeperDetailTest(unittest.TestCase):
         _, envs = self._main([0])
         self.assertEqual(envs[0].get(gatekeeper.DETAIL_EXIT_ENV), '1')
         self.assertEqual(envs[0].get(gatekeeper.IDLE_EXIT_ENV), '1')
+
+    def test_long_round_only_takes_short_gap(self):
+        # roundgap1112：长轮跑完只歇 ROUND_GAP；书源失败/空队列的长待机不受影响
+        long = gatekeeper.SHORT_ROUND_SECS
+        events, _ = self._main([0, gatekeeper.EXIT_PARTIAL, gatekeeper.EXIT_SOURCE_ONLY], round_secs=long)
+        gap = f'sleep:{gatekeeper.ROUND_GAP}'
+        self.assertEqual(events, self.window() + ['run', gap, 'run', gap, 'run',
+                                                  f'sleep:{gatekeeper.IDLE_SLEEP}'])
+
+    def test_short_round_keeps_old_pacing(self):
+        events, _ = self._main([0, 0], round_secs=gatekeeper.SHORT_ROUND_SECS - 1)
+        nap = f'sleep:{gatekeeper.PROBE_INTERVAL}'
+        self.assertEqual(events, self.window() + ['run', nap, 'run', nap])
+        self.assertLess(gatekeeper.ROUND_GAP, gatekeeper.PROBE_INTERVAL)
 
     def test_literals_match_labeler(self):
         self.assertEqual(gatekeeper.EXIT_SOURCE_ONLY, labeler.EXIT_SOURCE_ONLY)
