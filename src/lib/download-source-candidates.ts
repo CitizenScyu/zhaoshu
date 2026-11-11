@@ -193,14 +193,18 @@ export async function releaseSourcePrefetch(sql: CandidateSql, bookId: number, o
  * 只认 done（真出过书），不认选源命中：命中但下载恒败的 host（invalid_chapter / pagination_cycle 型）
  * 提前只会更早占掉早停槽位。host 取自任务 source_url，外加候选成功标记（yieldattr1105：回退成功的
  * 任务 source_url 仍是原始 builtin 源，实际下载源只在候选标记里）。
+ * creditfix1112：该书已有候选成功标记的 done 任务不再记给任务 source_url——书是回退站下的，原始源没出力；
+ * 否则原源站靠别站的成书长期顶着「有产出」：11-12 实测 30 天优先分 book.qq.com 1212（实为 243）、
+ * yunqi.qq.com 962（81）、jjwxc 140（0）、book15 283（10）；零产出判定也因此漏了 xxsy/hongxiu/washai。
  */
 export async function productiveHostScores(sql: CandidateSql, windowDays = 30): Promise<Map<string, number>> {
   if (!Number.isSafeInteger(windowDays) || windowDays <= 0) throw new Error('windowDays is invalid');
   const rows = await sql`
     SELECT host, sum(n)::int AS n FROM (
-      SELECT lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')) AS host, count(*)::int AS n
-      FROM download_tasks
-      WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day')
+      SELECT lower(substring(t.source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')) AS host, count(*)::int AS n
+      FROM download_tasks t
+      WHERE t.status = 'done' AND t.updated_at > now() - (${windowDays}::int * interval '1 day')
+        AND NOT EXISTS (SELECT 1 FROM download_source_candidates m WHERE m.book_id = t.book_id AND m.failure = '' AND m.failure_reason = ${CANDIDATE_DONE_REASON})
       GROUP BY 1
       UNION ALL
       SELECT lower(host), count(*)::int
@@ -220,16 +224,17 @@ export async function productiveHostScores(sql: CandidateSql, windowDays = 30): 
  * host 取候选表 host 列（= 选源池源 URL 的 host，与 selector 的 hostOf(source.url) 同键）。
  * 物理 host 门让出（占用/熔断）不 markFailure，所以这里不会把「忙」算成「没产出」。
  * yieldattr1105：done 同时认候选成功标记（回退站实收），否则回退真出书的站会因任务 source_url
- * 记的是原始 builtin 源而被误判零产出。
+ * 记的是原始 builtin 源而被误判零产出。creditfix1112：反过来，有候选成功标记的书其 done 任务不记给 source_url 站（见 productiveHostScores）。
  */
 export async function zeroYieldHosts(sql: CandidateSql, windowDays = 30, minBooks = 5): Promise<Map<string, number>> {
   if (!Number.isSafeInteger(windowDays) || windowDays <= 0) throw new Error('windowDays is invalid');
   if (!Number.isSafeInteger(minBooks) || minBooks <= 0) throw new Error('minBooks is invalid');
   const rows = await sql`
     WITH done AS (
-      SELECT DISTINCT regexp_replace(lower(substring(source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')), '^((www|m)\\.)+', '') AS station
-      FROM download_tasks
-      WHERE status = 'done' AND updated_at > now() - (${windowDays}::int * interval '1 day')
+      SELECT DISTINCT regexp_replace(lower(substring(t.source_url from '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#:@]+)')), '^((www|m)\\.)+', '') AS station
+      FROM download_tasks t
+      WHERE t.status = 'done' AND t.updated_at > now() - (${windowDays}::int * interval '1 day')
+        AND NOT EXISTS (SELECT 1 FROM download_source_candidates m WHERE m.book_id = t.book_id AND m.failure = '' AND m.failure_reason = ${CANDIDATE_DONE_REASON})
       UNION
       SELECT regexp_replace(lower(host), '^((www|m)\\.)+', '')
       FROM download_source_candidates

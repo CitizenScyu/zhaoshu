@@ -261,9 +261,30 @@ maybe('bsrcfix-41：候选源持久化与跨实例占位（0005 三表）', () =
       WHERE book_id = 4 AND source_url = 'https://www.f.example/b4'`)).rows).toEqual([{ failure: '', failure_reason: 'done', position: 0 }]);
     // old.example 的成功标记已过窗 ⇒ 仍降级。
     expect(await zeroYieldHosts(sql(), 30, 3)).toEqual(new Map([['old.example', 3]]));
+    // creditfix1112：书 5 已有回退成功标记 ⇒ done 任务不再记给原始 builtin.example。
     expect(await productiveHostScores(sql())).toEqual(new Map([
-      ['builtin.example', 1], ['m.f.example', 1], ['www.f.example', 1]]));
+      ['m.f.example', 1], ['www.f.example', 1]]));
     // 成功行 failure='' ⇒ usable 照常可见（重排时可直接复用该源）。
     expect((await usableSourceCandidates(sql(), 5)).map(row => row.source_url)).toEqual(['https://m.f.example/b5']);
+  });
+
+  it('creditfix1112：有候选成功标记的书，done 任务不再记给原始 source_url 站（优先分/零产出同口径）', async () => {
+    await pg.exec(`
+      INSERT INTO labeled_books (title, author) SELECT 'b' || g, '' FROM generate_series(2, 4) g;
+      INSERT INTO download_source_candidates (book_id, source_url, host, failure, updated_at) VALUES
+        (1, 'https://www.orig.example/s', 'www.orig.example', 'temporary', now()),
+        (2, 'https://www.orig.example/s', 'www.orig.example', 'temporary', now()),
+        (3, 'https://www.orig.example/s', 'www.orig.example', 'temporary', now());
+      INSERT INTO download_tasks (user_id, book_id, title, status, source_url, updated_at) VALUES
+        (1, 4, 't', 'done', 'https://www.orig.example/book/4', now()),
+        (1, 1, 't', 'done', 'https://plain.example/book/1', now());
+    `);
+    // 书 4 由回退站下完前：done 记给原始源站 ⇒ 有优先分、不算零产出。
+    expect(await productiveHostScores(sql())).toEqual(new Map([['www.orig.example', 1], ['plain.example', 1]]));
+    expect(await zeroYieldHosts(sql(), 30, 3)).toEqual(new Map());
+    await markCandidateDone(sql(), 4, 'https://m.fb.example/b4');
+    // 标记后实收归回退站：原始源站失分并落入零产出；无标记的书 1 照旧记给 plain。
+    expect(await productiveHostScores(sql())).toEqual(new Map([['m.fb.example', 1], ['plain.example', 1]]));
+    expect(await zeroYieldHosts(sql(), 30, 3)).toEqual(new Map([['www.orig.example', 3]]));
   });
 });
