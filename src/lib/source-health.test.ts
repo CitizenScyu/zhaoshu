@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // audit-41 S5-1：cron_health 写/读。写路径必须幂等 upsert，且**写失败不能把 cron 打挂**
@@ -8,9 +9,11 @@ const mocks = vi.hoisted(() => ({ getSql: vi.fn() }));
 vi.mock('@/lib/db', () => ({ getSql: mocks.getSql }));
 
 import {
-  ADMISSION_ALERT_HOURS, CRON_ALERT_HOURS, LEDGER_SYNC_HEALTH_ROW, SHUYUAN_REFRESH_ALERT_HOURS,
-  hoursSince, readAdmissionCheckedAgeHours, readCronSuccessTimes, recordCronSuccess,
+  ADMISSION_ALERT_HOURS, CRON_ALERT_HOURS, DOWNLOAD_DONE_ALERT_HOURS, FANQIE_FAULT_ALERT_HOURS,
+  LEDGER_SYNC_HEALTH_ROW, SHUYUAN_REFRESH_ALERT_HOURS,
+  hoursSince, readAdmissionCheckedAgeHours, readCronSuccessTimes, readDownloadActivity, recordCronSuccess,
 } from './source-health';
+import { FANQIE_FAULT_HEALTH_ROW, FANQIE_FAULT_SINCE_HEALTH_ROW, FANQIE_OK_HEALTH_ROW } from './channel-health';
 
 const NOW = Date.parse('2026-09-23T12:00:00.000Z');
 
@@ -33,6 +36,25 @@ describe('source-health (S5-1)', () => {
     expect(CRON_ALERT_HOURS).toBe(26);
     // 42-admhealth：准入一天两轮（任一成功即刷新），30h = 一轮失败后最坏间隔 24h + 漂移余量。
     expect(ADMISSION_ALERT_HOURS).toBe(30);
+    // fqhealth1111：下载线停摆 / 番茄渠道持续故障都按 6h 判（workflow 里复述同一组数字）。
+    expect(DOWNLOAD_DONE_ALERT_HOURS).toBe(6);
+    expect(FANQIE_FAULT_ALERT_HOURS).toBe(6);
+  });
+
+  // 探针在 workflow env 里复述同一组阈值。此前只靠两边注释「必须一致」，这里钉死（fqhealth1111）。
+  it('探针 workflow 复述的阈值与这里的常数逐个一致', () => {
+    const yml = readFileSync('.github/workflows/source-health.yml', 'utf8');
+    const value = (name: string) => Number(yml.match(new RegExp(`^\\s+${name}: '(\\d+)'`, 'm'))?.[1]);
+    expect({
+      SHUYUAN_REFRESH_ALERT_HOURS: value('SHUYUAN_REFRESH_ALERT_HOURS'),
+      CRON_ALERT_HOURS: value('CRON_ALERT_HOURS'),
+      ADMISSION_ALERT_HOURS: value('ADMISSION_ALERT_HOURS'),
+      DOWNLOAD_DONE_ALERT_HOURS: value('DOWNLOAD_DONE_ALERT_HOURS'),
+      FANQIE_FAULT_ALERT_HOURS: value('FANQIE_FAULT_ALERT_HOURS'),
+    }).toEqual({
+      SHUYUAN_REFRESH_ALERT_HOURS, CRON_ALERT_HOURS, ADMISSION_ALERT_HOURS,
+      DOWNLOAD_DONE_ALERT_HOURS, FANQIE_FAULT_ALERT_HOURS,
+    });
   });
 
   it('recordCronSuccess 幂等 upsert 到 cron_health', async () => {
@@ -61,6 +83,7 @@ describe('source-health (S5-1)', () => {
     expect(await readCronSuccessTimes()).toEqual({
       reclaim: null, drain: '2026-09-23T06:00:00.000Z', admission: null,
       followup: null, ledgerSync: null, dbQuotaSeenAt: null,
+      fanqieOk: null, fanqieFault: null, fanqieFaultSince: null,
     });
     expect(sql).toHaveBeenCalledOnce();
   });
@@ -74,6 +97,7 @@ describe('source-health (S5-1)', () => {
     expect(await readCronSuccessTimes()).toEqual({
       reclaim: '2026-09-23T05:00:00.000Z', drain: null, admission: null,
       followup: null, ledgerSync: null, dbQuotaSeenAt: '2026-09-25T03:43:00.000Z',
+      fanqieOk: null, fanqieFault: null, fanqieFaultSince: null,
     });
     expect(sql).toHaveBeenCalledOnce();
   });
@@ -102,6 +126,7 @@ describe('source-health (S5-1)', () => {
       followup: '2026-10-22T09:00:00.000Z',
       ledgerSync: '2026-10-22T09:37:00.000Z',
       dbQuotaSeenAt: null,
+      fanqieOk: null, fanqieFault: null, fanqieFaultSince: null,
     });
   });
 
@@ -110,6 +135,39 @@ describe('source-health (S5-1)', () => {
     mocks.getSql.mockReturnValue(sql);
     await recordCronSuccess('followup');
     expect(sql.mock.calls[0][1]).toBe('followup');
+  });
+
+  // fqhealth1111：番茄渠道三行同表同查询带回，只进各自字段，不冒充任何 cron 成功心跳。
+  it('readCronSuccessTimes 带回番茄渠道心跳行（不串进 cron 字段）', async () => {
+    const sql = sqlMock(async () => [
+      { name: 'drain', last_success_at: '2026-11-11T06:00:00.000Z' },
+      { name: FANQIE_OK_HEALTH_ROW, last_success_at: '2026-11-09T01:00:00.000Z' },
+      { name: FANQIE_FAULT_HEALTH_ROW, last_success_at: '2026-11-11T05:00:00.000Z' },
+      { name: FANQIE_FAULT_SINCE_HEALTH_ROW, last_success_at: '2026-11-09T02:00:00.000Z' },
+    ]);
+    mocks.getSql.mockReturnValue(sql);
+    expect(await readCronSuccessTimes()).toEqual({
+      reclaim: null, drain: '2026-11-11T06:00:00.000Z', admission: null,
+      followup: null, ledgerSync: null, dbQuotaSeenAt: null,
+      fanqieOk: '2026-11-09T01:00:00.000Z',
+      fanqieFault: '2026-11-11T05:00:00.000Z',
+      fanqieFaultSince: '2026-11-09T02:00:00.000Z',
+    });
+    expect(sql).toHaveBeenCalledOnce();
+  });
+
+  it('readDownloadActivity 一次查询带回最近完成时刻与「有活」任务数；空表归一', async () => {
+    const sql = sqlMock(async () => [{ last_done_at: '2026-11-11T13:00:00.000Z', active_tasks: 31 }]);
+    mocks.getSql.mockReturnValue(sql);
+    expect(await readDownloadActivity()).toEqual({ lastDoneAt: '2026-11-11T13:00:00.000Z', activeTasks: 31 });
+    expect(sql).toHaveBeenCalledOnce();
+    const text = sql.mock.calls[0][0].join('?').replace(/\s+/g, ' ');
+    expect(text).toContain("max(updated_at)::text FROM download_tasks WHERE status = 'done'");
+    // 退避中的 pending 不算「有活」：只数 running 与已到重试时刻的 pending。
+    expect(text).toContain("status = 'running' OR (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= now()))");
+
+    mocks.getSql.mockReturnValue(sqlMock(async () => [{ last_done_at: null, active_tasks: '0' }]));
+    expect(await readDownloadActivity()).toEqual({ lastDoneAt: null, activeTasks: 0 });
   });
 
   it('readAdmissionCheckedAgeHours 取 MAX 并换算成小时；空表为 null', async () => {

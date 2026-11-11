@@ -22,6 +22,10 @@
 #   ADMISSION_ALERT_HOURS      = 30 —— admission 一天两轮（02:00 刷新尾部 / 14:00 独立轮，任一成功
 #                                        即刷新成功行），30h = 一轮整体失败后的最坏间隔 24h + 漂移余量；
 #                                        一轮失败不告警，两轮都失败才告警（42-admhealth）。
+#   DOWNLOAD_DONE_ALERT_HOURS  = 6  —— 下载线：有活（running + 到期 pending）却 6h 没完成一本 = 停摆；
+#                                        队列空着不判（fqhealth1111）。
+#   FANQIE_FAULT_ALERT_HOURS   = 6  —— 番茄渠道：自上次成功以来通道故障持续 ≥6h、期间零成功（熔断每 3h
+#                                        放行一次）。11-09~11 全 400 两天零告警，靠人翻日志才发现（fqhealth1111）。
 # 离线门禁 src/lib/vercel-cron.test.ts 会按 deploy/phoenix 的 OnCalendar 真算间隔比对这几组常数，脱节即红（防漏改）。
 name: Source health probe
 
@@ -56,6 +60,8 @@ jobs:
       SHUYUAN_REFRESH_ALERT_HOURS: '26'
       CRON_ALERT_HOURS: '26'
       ADMISSION_ALERT_HOURS: '30'
+      DOWNLOAD_DONE_ALERT_HOURS: '6'
+      FANQIE_FAULT_ALERT_HOURS: '6'
     steps:
       - name: 评估健康状态
         id: assess
@@ -120,6 +126,31 @@ jobs:
             # ⚠️ 部署顺序：本行生效后，若 phoenix 上的脚本还是旧版（不写心跳），探针会持续报
             # 「ledgerSync 从未记录到成功」。先 scp 新脚本到 /opt/zhaoshu-download-b/scripts/ 再放行本改动。
             check_iso "ledgerSync" "$(jq -r '.crons.ledgerSync.lastSuccessAt' health.json)" "$CRON_ALERT_HOURS"
+            # fqhealth1111：下载线与番茄渠道。旧版 web 没有 channels 键 ⇒ 整段跳过（探针先于 web 上线不误报）。
+            if jq -e '.channels' health.json >/dev/null 2>&1; then
+              # 下载线：有活却 DOWNLOAD_DONE_ALERT_HOURS 内没完成一本（worker 全挂 / 每本都失败 / 全卡住）。
+              # 队列空着不判：近两周完成间隔的最大值（12h、9.9h）都出现在没活的时候。
+              active=$(jq -r '.channels.download.activeTasks // 0' health.json)
+              if [ "$active" -gt 0 ] 2>/dev/null; then
+                check_iso "下载线（${active} 个任务在跑或待领）" "$(jq -r '.channels.download.lastDoneAt' health.json)" "$DOWNLOAD_DONE_ALERT_HOURS"
+              fi
+              # 番茄渠道：faultSince = 自上次成功以来第一次通道故障（成功即清），lastFaultAt = 最近一次。
+              # 两者相隔 ≥ 阈值 = 故障持续这么久、期间零成功。单次故障后渠道闲着不报（相隔为 0）；
+              # 最近一次故障已超 CRON_ALERT_HOURS（渠道不再被尝试，如关了开关）也不再报。
+              fq_since=$(jq -r '.channels.fanqie.faultSince // empty' health.json)
+              fq_last=$(jq -r '.channels.fanqie.lastFaultAt // empty' health.json)
+              if [ -n "$fq_since" ] && [ -n "$fq_last" ]; then
+                ts=$(date -u -d "$fq_since" +%s 2>/dev/null || true)
+                tl=$(date -u -d "$fq_last" +%s 2>/dev/null || true)
+                if [ -n "$ts" ] && [ -n "$tl" ]; then
+                  span=$(( (tl - ts) / 3600 ))
+                  ago=$(( (now - tl) / 3600 ))
+                  if [ "$span" -ge "$FANQIE_FAULT_ALERT_HOURS" ] && [ "$ago" -le "$CRON_ALERT_HOURS" ]; then
+                    reason="${reason}番茄渠道连续故障 ${span}h 无一次成功（阈值 ${FANQIE_FAULT_ALERT_HOURS}h，最近故障 ${ago}h 前；看 /var/lib/zhaoshu-download-b/fanqie/events-<UTC日>.log）; "
+                  fi
+                fi
+              fi
+            fi
             if [ "$(jq -r '.ok' health.json)" != "true" ] && [ -z "$reason" ]; then
               reason="端点自报 ok=false，但未匹配到具体原因（阈值口径可能与 src/lib/source-health.ts 漂移）"
             fi
@@ -155,7 +186,7 @@ jobs:
               fi
             fi
           elif [ -n "$number" ]; then
-            gh issue comment "$number" --body "已恢复：健康端点 ok=true，池新鲜度与全部 cron 心跳（shuyuan / reclaim / drain / admission / followup / ledgerSync）均在阈值内。"
+            gh issue comment "$number" --body "已恢复：健康端点 ok=true，池新鲜度与全部 cron 心跳（shuyuan / reclaim / drain / admission / followup / ledgerSync）均在阈值内；下载线与番茄渠道（新版端点起）无停摆/持续故障。"
             gh issue close "$number"
           else
             echo "健康，且无未关闭的告警 issue"

@@ -39,6 +39,7 @@ import {
 } from '../src/lib/download-source-candidates';
 import { createExecutor, DEFAULT_DECISIONS, type DailyBudgetLike, type DownloadExecutor, type LoopDecisions } from './executor';
 import { dbQuotaBackoffMs, recordDbQuotaSeen } from '../src/lib/db-quota';
+import { recordFanqieFault, recordFanqieOk } from '../src/lib/channel-health';
 // capacity991：rollover 决策端口的生产装配（端口合同在 wiring、候选形状在 rollover 纯决策模块）。
 import { RolloverWiringEvidenceError, type RolloverEvidencePort } from './repository-rollover-wiring';
 import type { AdmissionStatus, RepositoryCandidate, RepositoryTuple } from './repository-rollover';
@@ -405,12 +406,17 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
   const scopedBuiltin = scoped(builtinAdapter);
   // fanqie1106：番茄渠道包在最外层（见 fanqie-leg.ts）。缺省关。搜索接口不在书源 host 门里，不走书源
   // transport，只借共享限速许可（不经 host 占位：占位是下载作用域的互斥）。
+  // fqhealth1111：成功/通道故障写 cron_health 心跳，探针据此告警（渠道坏了熔断只会静默退回免费源）。
+  const healthSql = sql;
   const fanqie = !options.adapters && fanqieEnabled(env)
     ? createFanqieLeg({
       dir: fanqieDir(options.workDir),
       dailyLimit: fanqieDailyLimit(env),
       fetchText: createFanqieSearchFetch(options.rateLimiter),
       log,
+      onHealth: healthSql
+        ? kind => (kind === 'ok' ? recordFanqieOk(healthSql) : recordFanqieFault(healthSql))
+        : undefined,
     })
     : undefined;
   const withFanqie = (adapter: SourceAdapter): SourceAdapter => fanqie ? fanqie.wrapAdapter(adapter) : adapter;

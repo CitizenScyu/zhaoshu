@@ -23,7 +23,10 @@ const PUA = String.fromCodePoint(0xe1d5);
 const raw = (...chapters: string[]) => HEADER + chapters.join('\n\n') + '\n\n';
 const context = () => ({ signal: new AbortController().signal, progress: async () => {} });
 
-function setup(options: { reply?: FanqieReply | Error; search?: unknown; dailyLimit?: number; now?: () => number } = {}) {
+function setup(options: {
+  reply?: FanqieReply | Error; search?: unknown; dailyLimit?: number; now?: () => number;
+  onHealth?: (kind: 'ok' | 'fault') => Promise<void> | void;
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'fanqie-'));
   mkdirSync(join(dir, 'out'));
   const inner: SourceAdapter = {
@@ -37,8 +40,12 @@ function setup(options: { reply?: FanqieReply | Error; search?: unknown; dailyLi
     if (options.reply instanceof Error) throw options.reply;
     return options.reply ?? { rc: 0, result: { status: 'done', file: 'a.txt', titles: ['第1章 入学'], missing: 0, pua: 0, replacement: 0 } };
   });
-  const leg = createFanqieLeg({ dir, fetchText, ask: ask as never, dailyLimit: options.dailyLimit, now: options.now });
-  return { dir, inner, innerPrecheck, fetchText, ask, leg, adapter: leg.wrapAdapter(inner), precheck: leg.wrapPrecheck(innerPrecheck) };
+  const onHealth = vi.fn(options.onHealth ?? (() => {}));
+  const leg = createFanqieLeg({ dir, fetchText, ask: ask as never, dailyLimit: options.dailyLimit, now: options.now, onHealth });
+  return {
+    dir, inner, innerPrecheck, fetchText, ask, onHealth, leg,
+    adapter: leg.wrapAdapter(inner), precheck: leg.wrapPrecheck(innerPrecheck),
+  };
 }
 
 describe('开关与目录', () => {
@@ -210,7 +217,7 @@ describe('下载腿', () => {
     expect(inner.download).toHaveBeenCalledTimes(1);
   });
   it('成功：complete 带 chapterRanges，任务行写入章数字数，产物读完即删，记 ok', async () => {
-    const { dir, adapter, inner, precheck } = setup();
+    const { dir, adapter, inner, precheck, onHealth } = setup();
     writeFileSync(join(dir, 'out', 'a.txt'), raw('第1章 入学', LONG));
     await precheck(TASK);
     const progress = vi.fn(async () => {});
@@ -222,6 +229,7 @@ describe('下载腿', () => {
     expect(existsSync(join(dir, 'out', 'a.txt'))).toBe(false);
     const day = new Date().toISOString().slice(0, 10);
     expect(readFileSync(join(dir, `events-${day}.log`), 'utf8')).toBe(`ok ${ID} done\n`);
+    expect(onHealth.mock.calls).toEqual([['ok']]);
   });
   it('DOWNLOAD_TITLE_CLEAN=1 才剥章节标题的附言尾巴（同引擎）', async () => {
     const titles = ['第1章 入学（求月票）'];
@@ -245,20 +253,22 @@ describe('下载腿', () => {
   });
   it('占用：host_occupied 排队，不走原腿、不记事件', async () => {
     for (const reply of [{ rc: 75, result: null }, { rc: null, result: null }]) {
-      const { dir, adapter, inner, precheck } = setup({ reply });
+      const { dir, adapter, inner, precheck, onHealth } = setup({ reply });
       await precheck(TASK);
       expect(await adapter.download(TASK, context())).toMatchObject({
         kind: 'incomplete', reason: 'source_unavailable', stage: 'fanqie', retryCause: 'host_occupied',
       });
       expect(inner.download).not.toHaveBeenCalled();
       expect(existsSync(join(dir, `events-${new Date().toISOString().slice(0, 10)}.log`))).toBe(false);
+      expect(onHealth).not.toHaveBeenCalled(); // 占用是正常排队，不是故障
     }
   });
-  it('socket 不通：走原腿，不怪这本书', async () => {
-    const { adapter, inner, precheck, fetchText } = setup({ reply: new Error('ECONNREFUSED') });
+  it('socket 不通：走原腿，不怪这本书，报通道故障心跳', async () => {
+    const { adapter, inner, precheck, fetchText, onHealth } = setup({ reply: new Error('ECONNREFUSED') });
     await precheck(TASK);
     await adapter.download(TASK, context());
     expect(inner.download).toHaveBeenCalledTimes(1);
+    expect(onHealth.mock.calls).toEqual([['fault']]);
     await precheck(TASK);
     expect(fetchText).toHaveBeenCalledTimes(1);
   });
@@ -281,7 +291,7 @@ describe('下载腿', () => {
     ['解不出的字超过每 5 万字 1 处', { rc: 1, result: { status: 'incomplete', file: 'c.txt', titles: ['第1章 入学'], missing: 0, replacement: 1 } }],
     ['报 done 但正文自查有解不出的字', { rc: 0, result: { status: 'done', file: 'c.txt', titles: ['第1章 入学'] } }],
   ])('失败退回原腿并记住这本书：%s', async (_name, reply) => {
-    const { dir, adapter, inner, precheck, innerPrecheck } = setup({ reply: reply as FanqieReply });
+    const { dir, adapter, inner, precheck, innerPrecheck, onHealth } = setup({ reply: reply as FanqieReply });
     writeFileSync(join(dir, 'out', 'a.txt'), raw('第1章 入学', LONG));
     writeFileSync(join(dir, 'out', 'b.txt'), raw('第1章 入学', '短'));
     writeFileSync(join(dir, 'out', 'c.txt'), raw('第1章 入学', `${LONG}抗${FFFD}`));
@@ -290,6 +300,8 @@ describe('下载腿', () => {
     expect(inner.download).toHaveBeenCalledTimes(1);
     await precheck(TASK);
     expect(innerPrecheck).toHaveBeenCalledTimes(1);
+    // 书的问题不是通道故障：不报心跳（否则几本书恰好都残缺就会冒充渠道坏了）。
+    expect(onHealth).not.toHaveBeenCalled();
   });
   it.each([
     ['界面遮挡/自动化异常', { rc: 1, result: { status: 'error', reason: 'exception: POST element/x/click -> 400 element click intercepted' } }],
@@ -297,14 +309,27 @@ describe('下载腿', () => {
     ['容器没出结果', { rc: 1, result: null }],
     ['产物读不到', { rc: 0, result: { status: 'done', file: 'gone.txt', titles: ['第1章 入学'] } }],
   ])('通道故障退回原腿、计熔断，但不记坏这本书：%s', async (_name, reply) => {
-    const { dir, adapter, inner, precheck, innerPrecheck, fetchText } = setup({ reply: reply as FanqieReply });
+    const { dir, adapter, inner, precheck, innerPrecheck, fetchText, onHealth } = setup({ reply: reply as FanqieReply });
     await precheck(TASK);
     expect(await adapter.download(TASK, context())).toEqual({ kind: 'failure', code: 'inner' });
     expect(inner.download).toHaveBeenCalledTimes(1);
     expect(readFileSync(join(dir, `events-${new Date().toISOString().slice(0, 10)}.log`), 'utf8')).toMatch(/^fail /);
+    expect(onHealth.mock.calls).toEqual([['fault']]);
     expect(await precheck(TASK)).toEqual({ ok: true });
     expect(innerPrecheck).not.toHaveBeenCalled();
     expect(fetchText).toHaveBeenCalledTimes(1);
+  });
+  it('心跳写不上（同步抛或异步拒绝）不影响下载结果', async () => {
+    for (const onHealth of [
+      () => { throw new Error('sync'); },
+      () => Promise.reject(new Error('async')),
+    ]) {
+      const { dir, adapter, inner, precheck } = setup({ onHealth });
+      writeFileSync(join(dir, 'out', 'a.txt'), raw('第1章 入学', LONG));
+      await precheck(TASK);
+      expect(await adapter.download(TASK, context())).toMatchObject({ kind: 'complete', chaptersTotal: 1 });
+      expect(inner.download).not.toHaveBeenCalled();
+    }
   });
 });
 

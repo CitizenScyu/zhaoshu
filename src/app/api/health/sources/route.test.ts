@@ -55,12 +55,17 @@ function pool(refreshedAtAgeHours: number | null) {
   };
 }
 
-// cron_health / source_admission 的 SQL 替身：按查询文本分派，不发真库（列表无参数）。
-function sqlStub(cronRows: { name: string; last_success_at: string | null }[], admissionCheckedAt: string | null) {
+// cron_health / source_admission / download_tasks 的 SQL 替身：按查询文本分派，不发真库（列表无参数）。
+function sqlStub(
+  cronRows: { name: string; last_success_at: string | null }[],
+  admissionCheckedAt: string | null,
+  download: { last_done_at: string | null; active_tasks: number } = { last_done_at: hoursAgo(1), active_tasks: 20 },
+) {
   return vi.fn(async (strings: TemplateStringsArray) => {
     const text = strings.join(' ');
     if (/FROM cron_health/.test(text)) return cronRows;
     if (/max\(search_checked_at\)/.test(text)) return [{ max_checked_at: admissionCheckedAt }];
+    if (/FROM download_tasks/.test(text)) return [download];
     return [];
   });
 }
@@ -92,7 +97,7 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
   it('键集恰为契约集合（多一个键即缺陷）', async () => {
     const payload = await body(await GET());
     expect(Object.keys(payload).sort()).toEqual(
-      ['admissionCheckedAtAgeHours', 'crons', 'dbQuota', 'ok', 'refreshedAtAgeHours'],
+      ['admissionCheckedAtAgeHours', 'channels', 'crons', 'dbQuota', 'ok', 'refreshedAtAgeHours'],
     );
     expect(Object.keys(payload.dbQuota as object).sort()).toEqual(['lastSeenAt', 'state']);
     // obsfix45 起含 followup（追更轮）与 ledgerSync（台账同步/F1 准入续期）两个心跳键。
@@ -102,6 +107,11 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
     for (const cron of Object.values(payload.crons as Record<string, object>)) {
       expect(Object.keys(cron)).toEqual(['lastSuccessAt']);
     }
+    // fqhealth1111：下载线 + 番茄渠道。
+    const channels = payload.channels as Record<string, object>;
+    expect(Object.keys(channels).sort()).toEqual(['download', 'fanqie']);
+    expect(Object.keys(channels.download).sort()).toEqual(['activeTasks', 'lastDoneAt']);
+    expect(Object.keys(channels.fanqie).sort()).toEqual(['faultSince', 'lastFaultAt', 'lastOkAt']);
   });
 
   it('值类型：年龄是数字或 null，cron 上次成功是 ISO 文本或 null', async () => {
@@ -171,6 +181,40 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
     expect((payload.crons as Record<string, { lastSuccessAt: string | null }>).admission.lastSuccessAt).toBe(hoursAgo(40));
   });
 
+  // fqhealth1111：番茄渠道心跳行与下载线聚合只透传，判龄在探针侧；渠道故障、下载线停摆都不拉低 ok。
+  it('channels：番茄心跳行与下载线聚合原样透传，且不拉低 ok', async () => {
+    mocks.getSql.mockReturnValue(sqlStub(
+      [
+        { name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) },
+        { name: 'fanqie_ok', last_success_at: hoursAgo(50) },
+        { name: 'fanqie_fault', last_success_at: hoursAgo(1) },
+        { name: 'fanqie_fault_since', last_success_at: hoursAgo(48) },
+      ],
+      hoursAgo(5),
+      { last_done_at: hoursAgo(9), active_tasks: 31 },
+    ));
+    const payload = await body(await GET());
+    expect(payload.ok).toBe(true);
+    expect(payload.channels).toEqual({
+      download: { lastDoneAt: hoursAgo(9), activeTasks: 31 },
+      fanqie: { lastOkAt: hoursAgo(50), lastFaultAt: hoursAgo(1), faultSince: hoursAgo(48) },
+    });
+    // 番茄行不串进 crons。
+    expect(Object.keys(payload.crons as object)).not.toContain('fanqie_ok');
+  });
+
+  it('channels：番茄从未有心跳、下载表为空 ⇒ 时间戳 null、计数 0', async () => {
+    mocks.getSql.mockReturnValue(sqlStub(
+      [{ name: 'reclaim', last_success_at: hoursAgo(5) }, { name: 'drain', last_success_at: hoursAgo(6) }],
+      hoursAgo(5),
+      { last_done_at: null, active_tasks: 0 },
+    ));
+    expect((await body(await GET())).channels).toEqual({
+      download: { lastDoneAt: null, activeTasks: 0 },
+      fanqie: { lastOkAt: null, lastFaultAt: null, faultSince: null },
+    });
+  });
+
   it('响应带 no-store，且不需要任何鉴权头（匿名可读）', async () => {
     const res = await GET();
     expect(res.status).toBe(200);
@@ -238,6 +282,10 @@ describe('GET /api/health/sources (S5-1 匿名健康端点)', () => {
         ledgerSync: { lastSuccessAt: null },
       },
       dbQuota: { state: 'ok', lastSeenAt: null },
+      channels: {
+        download: { lastDoneAt: null, activeTasks: null },
+        fanqie: { lastOkAt: null, lastFaultAt: null, faultSince: null },
+      },
     });
   });
 });

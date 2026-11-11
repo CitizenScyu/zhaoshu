@@ -4,7 +4,7 @@ import { isDbQuotaError, recordDbQuotaSeen } from '@/lib/db-quota';
 import { getShuyuanPoolHealth } from '@/lib/shuyuan';
 import {
   CRON_ALERT_HOURS, SHUYUAN_REFRESH_ALERT_HOURS, hoursSince,
-  readAdmissionCheckedAgeHours, readCronSuccessTimes,
+  readAdmissionCheckedAgeHours, readCronSuccessTimes, readDownloadActivity,
 } from '@/lib/source-health';
 import { dbQuotaLatch, requestHitDbQuota, withDbQuotaGuard } from '@/lib/db-quota-guard';
 
@@ -14,7 +14,8 @@ import { dbQuotaLatch, requestHitDbQuota, withDbQuotaGuard } from '@/lib/db-quot
 // 🔴 红线（硬性）：payload 只含聚合数字与时间戳——不得出现源站域名 / URL、源名、用户 id、
 // 任何凭据，或任何可在别处复用的标识。字段集是契约，多一个键都算缺陷（route.test.ts 用
 // Object.keys(...).sort() 精确比对钉死）。新增键必须与 route.test.ts 的契约集合同一次提交改
-// （obsfix45 加了 crons.followup 与 crons.ledgerSync 两个键，都是纯时间戳，无标识）。
+// （obsfix45 加了 crons.followup 与 crons.ledgerSync 两个键，都是纯时间戳，无标识；
+// fqhealth1111 加了 channels：时间戳 + 一个全局任务计数，同样无标识）。
 //
 // 失败语义：任何异常都返回 200 + ok:false，**绝不 500**——探针必须能区分「端点挂了」
 // （HTTP 非 200 / 解析不出 JSON）与「池子陈旧或 cron 没跑」（200 + ok:false）。
@@ -42,6 +43,14 @@ interface SourceHealth {
     ledgerSync: { lastSuccessAt: string | null };
   };
   dbQuota: { state: 'ok' | 'exceeded'; lastSeenAt: string | null };
+  /**
+   * fqhealth1111：下载线与番茄渠道（只透传，不进 ok；探针按 DOWNLOAD_DONE_ALERT_HOURS /
+   * FANQIE_FAULT_ALERT_HOURS 单独判）。11-09~11 番茄渠道全 400 两天、熔断静默退回免费源，零告警。
+   */
+  channels: {
+    download: { lastDoneAt: string | null; activeTasks: number | null };
+    fanqie: { lastOkAt: string | null; lastFaultAt: string | null; faultSince: string | null };
+  };
 }
 
 // 单一构造点：成功与失败路径返回**同一组键**，探针不会因为键缺失而误判。
@@ -59,6 +68,10 @@ function emptyHealth(): SourceHealth {
       ledgerSync: { lastSuccessAt: null },
     },
     dbQuota: { state: 'ok', lastSeenAt: null },
+    channels: {
+      download: { lastDoneAt: null, activeTasks: null },
+      fanqie: { lastOkAt: null, lastFaultAt: null, faultSince: null },
+    },
   };
 }
 
@@ -80,11 +93,12 @@ async function handleGET() {
   let quotaHit = false;
   try {
     await ensureSchema();
-    // 三次只读查询，无 N+1：池健康度（内含一次 meta 读）、cron_health 全表、准入 MAX 聚合。
-    const [pool, crons, admissionCheckedAtAgeHours] = await Promise.all([
+    // 四次只读查询，无 N+1：池健康度（内含一次 meta 读）、cron_health 全表、准入 MAX 聚合、下载线两个聚合。
+    const [pool, crons, admissionCheckedAtAgeHours, download] = await Promise.all([
       getShuyuanPoolHealth(AbortSignal.timeout(QUERY_TIMEOUT_MS)),
       readCronSuccessTimes(),
       readAdmissionCheckedAgeHours(),
+      readDownloadActivity(),
     ]);
     health.refreshedAtAgeHours = pool.refreshedAtAgeHours;
     health.admissionCheckedAtAgeHours = admissionCheckedAtAgeHours;
@@ -105,6 +119,10 @@ async function handleGET() {
     // 是哪条停了；且新接线的行在部署后首轮成功前是 null，并进 ok 会造成一段必然的假红窗口。
     health.crons.followup.lastSuccessAt = crons.followup;
     health.crons.ledgerSync.lastSuccessAt = crons.ledgerSync;
+    health.channels.download = { lastDoneAt: download.lastDoneAt, activeTasks: download.activeTasks };
+    health.channels.fanqie = {
+      lastOkAt: crons.fanqieOk, lastFaultAt: crons.fanqieFault, faultSince: crons.fanqieFaultSince,
+    };
     health.ok = poolFresh(pool.refreshedAtAgeHours)
       && isFresh(crons.reclaim, CRON_ALERT_HOURS)
       && isFresh(crons.drain, CRON_ALERT_HOURS);

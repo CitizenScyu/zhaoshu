@@ -287,6 +287,8 @@ export interface FanqieLegOptions {
   fetchText: (url: string, signal: AbortSignal) => Promise<string>;
   dailyLimit?: number;
   log?: (level: 'info' | 'error', message: string, fields?: Record<string, unknown>) => void;
+  /** fqhealth1111：渠道心跳（生产 = 写 cron_health，见 src/lib/channel-health.ts）。只报成功与通道故障，不等它、失败吞掉。 */
+  onHealth?: (kind: 'ok' | 'fault') => Promise<void> | void;
   // ---- 测试注入缝 ----
   ask?: typeof askFanqieChannel;
   now?: () => number;
@@ -340,6 +342,12 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
       mkdirSync(dir, { recursive: true });
       appendFileSync(eventsFile(), `${kind} ${bookId} ${reason}\n`);
     } catch { /* 记不上只影响额度和熔断计数 */ }
+  };
+  const health = (kind: 'ok' | 'fault') => {
+    try {
+      const pending = options.onHealth?.(kind);
+      if (pending) pending.catch(() => {});
+    } catch { /* 心跳写不上不影响下载 */ }
   };
   /** 今日额度未满且未熔断。熔断到期放行：再失败时事件文件 mtime 刷新，重新计时。 */
   const channelOpen = (): boolean => {
@@ -433,7 +441,10 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
             reply = await ask(socketPath, bookId, context.signal);
           } catch (error) {
             // 中止交原腿按其语义收口；通道本身坏了（socket 没起）不怪这本书，照走免费源。
-            if (!context.signal.aborted) log('error', '番茄渠道不可用', { taskId: task.id, code: (error as { code?: unknown } | null)?.code ?? (error as Error)?.message });
+            if (!context.signal.aborted) {
+              log('error', '番茄渠道不可用', { taskId: task.id, code: (error as { code?: unknown } | null)?.code ?? (error as Error)?.message });
+              health('fault');
+            }
             return inner.download(task, context);
           }
           if (context.signal.aborted) return inner.download(task, context);
@@ -446,11 +457,13 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
           const book = collect(reply.result);
           if (typeof book === 'string') {
             recordEvent('fail', bookId, book.replace(/\W+/g, '_').slice(0, 40));
-            if (!CHANNEL_FAULT.test(book)) writeMemo(task, { failed: true });
+            if (CHANNEL_FAULT.test(book)) health('fault');
+            else writeMemo(task, { failed: true });
             log('info', '番茄渠道下载', { taskId: task.id, bookId, outcome: 'failed', reason: book.slice(0, 80) });
             return inner.download(task, context);
           }
           recordEvent('ok', bookId, 'done');
+          health('ok');
           log('info', '番茄渠道下载', { taskId: task.id, bookId, outcome: 'done', chapters: book.chapters,
             chars: book.charsTotal, damaged: book.damaged, seconds: reply.result?.seconds });
           // 任务行的章数/字数只经 progress 写入（下载列表与统计读它）。

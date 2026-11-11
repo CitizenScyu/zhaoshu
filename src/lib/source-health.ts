@@ -1,11 +1,12 @@
 import { getSql } from './db';
 import { DB_QUOTA_HEALTH_ROW } from './db-quota';
+import { FANQIE_FAULT_HEALTH_ROW, FANQIE_FAULT_SINCE_HEALTH_ROW, FANQIE_OK_HEALTH_ROW } from './channel-health';
 
 // 源池 / cron 健康观测（audit-41 S5-1）。三条 Vercel cron（shuyuan / reclaim / drain）
 // 失败时此前零告警通道——2026-09-21 源池停摆 10 小时，靠人肉盯 refreshed_at 才发现。
 // 本文件是健康端点 /api/health/sources 的唯一数据来源；探针（GitHub Actions）只读那个端点。
 //
-// 阈值集中在这里一处（探针侧在 workflow 里复述同一组数字，两边必须一致）。
+// 阈值集中在这里一处（探针侧在 workflow 里复述同一组数字，两边必须一致；source-health.test.ts 逐个比对钉死）。
 // 判据 =「该 cron 的计划间隔 + 2h 容差」：漏掉一次计划运行后不久即暴露，而不是拖到第二天。
 //
 // ⚠️ 不变量：**每条 cron 的告警阈值必须 > 它在 phoenix systemd timer 里的实际触发间隔**。
@@ -25,6 +26,12 @@ export const CRON_ALERT_HOURS = 26;
 // 任一成功即刷新该行，正常刷新间隔 12h；30h = 一轮整体失败后的最坏间隔（24h）+ Hobby cron 小时级
 // 漂移与探针采样（3h 一次）余量。比 26h 宽是为了「一轮失败不告警、两轮都失败才告警」。
 export const ADMISSION_ALERT_HOURS = 30;
+// fqhealth1111：下载线与番茄渠道的告警阈值（探针侧同样复述，两边必须一致）。都只透传、不进 ok。
+// 下载线：有活（running 或已到重试时刻的 pending）却 6h 没有一本完成 = 停摆（worker 全挂 / 每本都失败 /
+// 全卡住）。必须同时看「有活」：近两周完成间隔的最大值 12h、9.9h 都出现在队列空着的时候。
+export const DOWNLOAD_DONE_ALERT_HOURS = 6;
+// 番茄渠道：自上次成功以来的通道故障持续 ≥6h（期间零成功）。熔断每 3h 放行一次，6h ≈ 熔断后又连败两轮。
+export const FANQIE_FAULT_ALERT_HOURS = 6;
 
 /**
  * 台账同步（zhaoshu-repo-rollover.timer 的 ExecStartPost，每小时一轮）的成功行名。
@@ -56,6 +63,10 @@ export interface CronSuccessTimes {
    * 见 db-quota.ts recordDbQuotaSeen）；不是 cron 成功时间，不参与 ok 判据。从未记录为 null。
    */
   dbQuotaSeenAt: string | null;
+  /** 番茄渠道心跳（fqhealth1111，行名见 channel-health.ts）：同样不是 cron 成功时间，不进 ok。 */
+  fanqieOk: string | null;
+  fanqieFault: string | null;
+  fanqieFaultSince: string | null;
 }
 
 /**
@@ -69,6 +80,14 @@ const CRON_ROW_FIELDS: Record<string, keyof CronSuccessTimes> = {
   admission: 'admission',
   followup: 'followup',
   [LEDGER_SYNC_HEALTH_ROW]: 'ledgerSync',
+};
+
+// 同表的非成功心跳行：原样透传时间戳，消费方各自按语义判（见上面字段注释）。
+const SIGNAL_ROW_FIELDS: Record<string, keyof CronSuccessTimes> = {
+  [DB_QUOTA_HEALTH_ROW]: 'dbQuotaSeenAt',
+  [FANQIE_OK_HEALTH_ROW]: 'fanqieOk',
+  [FANQIE_FAULT_HEALTH_ROW]: 'fanqieFault',
+  [FANQIE_FAULT_SINCE_HEALTH_ROW]: 'fanqieFaultSince',
 };
 
 // cron 成功分支调用一次。监控写入失败绝不能把 cron 本身打挂（否则告警系统自己制造故障）：
@@ -98,13 +117,35 @@ export async function readCronSuccessTimes(): Promise<CronSuccessTimes> {
   }[];
   const out: CronSuccessTimes = {
     reclaim: null, drain: null, admission: null, followup: null, ledgerSync: null, dbQuotaSeenAt: null,
+    fanqieOk: null, fanqieFault: null, fanqieFaultSince: null,
   };
   for (const row of rows) {
-    const field = CRON_ROW_FIELDS[row.name];
+    const field = CRON_ROW_FIELDS[row.name] ?? SIGNAL_ROW_FIELDS[row.name];
     if (field) out[field] = row.last_success_at;
-    else if (row.name === DB_QUOTA_HEALTH_ROW) out.dbQuotaSeenAt = row.last_success_at;
   }
   return out;
+}
+
+/** 下载线活动（fqhealth1111）：最近一本完成的时刻 + 当前「有活」的任务数。 */
+export interface DownloadActivity {
+  lastDoneAt: string | null;
+  /** running + 已到重试时刻的 pending；退避中的 pending 不算（它们本来就不该被领）。 */
+  activeTasks: number;
+}
+
+// 一次查询两个聚合（表一万多行，生产实测 5ms，探针 3h 一次）。
+export async function readDownloadActivity(): Promise<DownloadActivity> {
+  const rows = await getSql()`
+    SELECT
+      (SELECT max(updated_at)::text FROM download_tasks WHERE status = 'done') AS last_done_at,
+      (SELECT count(*)::int FROM download_tasks WHERE status = 'running'
+        OR (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= now()))) AS active_tasks` as {
+    last_done_at: string | null; active_tasks: number | string | null;
+  }[];
+  return {
+    lastDoneAt: rows[0]?.last_done_at ?? null,
+    activeTasks: Number(rows[0]?.active_tasks ?? 0),
+  };
 }
 
 // 准入批次的代表时间：source_admission.search_checked_at 的 MAX（一次聚合，无 N+1）。
