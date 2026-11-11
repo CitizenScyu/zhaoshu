@@ -213,6 +213,7 @@ export function selectCandidates(
   for (const s of data) {
     const upgradedBase = upgradeSourceTemplateUrl(String(s.bookSourceUrl ?? ''));
     if (!upgradedBase.startsWith('https://')) continue;
+    if (!plainAuthority(upgradedBase)) continue;
     if (!rulesNoJs(s, options)) continue;
     // 默认口径 = 纯 GET；postSearch 开时额外放行「可构造出 POST/GET 请求」的源（与运行时同一判据，未知键/展不开仍拒，webView 仅 ENGINE_SEARCH_WEBVIEW 开时放行）。
     if (!searchIsPureGet(s.searchUrl)
@@ -227,6 +228,19 @@ export function selectCandidates(
     out.push(s);
   }
   return out;
+}
+
+/**
+ * junkhost1112：bookSourceUrl 的 authority 段只许可见 ASCII 且不含逗号。书源作者常把备注直接拼在 host 后
+ * （`https://zhidao.baidu.com已校验`、`…com♤Haxc`、`…net-By Dark`、`…org,{{'webView'…`），URL 解析会把它变成
+ * punycode 假 host（如 `zhidao.baidu.xn--com-…`）照样过 checkSourceUrl，进池后只会制造失败：2026-11-12 生产
+ * 手工禁了 42 行这类源，其中一个让打标机一天 347 次 no_source 退避。中文域名书站极少，宁可一并不收。
+ * 只看 authority，路径/查询里的中文与模板不受影响；checkSourceUrl（跨仓契约钉住）不动。
+ */
+function plainAuthority(httpsUrl: string): boolean {
+  // 首尾空白不算（生产有 3 个在用源 host 后带空格，URL 解析会剥掉，照常可用）
+  const authority = httpsUrl.trim().slice('https://'.length).split(/[/?#]/, 1)[0];
+  return authority.length > 0 && !/[^\x21-\x7e]|,/.test(authority);
 }
 
 /** legado BookSourceType 0 = 文本；缺省（老源无此字段）按文本。数字串同数字处理。 */
