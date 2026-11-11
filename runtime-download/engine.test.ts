@@ -4,7 +4,7 @@
 //   - 源站 HTTP 错误（含 429）→ recordFailure(host, ...)，429 带 Retry-After 则含 retryAfterMs（发现 4）；
 //   - 网络/传输错误（无 status）→ 不计熔断（recordFailure 不被调用）。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createResolveSource, createSourceTransport, loadEnginePool, ResolveSourceBlockedError, type EngineModules, type RateLimiterLike } from "./engine";
+import { createResolveSource, createSourceTransport, downloadHeadersTimeoutMs, loadEnginePool, ResolveSourceBlockedError, type EngineModules, type RateLimiterLike } from "./engine";
 import { refreshSupportedHosts, stationKeyOfHost } from "../src/lib/source-policy";
 
 vi.mock("../src/lib/supported-sources", async (importOriginal) => {
@@ -90,6 +90,43 @@ describe('T8 createSourceTransport 限速器接线', () => {
     await expect(transport(`https://${HOST}/x`, opts())).rejects.toBeInstanceOf(TypeError);
     expect(limiter.failures).toHaveLength(0);
     expect(limiter.success).toHaveLength(0);
+  });
+});
+
+describe('headers1111 下载线首包上限', () => {
+  afterEach(() => vi.useRealTimers());
+
+  // 响应头 4s 才到：默认 3s 判 ConnectTimeoutError（合成 host 无备用 host，不换 host），覆写 6s 则拿到正文。
+  const slowHeaders = () => vi.fn().mockImplementation(() => new Promise<Response>((resolve) => {
+    setTimeout(() => resolve(new Response('正文')), 4_000);
+  }));
+
+  it('缺省不覆写：仍是 source-fetch 的 3s', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', slowHeaders());
+    const result = createSourceTransport(fakeLimiter())(`https://${HOST}/s`, opts());
+    const assertion = expect(result).rejects.toMatchObject({ name: 'ConnectTimeoutError' });
+    await vi.advanceTimersByTimeAsync(3_001);
+    await assertion;
+  });
+
+  it('connectTimeoutMs=6000：4s 首包照常成功', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', slowHeaders());
+    const result = createSourceTransport(fakeLimiter(), { connectTimeoutMs: 6_000 })(`https://${HOST}/s`, opts());
+    await vi.advanceTimersByTimeAsync(4_001);
+    await expect(result).resolves.toMatchObject({ text: '正文' });
+  });
+
+  it('DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS：缺省/非法 = undefined，正整数夹到 1000..8000', () => {
+    expect(downloadHeadersTimeoutMs({})).toBeUndefined();
+    expect(downloadHeadersTimeoutMs({ DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: '' })).toBeUndefined();
+    expect(downloadHeadersTimeoutMs({ DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: 'six' })).toBeUndefined();
+    expect(downloadHeadersTimeoutMs({ DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: '-5' })).toBeUndefined();
+    expect(downloadHeadersTimeoutMs({ DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: '0' })).toBeUndefined();
+    expect(downloadHeadersTimeoutMs({ DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: ' 6000 ' })).toBe(6000);
+    expect(downloadHeadersTimeoutMs({ DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: '200' })).toBe(1000);
+    expect(downloadHeadersTimeoutMs({ DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: '30000' })).toBe(8000);
   });
 });
 

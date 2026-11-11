@@ -18,7 +18,7 @@ import { createSourceSelector, type SourceSelector } from './source-selector';
 import { createHostOccupancy } from './host-occupancy';
 import { createHostPriority, skipStrictTocEnabled, skipZeroYieldEnabled } from './host-priority';
 import {
-  assembleEngineModules, createSourceTransport, loadEnginePool,
+  assembleEngineModules, createSourceTransport, downloadHeadersTimeoutMs, loadEnginePool,
   type EngineModules, type RateLimiterLike, type SourceTransport,
 } from './engine';
 import { WORKER_TASK_TIMEOUT_MS } from '../src/lib/download-worker';
@@ -135,7 +135,8 @@ export function createSourcePrefetch(options: SourcePrefetchOptions): SourcePref
       scanTtlMs: PREFETCH_SCAN_TTL_MS,
     });
     // 注入 transport 也必须过占用门（不绕过）：先建传输层再统一 wrapTransport。
-    const transport = occupancy.wrapTransport(options.transport ?? createSourceTransport(options.rateLimiter));
+    const transport = occupancy.wrapTransport(options.transport
+      ?? createSourceTransport(options.rateLimiter, { connectTimeoutMs: downloadHeadersTimeoutMs(env) }));
     return createSourceSelector({
       modules,
       transport,

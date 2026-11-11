@@ -210,6 +210,16 @@ export type SourceTransport = (
   },
 ) => Promise<{ url: string; text: string }>;
 
+/**
+ * headers1111：DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS = 下载线（选源扫描、取页）从发起到响应头的上限。
+ * source-fetch 的 3s「连接段」实际包含 TTFB；部分有产出的站搜索接口首包常过 3s，判超时后还会换 host
+ * 再打一次。缺省/非法 = undefined（不覆写，仍 3s），正整数夹到 1000..8000（总超时 8s 内）。
+ */
+export function downloadHeadersTimeoutMs(env: Record<string, string | undefined> = process.env): number | undefined {
+  const raw = env.DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS?.trim() ?? '';
+  return /^\d+$/.test(raw) && Number(raw) > 0 ? Math.min(8_000, Math.max(1_000, Number(raw))) : undefined;
+}
+
 /** source-fetch 的门拒绝标记（结构判别）：beforeRequest/beforeFetch 抛出的错误被标
  * fromBeforeRequest=true——发生在物理 fetch 之前，不是源站行为。 */
 interface GateRejection { fromBeforeRequest?: boolean }
@@ -224,8 +234,10 @@ interface GateRejection { fromBeforeRequest?: boolean }
  * （真正返回响应的站）或最近实际发射的 host，不把备用 host 记到初始 host。
  * 许可被拒/排队中止等 beforeFetch 异常沿用 source-fetch 的 fromBeforeRequest 标记：
  * 不触发换 host 重试、不计源站失败。同一 limiter 实例被整个执行器共享（单实例）。
+ * headers1111：connectTimeoutMs 给了就覆写 fetchSourceText 的首包上限（缺省仍 3s）。
  */
-export function createSourceTransport(limiter?: RateLimiterLike): SourceTransport {
+export function createSourceTransport(limiter?: RateLimiterLike, transportOptions: { connectTimeoutMs?: number } = {}): SourceTransport {
+  const { connectTimeoutMs } = transportOptions;
   return async (url, options) => {
     const { signal, timeoutMs, request, responseCharset, noFollow, beforeRequest, beforeFetch: callerGate, afterAcquire } = options;
     // 最近一次物理发射的 host（许可按它取过）：无 responseHost 的 HTTP 失败反馈归它。
@@ -247,7 +259,7 @@ export function createSourceTransport(limiter?: RateLimiterLike): SourceTranspor
     let page: { url: string; text: string };
     // 请求结果与反馈结果分开捕获，反馈失败不能再次归因成HTTP失败。
     try {
-      page = await fetchSourceText(url, { signal, timeoutMs, request, responseCharset, noFollow, beforeRequest, beforeFetch });
+      page = await fetchSourceText(url, { signal, timeoutMs, connectTimeoutMs, request, responseCharset, noFollow, beforeRequest, beforeFetch });
     } catch (error) {
       // 只认调用方取消reason的同一引用，不吞掉已收到的不同HTTP错误。
       if (signal.aborted && error === signal.reason) throw error;

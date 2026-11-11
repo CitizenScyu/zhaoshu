@@ -15,7 +15,7 @@ import type { GitHubContents } from '../src/lib/download-publisher';
 import { createWorkerStorage } from './storage';
 import { createGitHubContents } from './github-contents';
 import {
-  assembleEngineModules, createResolveSource, createSourceTransport, loadEnginePool,
+  assembleEngineModules, createResolveSource, createSourceTransport, downloadHeadersTimeoutMs, loadEnginePool,
   type EngineModules, type RateLimiterLike, type ResolvedSource,
 } from './engine';
 import { readBookText } from './read-book-text';
@@ -314,7 +314,7 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
       scanTtlMs: 360_000,
     })
     : undefined);
-  const baseTransport = options.transport ?? createSourceTransport(options.rateLimiter);
+  const baseTransport = options.transport ?? createSourceTransport(options.rateLimiter, { connectTimeoutMs: downloadHeadersTimeoutMs(env) });
   const transport = hostOccupancy ? hostOccupancy.wrapTransport(baseTransport) : baseTransport;
 
   const outRoot = join(options.workDir, 'out');

@@ -13,7 +13,7 @@ vi.mock('./storage', () => ({ createWorkerStorage: mocks.storage }));
 vi.mock('./github-contents', () => ({ createGitHubContents: mocks.github }));
 vi.mock('./engine', () => ({
   assembleEngineModules: mocks.modules, createResolveSource: mocks.resolveSource,
-  createSourceTransport: mocks.transport, loadEnginePool: vi.fn(),
+  createSourceTransport: mocks.transport, loadEnginePool: vi.fn(), downloadHeadersTimeoutMs: () => undefined,
 }));
 vi.mock('./read-book-text', () => ({ readBookText: vi.fn() }));
 vi.mock('./without-process-signals', () => ({ withoutProcessSignals: (fn: unknown) => fn }));

@@ -398,7 +398,7 @@ describe('默认真实链（真实 selector/transport/occupancy 装配）', () =
 
   function buildDefaultChain(
     pool: string[],
-    over: { failed?: string[]; busyHosts?: string[]; transport?: SourceTransport } & FakeSqlOptions = {},
+    over: { failed?: string[]; busyHosts?: string[]; transport?: SourceTransport; env?: Record<string, string> } & FakeSqlOptions = {},
   ): DefaultChain {
     const f = fakeSql({ throwSql: over.throwSql, occupyFail: over.occupyFail });
     if (over.failed) f.candidates.set(10, over.failed);
@@ -407,7 +407,7 @@ describe('默认真实链（真实 selector/transport/occupancy 装配）', () =
     const prefetch = createSourcePrefetch({
       rateLimiter: limiter,
       log,
-      env: {} as NodeJS.ProcessEnv,
+      env: (over.env ?? {}) as NodeJS.ProcessEnv,
       sql: f.sql,
       store: s.store,
       // DI 边界单点转型：窄合成形状只覆盖 selector 读取面。
@@ -436,6 +436,15 @@ describe('默认真实链（真实 selector/transport/occupancy 装配）', () =
     expect(chain.limiter.recordFailure).not.toHaveBeenCalled();
     // 入选的是精确 source.url（非 host），经 store.finish 落 plan。
     expect(chain.s.plans.get(1)).toEqual(['https://pick.example/ok']);
+    // headers1111：未设 env 不覆写首包上限（fetchSourceText 用自身 3s 默认）。
+    expect(mocks.fetchSourceText.mock.calls.every(([, o]) => o.connectTimeoutMs === undefined)).toBe(true);
+  });
+
+  it('headers1111：DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS 透传到每次取页的 connectTimeoutMs', async () => {
+    const chain = buildDefaultChain(['https://pick.example/ok'], { env: { DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: '6000' } });
+    expect(await chain.prefetch.run(new AbortController().signal)).toBe('completed');
+    expect(mocks.fetchSourceText).toHaveBeenCalledTimes(2);
+    expect(mocks.fetchSourceText.mock.calls.map(([, o]) => o.connectTimeoutMs)).toEqual([6000, 6000]);
   });
 
   it('注入 transport 仍过占用门：wrapTransport 不被绕过（占用 INSERT 每请求两次）', async () => {

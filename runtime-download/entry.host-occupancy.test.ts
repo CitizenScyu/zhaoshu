@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
   neon: vi.fn(), storage: vi.fn(), github: vi.fn(), modules: vi.fn(),
   resolveSource: vi.fn(), transport: vi.fn(), adapter: vi.fn(), executor: vi.fn(),
   runDownload: vi.fn(), wrapTransport: vi.fn(), fallbackWrapAdapter: vi.fn(),
-  identityPrecheck: vi.fn(), createHostOccupancy: vi.fn(), createBuiltinFallback: vi.fn(),
+  identityPrecheck: vi.fn(), createHostOccupancy: vi.fn(), createBuiltinFallback: vi.fn(), headersTimeout: vi.fn(),
 }));
 vi.mock('@neondatabase/serverless', () => ({ neon: mocks.neon }));
 vi.mock('../scripts/engine-download.mjs', () => ({ downloadBook: vi.fn(), tocFloor: () => false }));
@@ -20,7 +20,7 @@ vi.mock('./storage', () => ({ createWorkerStorage: mocks.storage }));
 vi.mock('./github-contents', () => ({ createGitHubContents: mocks.github }));
 vi.mock('./engine', () => ({
   assembleEngineModules: mocks.modules, createResolveSource: mocks.resolveSource,
-  createSourceTransport: mocks.transport, loadEnginePool: vi.fn(),
+  createSourceTransport: mocks.transport, loadEnginePool: vi.fn(), downloadHeadersTimeoutMs: mocks.headersTimeout,
 }));
 vi.mock('./read-book-text', () => ({ readBookText: vi.fn() }));
 vi.mock('./without-process-signals', () => ({ withoutProcessSignals: (fn: unknown) => fn }));
@@ -82,7 +82,7 @@ describe('entry 物理 host 占用装配', () => {
     expect(await createDownloadExecutor(options())).toBe(executorMarker);
     // 共享 limiter 不重建：默认 transport 只建一次（同一 limiter），且 wrap 的是它的返回值。
     expect(mocks.transport).toHaveBeenCalledTimes(1);
-    expect(mocks.transport).toHaveBeenCalledWith(limiter);
+    expect(mocks.transport).toHaveBeenCalledWith(limiter, { connectTimeoutMs: undefined });
     expect(mocks.wrapTransport).toHaveBeenCalledTimes(1);
     expect(mocks.wrapTransport).toHaveBeenCalledWith(mocks.transport.mock.results[0].value);
     // hostOccupancy 以注入 sql 建；TTL：download 与任务超时同源 + 10 分钟，scan 固定 6 分钟。
@@ -107,6 +107,15 @@ describe('entry 物理 host 占用装配', () => {
     await adaptersOf()[1].download(taskRow, context);
     expect(events).toEqual(['enter', 'exit', 'enter', 'exit']);
     expect(mocks.runDownload).toHaveBeenCalledWith(7, context.signal, expect.any(Function));
+  });
+
+  it('headers1111：默认 transport 带上 env 解析出的首包上限（解析交给 downloadHeadersTimeoutMs）', async () => {
+    const env = { DOWNLOAD_SOURCE_HEADERS_TIMEOUT_MS: '6000' } as unknown as NodeJS.ProcessEnv;
+    mocks.headersTimeout.mockReturnValue(6000);
+    await createDownloadExecutor(options({ env }));
+    expect(mocks.headersTimeout).toHaveBeenCalledWith(env);
+    expect(mocks.transport).toHaveBeenCalledTimes(1);
+    expect(mocks.transport).toHaveBeenCalledWith(limiter, { connectTimeoutMs: 6000 });
   });
 
   it('单源下载抛错仍退出作用域，下一次下载重新进入', async () => {
