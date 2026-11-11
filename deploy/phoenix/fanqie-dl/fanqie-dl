@@ -73,8 +73,11 @@ budget=$(( 300 + ${#ids[@]} * ${FQ_PER_BOOK_SEC:-1500} ))
 echo "image fanqie-dl:$tag  books ${#ids[@]}  log $log" >&2
 find "$BASE/logs" -name '*.log' -mtime +30 -delete
 find "$OUT" -maxdepth 1 \( -name '.debug-*.png' -o -name '*.failed' -o -name '*.bak' \) -mtime +7 -delete
+# The app polls GitHub for updates and, once a newer build is out, a release-notes dialog covers the UI and swallows
+# every click. This container never self-updates (--update rebuilds the image), so keep it off GitHub.
 timeout -k 20 "$budget" docker run --rm --init --name "$name" \
   --cpus "${FQ_CPUS:-1.5}" --memory "${FQ_MEM:-2g}" --shm-size 256m \
+  --add-host github.com:127.0.0.1 --add-host api.github.com:127.0.0.1 \
   -e FQ_PER_BOOK_SEC -e FQ_STALL_SEC -e FQ_TITLES \
   -v "$BASE/fq_run.py:/fq_run.py:ro" \
   -v "$OUT:/root/.local/share/com.pofl.fanqienoveldownloader/downloads/FanqieNovels" \
