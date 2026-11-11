@@ -292,8 +292,9 @@ export function tocShapeError(titles) {
 // tocfloor1111：章数下限闸门。任务层把下限作 args['chapter-floor'] 传入；目录章数 < 下限 × 0.7 ⇒ toc_below_floor
 // （与形态闸门的 toc_incomplete 分开记，便于统计误判），按源级失败换源（零正文请求）。下限 < 30 或不是整数不判。
 // 下限 = 这本书各任务行 chapters_done 的最大值（runtime-download/storage.ts taskRow）。任务行的 chapters_done 原是
-// 进度通道的最新值，本闸门拒绝时也会被写成 0；所以开关开着时任务层（download-worker runDownloadTask）写行时只升不降，
-// 并在同一次领取的各回退腿之间即时抬高下限。
+// 进度通道的最新值，本闸门拒绝时也会被写成 0；所以开关开着时任务层（download-worker runDownloadTask）在领取期间
+// 写行只升不降，并在同一次领取的各回退腿之间即时抬高下限。例外：整本登记成功后，done 行改记本次发布的章数
+// （gapfill 按它判缺章），这本书的下限依据可能因此降到发布章数。
 // 局限：下限只认「抓到过多少章」，不验内容；某个源的目录虚高（重复卷、乱章）且抓过大半时，正常源会被它拒掉。
 // 此时任务以 toc_below_floor 或 no_candidates 收口，不自动删书（nosrc-tool.sh gc 的 held_gated）；
 // 重排任务时 source_revision 以 nofloor- 开头，该任务不带下限（只对那一条任务，之后的补抓、追更任务照常带）。

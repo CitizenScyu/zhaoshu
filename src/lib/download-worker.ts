@@ -99,7 +99,10 @@ export interface WorkerStorage {
   /** 进度（租约条件）；false = 失租约。 */
   progress(lease: DownloadTaskLease, update: { chaptersDone: number; chaptersTotal: number; charsTotal: number }): Promise<boolean>;
   /** 终态（租约条件）；false = 失租约。 */
-  finish(lease: DownloadTaskLease, result: { status: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete'; error?: string }): Promise<boolean>;
+  finish(lease: DownloadTaskLease, result: {
+    status: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete'; error?: string;
+    progress?: { chaptersDone: number; chaptersTotal: number; charsTotal: number };
+  }): Promise<boolean>;
   /** 非终态放回 pending 并退避（租约条件）；返回下次可领取时刻（ISO UTC），null = 失租约。countAttempt=false 不计 attempt（hostwait1031）。 */
   defer(lease: DownloadTaskLease, input: { delayMs: number; error?: string; countAttempt?: boolean }): Promise<string | null>;
   /** 原样放回 pending（租约条件，不动 attempt_count/next_attempt_at）；false = 失租约。可选：缺省时停机放回不生效。 */
@@ -263,7 +266,7 @@ export interface WorkerOptions {
    * - 腿内进度即时抬高 task.chapter_floor（回退层每条腿都从同一个 task 对象展开，后面的腿用得到新下限）；
    * - 进度回调写行时写「领取时的行」与本次各腿进度中章数最高的一份，行在领取期间任何时刻都不低于历次最高
    *   （崩溃、失租约、限速反馈收口都不丢）；代价是新腿追平前，行上显示的是此前最高的那份进度。
-   * - 完成登记成功后、写 done 前，把行改写成本次发布的章数（gapfill、书库统计都读 done 行）。
+   * - 完成登记成功后，done 与本次发布的章数在同一条 UPDATE 里写（gapfill、书库统计都读 done 行）。
    * 缺省关 = 与引入前逐字一致。
    */
   tocFloor?: boolean;
@@ -448,7 +451,7 @@ export async function runDownloadTask(
   let sawProgress = 0;
   let leaseLostObserved = false;
   // tocfloor1111（options.tocFloor）：本行进度只升不降。每次进度回调写的是「领取时的行」与本次各腿进度里
-  // 章数最高的一份，被拒那次的目录（腿开头先报 0）、崩溃、失租约都不会把下限依据写低；完成登记后另写本次实得章数。
+  // 章数最高的一份，被拒那次的目录（腿开头先报 0）、崩溃、失租约都不会把下限依据写低；done 时改记本次实得章数。
   type ProgressSnapshot = { chaptersDone: number; chaptersTotal: number; charsTotal: number };
   let bestProgress: ProgressSnapshot | null = options.tocFloor && (task.chapters_done ?? 0) > 0
     ? { chaptersDone: task.chapters_done!, chaptersTotal: Math.max(task.chapters_total ?? 0, task.chapters_done!), charsTotal: task.chars_total ?? 0 }
@@ -701,11 +704,13 @@ export async function runDownloadTask(
     if (registered === 'lost') throw new TaskLeaseLostError();
     if (registered === 'mismatch') throw new Error('ARTIFACT_REGISTRATION_MISMATCH');
     if (registered !== 'registered' && registered !== 'already') throw new Error('ARTIFACT_REGISTRATION_INVALID_RESULT');
-    // tocfloor1111：行里此时是历次最高进度，done 行改记本次发布的章数（gapfill 按它判缺章）；写库出错不拦 done。
-    if (options.tocFloor && !(await storage.progress(lease, {
-      chaptersDone: outcome.chaptersDone, chaptersTotal: outcome.chaptersTotal, charsTotal: outcome.charsTotal,
-    }).catch(() => true))) throw new TaskLeaseLostError();
-    const written = await storage.finish(lease, { status: 'done', error: '' });
+    // tocfloor1111：行里此时是历次最高进度，done 行改记本次发布的章数（gapfill 按它判缺章）；与 done 同一条 UPDATE。
+    const written = await storage.finish(lease, {
+      status: 'done', error: '',
+      ...(options.tocFloor ? {
+        progress: { chaptersDone: outcome.chaptersDone, chaptersTotal: outcome.chaptersTotal, charsTotal: outcome.charsTotal },
+      } : {}),
+    });
     if (!written) throw new TaskLeaseLostError();
     return { processed: true, terminal: 'done' };
   } catch (error) {

@@ -119,6 +119,27 @@ maybe('bsrcfix-41：候选源持久化与跨实例占位（0005 三表）', () =
     await expect(failedCandidateSources(sql(), 1, -1)).rejects.toThrow('ttlMs is invalid');
   });
 
+  it('tocfloor1111：toc_below_floor 遇同源瞬时失败只刷新时间不改原因，其余失败照常覆盖', async () => {
+    const reason = async (url: string) => (await pg.query(
+      `SELECT failure, failure_reason, updated_at > now() - interval '1 hour' AS fresh
+       FROM download_source_candidates WHERE book_id = 1 AND source_url = $1`, [url])).rows[0];
+    await markCandidateFailure(sql(), 1, 'https://a.example/', 'temporary', 'toc_below_floor');
+    await pg.query(`UPDATE download_source_candidates SET updated_at = now() - interval '49 hours' WHERE source_url = 'https://a.example/'`);
+    await markCandidateFailure(sql(), 1, 'https://a.example/', 'temporary', 'operation_timeout');
+    expect(await reason('https://a.example/')).toEqual({ failure: 'temporary', failure_reason: 'toc_below_floor', fresh: true });
+    await markCandidateFailure(sql(), 1, 'https://a.example/', 'temporary', 'source_unavailable');
+    expect(await reason('https://a.example/')).toMatchObject({ failure_reason: 'toc_below_floor' });
+    await markCandidateFailure(sql(), 1, 'https://a.example/', 'temporary', 'preview_truncated');
+    expect(await reason('https://a.example/')).toMatchObject({ failure: 'temporary', failure_reason: 'preview_truncated' });
+    // 别的原因不受保护：瞬时失败照常覆盖。
+    await markCandidateFailure(sql(), 1, 'https://b.example/', 'temporary', 'missing_chapters');
+    await markCandidateFailure(sql(), 1, 'https://b.example/', 'temporary', 'operation_timeout');
+    expect(await reason('https://b.example/')).toMatchObject({ failure_reason: 'operation_timeout' });
+    await markCandidateFailure(sql(), 1, 'https://c.example/', 'temporary', 'toc_below_floor');
+    await markCandidateFailure(sql(), 1, 'https://c.example/', 'permanent', 'identity_mismatch_or_no_candidate');
+    expect(await reason('https://c.example/')).toMatchObject({ failure: 'permanent', failure_reason: 'identity_mismatch_or_no_candidate' });
+  });
+
   it('tryOccupyHost 原子互斥：他实例占用 ⇒ false；过期 ⇒ 接管；释放后可再占', async () => {
     expect(await tryOccupyHost(sql(), 'a.example', 'w1', 'download', 1, 60_000)).toBe(true);
     expect(await tryOccupyHost(sql(), 'a.example', 'w2', 'download', 2, 60_000)).toBe(false);

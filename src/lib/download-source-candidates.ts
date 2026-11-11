@@ -79,6 +79,12 @@ export async function replaceSourceCandidates(
   ]);
 }
 
+/**
+ * tocfloor1111：章数下限闸门的判定（toc_below_floor）遇同源瞬时失败（source_unavailable / operation_timeout）
+ * 只刷新时间、不改原因——这次没重判目录，nosrc gc 的 held_gated 依据不该被一次超时抹掉；其余失败照常覆盖。
+ */
+const FLOOR_KEEPING_REASONS = ['source_unavailable', 'operation_timeout'];
+
 /** 与 replace 同序先锁 book 行；候选被并发替换删除后仍补写失败记忆。 */
 export async function markCandidateFailure(
   sql: CandidateSql,
@@ -93,7 +99,11 @@ export async function markCandidateFailure(
          (book_id, source_url, host, position, failure, failure_reason, updated_at)
        VALUES (${bookId}, ${sourceUrl}, ${candidateHostOf(sourceUrl)}, 0, ${kind}, ${reason.slice(0, 64)}, now())
        ON CONFLICT (book_id, source_url) DO UPDATE
-         SET failure = EXCLUDED.failure, failure_reason = EXCLUDED.failure_reason, updated_at = now()`,
+         SET failure = EXCLUDED.failure,
+             failure_reason = CASE WHEN download_source_candidates.failure_reason = 'toc_below_floor'
+                                    AND EXCLUDED.failure_reason = ANY (${FLOOR_KEEPING_REASONS}::text[])
+                                   THEN download_source_candidates.failure_reason ELSE EXCLUDED.failure_reason END,
+             updated_at = now()`,
   ]);
 }
 

@@ -115,3 +115,30 @@ it('demote：dryRun 不写；只下架系统 done；restore 只恢复挂 artifac
   await expect(demotePreviewTasks(sql, { taskIds: [], dryRun: true })).rejects.toThrow('taskIds');
   await expect(demotePreviewTasks(sql, { taskIds: [0], dryRun: true })).rejects.toThrow('taskIds');
 });
+
+// tocfloor1111：nofloor- 重排同一语句把本次插入的书的闸门源挪出 48h 失败记忆窗口；别的原因、别的前缀不动。
+it('nofloor- 重排：闸门源挪出失败窗口，别的原因与普通前缀不动', async () => {
+  await pg.exec(`
+    INSERT INTO labeled_books(id,title,author,source_url) VALUES
+      (30,'闸门书甲','子','https://c.example/30'),
+      (31,'闸门书乙','丑','https://c.example/31');
+    INSERT INTO download_tasks(id,user_id,book_id,title,author,status,requested_by,enqueue_key,error) VALUES
+      (50,NULL,30,'闸门书甲','子','failed','system','30:p:','toc_below_floor'),
+      (51,NULL,31,'闸门书乙','丑','failed','system','31:p:','toc_below_floor');
+    INSERT INTO download_source_candidates(book_id,source_url,host,failure,failure_reason) VALUES
+      (30,'https://m.example.org/30','m.example.org','temporary','toc_below_floor'),
+      (30,'https://www.biquge.example/30','www.biquge.example','temporary','preview_truncated'),
+      (31,'https://m.example.org/31','m.example.org','temporary','toc_below_floor');`);
+  const reopened = async (bookId: number) => (await pg.query(
+    `SELECT failure_reason, updated_at < now() - interval '48 hours' AS reopened
+     FROM download_source_candidates WHERE book_id = $1 ORDER BY source_url`, [bookId])).rows;
+  const options = { limit: 1, dryRun: false, policyVersion: 'p', reasons: ['toc_below_floor'] };
+  // 先按 id 倒序挑到 31：普通前缀，带下限，不挪窗。
+  expect(await requeueUnfinishedBooks(sql, { ...options, sourceRevision: 'requeue-floor-test' })).toMatchObject({ inserted: 1, reopened: 0 });
+  expect(await reopened(31)).toEqual([{ failure_reason: 'toc_below_floor', reopened: false }]);
+  expect(await requeueUnfinishedBooks(sql, { ...options, sourceRevision: 'nofloor-20261111', dryRun: true })).toMatchObject({ inserted: 0, reopened: 0 });
+  expect(await requeueUnfinishedBooks(sql, { ...options, sourceRevision: 'nofloor-20261111' })).toMatchObject({ inserted: 1, reopened: 1 });
+  expect(await reopened(30)).toEqual([
+    { failure_reason: 'toc_below_floor', reopened: true }, { failure_reason: 'preview_truncated', reopened: false },
+  ]);
+});

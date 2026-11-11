@@ -57,9 +57,11 @@ SQL
 # attempt (a lastcall revision, or >= 2 failed tasks with the latest started in the last 14 days).
 # gated = a source was turned down by the chapter-floor gate (toc_below_floor, tocfloor1111): sources exist, the
 # gate judged them truncated, so the book is never deleted automatically (reported as held_gated). The evidence is
-# the candidate row's latest failure reason or a task error; a later different failure on the same source replaces
-# it (that source no longer counts). A high chapters_done alone is no evidence: preview sites (biquge.site/.xin)
-# list the full TOC and are later judged preview_truncated. `select gated` lists them for a nofloor- requeue.
+# the candidate row's latest failure reason or a task error. A later non-transient failure on the same source
+# replaces it (that source no longer counts; a timeout/unavailable keeps it, markCandidateFailure). A nofloor-
+# task is the explicit escape: evidence from before the book's latest nofloor- task no longer counts, whatever
+# that task ended with. A high chapters_done alone is no evidence: preview sites (biquge.site/.xin) list the full
+# TOC and are later judged preview_truncated. `select gated` lists them for a nofloor- requeue.
 gc_sql() {
 cat <<'SQL'
 CREATE TEMP TABLE gc AS
@@ -68,15 +70,19 @@ WITH l AS (
   FROM download_tasks ORDER BY book_id, id DESC
 ), f AS (
   SELECT book_id, count(*) FILTER (WHERE status IN ('failed', 'partial')) AS fails,
-         bool_or(source_revision LIKE 'lastcall-%' OR source_revision LIKE 'gc-lastcall-%') AS had_last
+         bool_or(source_revision LIKE 'lastcall-%' OR source_revision LIKE 'gc-lastcall-%') AS had_last,
+         max(id) FILTER (WHERE source_revision LIKE 'nofloor-%') AS nf_id,
+         max(created_at) FILTER (WHERE source_revision LIKE 'nofloor-%') AS nf_at
   FROM download_tasks GROUP BY book_id
 )
 SELECT lb.id,
   COALESCE(f.had_last, false) AS had_last,
   EXISTS (SELECT 1 FROM download_source_candidates c WHERE c.book_id = lb.id AND c.failure = ''
           AND c.host NOT IN ('book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com')) AS freeok,
-  (EXISTS (SELECT 1 FROM download_source_candidates c WHERE c.book_id = lb.id AND c.failure_reason = 'toc_below_floor')
-   OR EXISTS (SELECT 1 FROM download_tasks g WHERE g.book_id = lb.id AND g.error = 'toc_below_floor')) AS gated,
+  (EXISTS (SELECT 1 FROM download_source_candidates c WHERE c.book_id = lb.id AND c.failure_reason = 'toc_below_floor'
+           AND (f.nf_at IS NULL OR c.updated_at > f.nf_at))
+   OR EXISTS (SELECT 1 FROM download_tasks g WHERE g.book_id = lb.id AND g.error = 'toc_below_floor'
+              AND (f.nf_id IS NULL OR g.id > f.nf_id))) AS gated,
   COALESCE((l.status = 'failed' AND l.error ~ '^(identity_mismatch|identity_mismatch_or_no_candidate|download_failed|invalid_next_page|invalid_chapter|unsupported_toc_rule|preview_truncated|toc_limit)$')
            OR l.error LIKE '源不可用（search 阶段，已连续 % 次，停止自动重试）：no_candidates', false) AS delkind,
   COALESCE(l.source_revision LIKE 'lastcall-%' OR l.source_revision LIKE 'gc-lastcall-%'
@@ -295,12 +301,16 @@ SQL
 cmd_enqueue() {
   local ids=$1 rev=$2
   check_ids "$ids"
+  # A revision enqueues a book once (enqueue_key); re-running the same revision for an already queued book
+  # rolls the whole batch back (inserted < eligible), so every batch takes a new suffix.
+  # nofloor- (tocfloor1111): the new task runs without the chapter floor; the gated sources' 48h temporary-failure
+  # window (TEMPORARY_FAILURE_TTL_MS) is moved past in the same transaction so the escape can pick them again.
   cat <<'SQL' | "${PSQL[@]}" -v ids="$(ids_literal "$ids")" -v rev="$rev"
 BEGIN;
 CREATE TEMP TABLE want ON COMMIT DROP AS SELECT DISTINCT unnest(:'ids'::integer[]) AS id;
 CREATE TEMP TABLE prm ON COMMIT DROP AS SELECT :'rev'::text AS rev;
 DO $$
-DECLARE w int; el int; n int; r text;
+DECLARE w int; el int; n int; ro int; r text;
 BEGIN
   SELECT rev INTO r FROM prm;
   SELECT count(*) INTO w FROM want;
@@ -314,10 +324,15 @@ BEGIN
     FROM labeled_books lb JOIN want ON want.id = lb.id
     WHERE NOT EXISTS (SELECT 1 FROM download_tasks d WHERE d.book_id = lb.id AND d.status IN ('done', 'pending', 'running'))
     ON CONFLICT (enqueue_key) WHERE requested_by = 'system' AND enqueue_key IS NOT NULL DO NOTHING
-    RETURNING id)
-  SELECT count(*) INTO n FROM i;
-  IF n <> el THEN RAISE EXCEPTION 'inserted % of % eligible (% wanted)', n, el, w; END IF;
-  RAISE NOTICE 'enqueued % tasks revision % (wanted %, eligible %)', n, r, w, el;
+    RETURNING id, book_id
+  ), reopen AS (
+    UPDATE download_source_candidates c SET updated_at = now() - interval '49 hours'
+    WHERE r LIKE 'nofloor-%' AND c.book_id IN (SELECT book_id FROM i)
+      AND c.failure = 'temporary' AND c.failure_reason = 'toc_below_floor' AND c.updated_at > now() - interval '49 hours'
+    RETURNING 1)
+  SELECT (SELECT count(*) FROM i), (SELECT count(*) FROM reopen) INTO n, ro;
+  IF n <> el THEN RAISE EXCEPTION 'inserted % of % eligible (% wanted); same revision again? use a new suffix', n, el, w; END IF;
+  RAISE NOTICE 'enqueued % tasks revision % (wanted %, eligible %, gated sources reopened %)', n, r, w, el, ro;
 END $$;
 COMMIT;
 SQL

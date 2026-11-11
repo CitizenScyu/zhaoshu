@@ -210,9 +210,20 @@ export async function updateDownloadTaskProgress(
 export async function finishDownloadTask(
   sql: DownloadQueueSql,
   lease: DownloadTaskLease,
-  result: { status: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete'; error?: string },
+  result: {
+    status: 'done' | 'failed' | 'partial' | 'superseded_by_incomplete'; error?: string;
+    /** tocfloor1111：与终态同一条 UPDATE 改写进度（不出现「终态写上了、进度没改」的中间态）。 */
+    progress?: { chaptersDone: number; chaptersTotal: number; charsTotal: number };
+  },
 ): Promise<boolean> {
-  const rows = await sql`
+  const progress = result.progress;
+  const rows = progress ? await sql`
+    UPDATE download_tasks
+    SET status = ${result.status}, error = ${result.error ?? ''}, lease_owner = '', updated_at = now(),
+        chapters_done = ${progress.chaptersDone}, chapters_total = ${progress.chaptersTotal}, chars_total = ${progress.charsTotal}
+    WHERE id = ${lease.id} AND status = 'running'
+      AND lease_generation = ${lease.leaseGeneration} AND lease_owner = ${lease.leaseOwner}
+    RETURNING id` as { id: number }[] : await sql`
     UPDATE download_tasks
     SET status = ${result.status}, error = ${result.error ?? ''}, lease_owner = '', updated_at = now()
     WHERE id = ${lease.id} AND status = 'running'

@@ -12,6 +12,7 @@
 // 已用过该 revision 的书不再被选中（不会让 LIMIT 反复挑到插不进去的行）。
 // 单条语句 = 单个事务；dryRun 时插入 CTE 的条件恒假，只返回统计。
 
+import { TEMPORARY_FAILURE_TTL_MS } from './download-source-candidates';
 import { DEFAULT_POLICY_VERSION, type ImporterSql } from './importer-enqueue';
 import { PAYWALL_HOSTS } from './source-host-health';
 
@@ -45,6 +46,8 @@ export interface RequeueResult {
   selected: number;
   /** 实际插入的新系统任务数（dryRun 恒 0）。 */
   inserted: number;
+  /** tocfloor1111：nofloor- 重排挪出失败记忆窗口的闸门源数（其他前缀恒 0）。 */
+  reopened: number;
   byHost: { host: string; n: number }[];
   byReason: { reason: string; n: number }[];
 }
@@ -100,12 +103,22 @@ export async function requeueUnfinishedBooks(sql: ImporterSql, options: RequeueO
       WHERE ${!options.dryRun}
       ON CONFLICT (enqueue_key) WHERE requested_by = 'system' AND enqueue_key IS NOT NULL
       DO NOTHING
-      RETURNING id
+      RETURNING id, book_id
+    ), reopened AS (
+      -- tocfloor1111：nofloor- 重排是不带章数下限的逃生任务；同一语句把闸门拒过的源挪出 temporary 失败记忆
+      -- 窗口，否则这条任务 48h 内选不回它们（与 nosrc-tool.sh enqueue 同口径）。
+      UPDATE download_source_candidates c
+      SET updated_at = now() - (${TEMPORARY_FAILURE_TTL_MS + 3_600_000}::bigint * interval '1 millisecond')
+      WHERE ${revision.startsWith('nofloor-')} AND c.book_id IN (SELECT book_id FROM inserted)
+        AND c.failure = 'temporary' AND c.failure_reason = 'toc_below_floor'
+        AND c.updated_at > now() - (${TEMPORARY_FAILURE_TTL_MS}::bigint * interval '1 millisecond')
+      RETURNING 1
     )
     SELECT (SELECT count(*)::int FROM flagged) AS eligible,
            (SELECT count(*)::int FROM flagged WHERE paywall) AS paywall,
            (SELECT count(*)::int FROM picked) AS selected,
            (SELECT count(*)::int FROM inserted) AS inserted,
+           (SELECT count(*)::int FROM reopened) AS reopened,
            (SELECT COALESCE(jsonb_agg(jsonb_build_object('host', host, 'n', n) ORDER BY n DESC, host), '[]'::jsonb)
               FROM (SELECT host, count(*)::int AS n FROM flagged GROUP BY host ORDER BY n DESC, host LIMIT 30) h) AS by_host,
            (SELECT COALESCE(jsonb_agg(jsonb_build_object('reason', reason, 'n', n) ORDER BY n DESC, reason), '[]'::jsonb)
@@ -118,6 +131,7 @@ export async function requeueUnfinishedBooks(sql: ImporterSql, options: RequeueO
     paywall: Number(row.paywall ?? 0),
     selected: Number(row.selected ?? 0),
     inserted: Number(row.inserted ?? 0),
+    reopened: Number(row.reopened ?? 0),
     byHost: Array.isArray(row.by_host) ? row.by_host as RequeueResult['byHost'] : [],
     byReason: Array.isArray(row.by_reason) ? row.by_reason as RequeueResult['byReason'] : [],
   };

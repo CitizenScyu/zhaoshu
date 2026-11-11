@@ -900,6 +900,30 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
       expect(await progressState(id)).toMatchObject({ status: 'done', chapters_done: 3, chapters_total: 3, chars_total: 3 * 810 });
     });
 
+    it('开：done 与章数同一条 UPDATE——腿结束后进度通道再写库出错也不会留下 done 行 120/200', async () => {
+      const id = await insertTask();
+      const txt = completeText('测试书', 3);
+      let writes = 0;
+      const flaky = floorStorage({
+        progress: async (lease, update) => {
+          writes += 1;
+          if (writes > 2) throw new Error('合成库错误');
+          return updateDownloadTaskProgress(sql as never, lease, update);
+        },
+      });
+      const result = await runDownloadTask(
+        options([legAdapter(async (_task, context) => {
+          await context.progress({ chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 });
+          await context.progress({ chaptersDone: 3, chaptersTotal: 3, charsTotal: 3 * 810 });
+          return { kind: 'complete', txt, chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 };
+        })], { storage: flaky, tocFloor: true }),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(result.terminal).toBe('done');
+      expect(writes).toBe(2);
+      expect(await progressState(id)).toMatchObject({ status: 'done', chapters_done: 3, chapters_total: 3, chars_total: 3 * 810 });
+    });
+
     it('开：整本复用（腿不报进度直接 complete）⇒ done 行是本次发布的章数，不是上次领取留下的', async () => {
       const id = await insertTask('pending', { chapters_done: 120, chapters_total: 200, chars_total: 9000 });
       const txt = completeText('测试书', 3);

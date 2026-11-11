@@ -80,6 +80,25 @@ maybe('T8 storage 绑定：租约条件/心跳/进度/终态/artifact 幂等', (
     expect(await storage.finish(lease, { status: 'done', error: '' })).toBe(false); // 已终态
   });
 
+  it('终态带 progress：章数与 done 同一条 UPDATE；不带则章数原样', async () => {
+    const counts = async (id: number) =>
+      (await pg.query('SELECT status, chapters_done, chapters_total, chars_total FROM download_tasks WHERE id = $1', [id])).rows[0];
+    const storage = createWorkerStorage(sql);
+    const withProgress = await insertTask();
+    const lease = (await storage.claim('owner-a'))!;
+    expect(await storage.progress(lease, { chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 })).toBe(true);
+    expect(await storage.finish(lease, { status: 'done', error: '', progress: { chaptersDone: 90, chaptersTotal: 90, charsTotal: 4000 } })).toBe(true);
+    expect(await counts(withProgress)).toMatchObject({ status: 'done', chapters_done: 90, chapters_total: 90, chars_total: 4000 });
+    const without = await insertTask('pending', 2);
+    const second = (await storage.claim('owner-a'))!;
+    expect(await storage.progress(second, { chaptersDone: 120, chaptersTotal: 200, charsTotal: 9000 })).toBe(true);
+    expect(await storage.finish(second, { status: 'done', error: '' })).toBe(true);
+    expect(await counts(without)).toMatchObject({ status: 'done', chapters_done: 120, chapters_total: 200, chars_total: 9000 });
+    // 失租约：带 progress 也零行
+    expect(await storage.finish(second, { status: 'done', error: '', progress: { chaptersDone: 1, chaptersTotal: 1, charsTotal: 1 } })).toBe(false);
+    expect(await counts(without)).toMatchObject({ chapters_done: 120 });
+  });
+
   it('releaseClaim：租约条件回退 pending（预算耗尽不 stranding）', async () => {
     const id = await insertTask();
     const storage = createWorkerStorage(sql);
