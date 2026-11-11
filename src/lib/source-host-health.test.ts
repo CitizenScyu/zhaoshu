@@ -31,7 +31,15 @@ describe('qqpay42 付费墙 host 集合', () => {
     expect(health.isPaywallHost('x.book.qq.com')).toBe(false);
     expect(health.isPaywallHost('qq.com')).toBe(false);
     expect(health.isPaywallHost('a.example')).toBe(false);
-    expect(health.PAYWALL_HOSTS).toHaveLength(4);
+    expect(health.PAYWALL_HOSTS).toHaveLength(10);
+  });
+
+  it('jjwx1111：晋江 6 个 host 命中，主域与别的子域不连带', () => {
+    for (const host of ['www.jjwxc.net', 'm.jjwxc.net', 'wap.jjwxc.net', 'android.jjwxc.net', 'apps.jjwxc.net', 'app.jjwxc.org']) {
+      expect(health.isPaywallHost(host)).toBe(true);
+    }
+    expect(health.isPaywallHost('jjwxc.net')).toBe(false);
+    expect(health.isPaywallHost('www.jjwxc.com')).toBe(false);
   });
 });
 

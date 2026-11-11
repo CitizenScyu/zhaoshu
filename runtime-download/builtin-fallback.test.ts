@@ -494,6 +494,22 @@ describe('41-T8FB builtin-fallback', () => {
     expect(calls).toEqual(['a.example']);
   });
 
+  // jjwx1111：晋江原源预检只会判 identity_mismatch，镜像没收录时原本直接落终态；进付费墙集合后不碰原源，
+  // 整池零候选走 no_candidates 长退避（等镜像收录），与腾讯系同一条路。
+  it('jjwx1111：晋江原源 + 池零候选 ⇒ 不调原源预检，回 no_candidates 而非 identity_mismatch', async () => {
+    const h = harness({ pool: ['https://a.example/', 'https://b.example/'], noBook: ['a.example', 'b.example'] });
+    let innerCalls = 0;
+    const precheck = h.fallback.wrapPrecheck(async () => { innerCalls += 1; return IDENTITY_MISS; });
+    expect(await precheck(task({ source_url: 'https://www.jjwxc.net/onebook.php?novelid=1' }), signal()))
+      .toEqual({ ok: false, reason: 'no_candidates', retryable: true, stage: 'search' });
+    expect(innerCalls).toBe(0);
+    expect(h.searched).toEqual(['a.example', 'b.example']);
+    // 反例：非付费墙原源判 identity_mismatch、池零候选 ⇒ 仍是终态 identity_mismatch。
+    const plain = harness({ pool: ['https://a.example/'], noBook: ['a.example'] });
+    expect(await plain.fallback.wrapPrecheck(async () => IDENTITY_MISS)(task(), signal()))
+      .toEqual({ ok: false, reason: 'identity_mismatch', retryable: false });
+  });
+
   it('vipwall42：引擎腿 preview_truncated ⇒ 标 temporary 失败记忆并换下一候选源', async () => {
     const state = {
       usable: [

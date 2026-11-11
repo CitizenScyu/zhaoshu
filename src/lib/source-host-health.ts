@@ -21,12 +21,21 @@ import { stationKeyOfHost } from './source-policy';
  * 付费墙 host（qqpay42）：搜索恒命中（付费墙站挂书）但正文拿不到（~250 字 VIP 预览），
  * 选中只会 preview_truncated / host_occupied 空转。对任何下载任务都拿不到正文，
  * 故全局排除（不设 env 开关、不做任务级判定）。
+ * jjwx1111：晋江同属此类（打标名单「晋江完结榜」全是 V 文）。11-06～11 原源为 www.jjwxc.net 的 178 个任务
+ * 无一从晋江下成（done 138 全靠回退镜像，下载候选表里也没有一行晋江 host）；原源预检只会判 identity_mismatch，
+ * 镜像没收录时任务直接落终态，而不是像腾讯系那样走 no_candidates 长退避（当周 37 本）。列出的是源池实有的 6 个 host。
  */
 export const PAYWALL_HOSTS: readonly string[] = [
   'book.qq.com',
   'chuangshi.qq.com',
   'ubook.reader.qq.com',
   'yunqi.qq.com',
+  'www.jjwxc.net',
+  'm.jjwxc.net',
+  'wap.jjwxc.net',
+  'android.jjwxc.net',
+  'apps.jjwxc.net',
+  'app.jjwxc.org',
 ];
 
 const PAYWALL_HOST_SET = new Set(PAYWALL_HOSTS);

@@ -2280,7 +2280,11 @@ def _known_author_alternates(title: str, author: str, candidates: list) -> list[
 # paywall1104：与下载侧 src/lib/source-host-health.ts 的 PAYWALL_HOSTS 对齐（测试钉死两边一致）。
 # 生产 6373 条打标里 book.qq.com 2502 条——它此前不在降权集合里，常被选成主源；下载机全局
 # 排除这四个 host、全池又没有免费镜像，这些书打完标永远下载不到全本。
-PAYWALL_HOSTS = frozenset({'book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com'})
+# jjwx1111：晋江 6 个 host 同列。晋江完结榜的书引擎搜索常先命中晋江（优选组排前），主源取了晋江，
+# 下载时原源一次没成过（178 个任务全靠回退镜像）；降权后主源取镜像，只有晋江能搜到的就不打标。
+PAYWALL_HOSTS = frozenset({'book.qq.com', 'chuangshi.qq.com', 'ubook.reader.qq.com', 'yunqi.qq.com',
+                           'www.jjwxc.net', 'm.jjwxc.net', 'wap.jjwxc.net', 'android.jjwxc.net',
+                           'apps.jjwxc.net', 'app.jjwxc.org'})
 DEPRIORITIZED_SOURCE_HOSTS = PAYWALL_HOSTS
 PAYWALL_SKIP_ENV = 'LABELER_PAYWALL_SKIP'
 

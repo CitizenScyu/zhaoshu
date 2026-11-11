@@ -5,7 +5,8 @@
 //
 // 红线不变：重排只是再给一次机会，下载结果仍走原有零发布规则——缺章（partial）不发布、
 // 不进书库（DOWNLOAD_GAP_PUBLISH=1 时只缺 ≤3 章且 ≤2% 的例外：占位发布，书库标「缺 N 章」）。
-// 付费墙源（PAYWALL_HOSTS）打标的书全池无免费镜像，默认不重排，免得空烧出网。
+// 付费墙源（PAYWALL_HOSTS）打标的书默认不重排，免得空烧出网：腾讯系全池无免费镜像；晋江（jjwx1111）
+// 有镜像的已靠回退下成，剩下的多是镜像没收录（要重排显式传 includePaywall）。
 //
 // 事件键：`${id}:${policyVersion}:${sourceRevision}`，与 importer / 补账同一表达式；
 // sourceRevision 由调用方给定（如 requeue-20261104），同一 revision 重放幂等，
