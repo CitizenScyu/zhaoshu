@@ -245,3 +245,35 @@ describe('gappub1109 少量缺章端到端', () => {
     expect(github.files.size).toBe(0);
   }, 60_000);
 });
+
+// titleclean1111：开 DOWNLOAD_TITLE_CLEAN 后整本与清单章名都是剥后的，引擎边界照样对得上（不退回二次解析）。
+describe('titleclean1111 章名附言剥离端到端', () => {
+  const RAW = ['第1章 起（求月票）', '第2章 承', '第3章 转（三更）APP免费', '第4章 （求月票）'];
+  const CLEAN = ['第1章 起', '第2章 承', '第3章 转', '第4章 （求月票）'];
+  const adCatalog = RAW.map((title, i) => `<dd><a href="/chapter/index1-${i + 1}.html">${title}</a></dd>`).join('');
+  const body = (n: string) => `第${n}章合成正文。`;
+  async function adTransport(url: string, options: { signal: AbortSignal; beforeRequest?: (signal: AbortSignal) => Promise<void> }) {
+    await options.beforeRequest?.(options.signal);
+    if (url.includes('/search')) return { url, text: `<a href="${BOOK_URL}">${TITLE}</a>` };
+    if (url === BOOK_URL) return { url, text: identity + adCatalog };
+    const matched = /\/chapter\/index1-(\d+)\.html$/.exec(url);
+    if (matched) return { url, text: `<li class="chapter-content" id="article-content"><p>${body(matched[1])}</p></li>` };
+    throw new Error(`unexpected url ${url}`);
+  }
+
+  it.each([['1', CLEAN], ['0', RAW]] as const)('DOWNLOAD_TITLE_CLEAN=%s:清单 chapter_index 章名与各章首行逐字节一致', async (flag, titles) => {
+    vi.stubEnv('DOWNLOAD_TITLE_CLEAN', flag);
+    const github = new MemoryGitHub();
+    const { storage, state } = memoryStorage();
+    const result = await runDownloadTask({ storage, github, adapters: [engineAdapter(adTransport)], repositoryId: 1, branch: 'main' }, lease);
+    expect(result).toMatchObject({ processed: true, terminal: 'done' });
+    expect(state.finished).toEqual({ status: 'done', error: '' });
+    const manifest = readManifest(github);
+    expect(manifest).not.toBeNull();
+    expect(manifest!.chapter_index.map((entry) => entry.t)).toEqual(titles);
+    const book = concatVolumes(github, manifest!);
+    for (const entry of manifest!.chapter_index) {
+      expect(book.toString('utf8', entry.s, entry.e)).toBe(`${titles[entry.i]}\n\n${body(String(entry.i + 1))}\n\n`);
+    }
+  });
+});

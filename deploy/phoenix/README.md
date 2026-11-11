@@ -313,6 +313,17 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   官方总章数），其中 106 本用本闸门能拦住；m.biquge5200.cc 发布的 57 本全是 5 章的「最新章节」目录。
 - 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`；smalltoc 随 `DOWNLOAD_TOC_SHAPE=0` 关。
 
+## 章名附言剥离（titleclean1111，2026-11-11）
+
+- drop-in `zhaoshu-download-b@.service.d/94-titleclean.conf`：`DOWNLOAD_TITLE_CLEAN=1`（缺省关）。拼整本前剥掉章名尾部的
+  站点广告和求票附言（「（求月票）」「APP免费」「（三更）」「【二合一】」「（4k）」等），剥后的章名写进 book.txt 和发布清单，
+  引擎 manifest 另记 `heading`；原章名留给续传、目录哈希和正文抓取，开关前后的缓存可互相续传。
+- 只剥尾部；分部标记（上/下/一/二、1/2）、（大结局）（完）、括号里的「求生」类不动；剥完只剩编号的保留原章名。
+- 已发布的书不回改，之后重下（补抓、追更、重排）时生效；重领复用整本（pubreplay）按 manifest 的 `heading` 拼回。
+- 动机（11-11 只读）：291 份 done 清单、13.3 万章里，70 本章名带求票尾巴（「（求月票）」1233 章、「（求追读）」125 章），
+  另有 20 余本带更序、二合一。
+- 关闭：删 drop-in → `systemctl daemon-reload` → 重启 `zhaoshu-download-b@1..20`。
+
 ## release 目录布局 / 回滚
 
 ```

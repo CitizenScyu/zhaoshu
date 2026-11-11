@@ -311,6 +311,45 @@ export function tocBelowFloor(count, floor) {
   return Number.isSafeInteger(floor) && floor >= TOC_FLOOR_MIN && count < floor * TOC_FLOOR_RATIO;
 }
 
+// titleclean1111：DOWNLOAD_TITLE_CLEAN=1 时，拼整本前剥掉章名尾部的站点广告和求票附言，写进 chapter.heading（只在与原章名
+// 不同时写）。book.txt 与发布清单的章名用 heading ?? title；title 原样留给续传、tocHash 和正文抓取。
+// 只剥尾部，循环剥到不再变；剥完去掉编号前缀后没有字（「第12章 （求月票）」「第1章 【月票系统】」）就保留原章名。
+// 表沿用打标机目录比对（scripts/douban_list.py _TOC_AD_SUFFIXES），收紧三处：括号里的「求」须接广告宾语（「（求生）」不剥），
+// 去掉单独的推荐/收藏/感谢，盟主/萌主/舵主须前有感谢类词（「（盟主之争）」不剥；「为盟主加更」由加更命中）。
+// 另加 phoenix 实见的无「第」更序「（三更）」与字数标注「（4k）」。
+// 分部标记（上/下/一/二、1/2）和（大结局）（完）不动；不做全半角折叠，表里两种都列。
+// 动机（2026-11-11 phoenix 只读，291 份 done 清单、13.3 万章）：70 本章名带求票尾巴（「（求月票）」1233 章、「（求追读）」125 章），
+// 另有 20 余本带更序、二合一；阅读目录整列是附言。缺省关；已发布的书不回改，之后重下（补抓、追更、重排）时生效。
+const AD_OPEN = '[(（【\\[［『「〔]';
+const AD_BODY = '[^()（）【】\\[\\]［］『』「」〔〕]*';
+const AD_CLOSE = '[)）】\\]］』」〕]';
+const adBracket = inner => new RegExp(`${AD_OPEN}${AD_BODY}(?:${inner})${AD_BODY}${AD_CLOSE}\\s*$`, 'i');
+const HEADING_AD_TAILS = [
+  /(?:APP|ＡＰＰ)\s*免费\s*$/i,
+  /更新时间[:：]\s*\d{4}-\d{1,2}-\d{1,2}(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?\s*$/,
+  adBracket(`求(?:月票|票|推荐|收藏|订阅|追读|支持|首订|保底|评论|打赏|鲜花|全订)|月票|订阅|加更|打赏|万赏|(?:感谢|鸣谢|谢谢)${AD_BODY}(?:盟主|萌主|舵主)`),
+  adBracket('第\\s*[0-9０-９一二三四五六七八九十两]+\\s*更|[0-9０-９二三四五两]\\s*合\\s*一'),
+  new RegExp(`${AD_OPEN}\\s*[0-9０-９一二三四五六七八九十两]+\\s*更[!！~～。…]*\\s*${AD_CLOSE}\\s*$`),
+  new RegExp(`${AD_OPEN}\\s*[0-9０-９]+(?:\\.[0-9]+)?\\s*[kKｋＫwW]\\s*${AD_CLOSE}\\s*$`),
+  // 括号被站点换成空格：「第187章:魏韩对峙 三 二合一」。须前有空白，「天地二合一」类章名不动。
+  /(?<=\s)[0-9０-９二三四五两]\s*合\s*一\s*$/,
+];
+const HEADING_NUMBER_PREFIX = /^\s*(?:第\s*[0-9０-９零〇一二三四五六七八九十百千万两]+\s*[章节節回卷话話集部篇]|[0-9０-９]+\s*[.、,，:：]?|楔子|序[章言曲]?|引子|正文|番外)\s*/;
+export function titleClean(env = process.env) {
+  const raw = env.DOWNLOAD_TITLE_CLEAN?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+export function cleanChapterHeading(title) {
+  if (typeof title !== 'string') return title;
+  const base = title.replace(/\s+$/, '');
+  let heading = base;
+  for (let previous; previous !== heading;) {
+    previous = heading;
+    for (const tail of HEADING_AD_TAILS) heading = heading.replace(tail, '').replace(/\s+$/, '');
+  }
+  return heading !== base && /[\p{L}\p{N}]/u.test(heading.replace(HEADING_NUMBER_PREFIX, '')) ? heading : title;
+}
+
 // chaperr1031：DOWNLOAD_CHAPTER_ERROR_KIND=1 时，白名单外的逐章失败（chapter.error='chapter_failed'）另记 chapter.error_kind =
 // 「构造器名[:HTTP 状态][:枚举 code]」（code 取 error.code / SourcePolicyError 归类 / undici cause.code，均为常量形态，不含上游文本
 // 与 URL）；补抓成功即删。缺省/其他值 = 关（零行为变化）。只是诊断字段，任何判据都不读它。
@@ -777,7 +816,13 @@ export async function downloadBook(m, args, resolveSource, transport = fetchSour
       manifest.chapters_missing = missing.length;
       await checkpoint();
     }
-    const txt = manifest.chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
+    if (titleClean()) {
+      for (const c of manifest.chapters) {
+        const heading = cleanChapterHeading(c.title);
+        if (heading !== c.title) c.heading = heading;
+      }
+    }
+    const txt = manifest.chapters.map(c => `${c.heading ?? c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
     atomic(join(dir, 'book.txt'), txt);
     manifest.artifact = { file: 'book.txt', sha256: hash(txt), bytes: Buffer.byteLength(txt) };
     manifest.status = 'done';

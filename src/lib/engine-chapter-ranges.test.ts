@@ -80,6 +80,21 @@ describe('engineChapterRanges:按引擎拼接方式还原章节字节边界', ()
     expect(engineChapterRanges('x', undefined)).toBeNull();
     expect(engineChapterRanges('x', [])).toBeNull();
   });
+
+  it('titleclean1111：有 heading 的章按 heading 对 txt、边界章名取 heading；txt 仍是原章名或 heading 非字符串 ⇒ null', () => {
+    const chapters = [
+      { title: '第1章 起（求月票）', heading: '第1章 起', text: '甲正文。' },
+      { title: '第2章 承', heading: undefined, text: '乙正文。' },
+    ];
+    const txt = chapters.map(({ title, heading, text }) => `${heading ?? title}\n\n${text}\n\n`).join('');
+    const records: EngineChapterRecord[] = chapters.map(({ title, heading, text }) => ({
+      title, heading, chars: [...text].length, sha256: sha256(text), status: 'done',
+    }));
+    expect(engineChapterRanges(txt, records)?.map((range) => range.title)).toEqual(['第1章 起', '第2章 承']);
+    const legacy = chapters.map(({ title, text }) => `${title}\n\n${text}\n\n`).join('');
+    expect(engineChapterRanges(legacy, records)).toBeNull();
+    expect(engineChapterRanges(txt, records.map((record, i) => (i === 0 ? { ...record, heading: null } : record)))).toBeNull();
+  });
 });
 
 describe('publishBookVersion 的 chapterRanges', () => {

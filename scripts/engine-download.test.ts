@@ -14,7 +14,7 @@ import { peerOutRoots, seedFromPeers } from '../runtime-download/resume-seed';
 import { createHtmlScope, createJsonScope, evaluateField } from '../src/lib/rule-engine/evaluate';
 import { parseFieldRule } from '../src/lib/rule-engine/parse';
 import { RuleEngineError } from '../src/lib/rule-engine/types';
-import { breakerYield, chapterErrorKind, chapterNumberOf, checkPagePath, rejectLanding, tocBelowFloor, tocFloor, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf, tailProbe } from './engine-download.mjs';
+import { breakerYield, chapterErrorKind, chapterNumberOf, cleanChapterHeading, checkPagePath, rejectLanding, tocBelowFloor, tocFloor, tocPageTimeout, tocShape, tocShapeError, withLanding, chapterResume, contentFailStreak, contentRetryPasses, contentStopBookPages, downloadBook, downloadOptions, errorKindOf, gapEligible, gapPublish, hostBurstPause, keepCached, noticeUnnumbered, numberedBook, pageFetchOptions, policyCodeOf, postRedirectAllowed, previewStub, previewTail, previewTailRun, recheckYield, retryPassPauseMs, ruleFailHint, ruleHintOf, tailProbe, titleClean } from './engine-download.mjs';
 
 const dirs: string[] = [];
 afterEach(() => { vi.unstubAllGlobals(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -2077,5 +2077,89 @@ describe('tocpages1105：目录页数上限与逐页计时', () => {
     const onResult = await on.run(slowToc(on));
     expect(onResult.code).toBe(0);
     expect(onResult.manifest.chapters.every((c: { status: string }) => c.status === 'done')).toBe(true);
+  });
+});
+
+// titleclean1111：章名尾部附言剥离（DOWNLOAD_TITLE_CLEAN，缺省关）。用例取自打标机目录比对（scripts/test_douban_list.py）
+// 与 2026-11-11 phoenix 只读扫描见到的形态，书名章名均为合成。
+describe('titleclean1111 章名附言剥离', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it.each([
+    ['第129章 坑太多（求月票）APP免费', '第129章 坑太多'],
+    ['第一章 开始(求推荐)', '第一章 开始'],
+    ['第5章 打赏（感谢盟主某某打赏）', '第5章 打赏'],
+    ['第5章 再战（感谢某某成为本书盟主）', '第5章 再战'],
+    ['第6章 夜（为盟主某某加更）', '第6章 夜'],
+    ['第8章 风起（求鲜花收藏~）', '第8章 风起'],
+    ['第3章 夜（求追读）', '第3章 夜'],
+    ['第4章 晨（求首订！）', '第4章 晨'],
+    ['第6章 战（三更）', '第6章 战'],
+    ['第9章 雨（第二更）', '第9章 雨'],
+    ['第7章 和（4k）', '第7章 和'],
+    ['第13章 雪(1.5W)', '第13章 雪'],
+    ['第10章 云【二合一】', '第10章 云'],
+    ['第187章:魏韩对峙 三 二合一', '第187章:魏韩对峙 三'],
+    ['第11章 风 更新时间：2024-01-02 12:30', '第11章 风'],
+    ['第12章 回家 （求月票） （第三更）', '第12章 回家'],
+    ['第24章 夜行（求月票） ', '第24章 夜行'],
+  ])('剥：%s → %s', (raw, clean) => {
+    expect(cleanChapterHeading(raw)).toBe(clean);
+  });
+
+  it.each([
+    '求生（上）', '大战(二)', '第21章 求生（求生）', '第8章 武林大会（盟主之争）', 'APP免费的秘密', '求月票的少年与剑', '天地二合一', '第23章 二合一之战',
+    '第99章 终章（大结局）', '第20章 交锋（1/2）', '第22章 归来（完）',
+    // 剥完只剩编号（或什么都不剩）⇒ 保留原章名
+    '第12章 （求月票）', '第2章 APP免费', '第8章 二合一', '第1章 【月票系统】', '序章 （求收藏）', '（求月票）',
+  ])('不动：%s', raw => {
+    expect(cleanChapterHeading(raw)).toBe(raw);
+  });
+
+  it('开关解析：缺省/0 关，1/true/on 开；非字符串章名原样返回', () => {
+    expect(titleClean({})).toBe(false);
+    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: '0' })).toBe(false);
+    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: '1' })).toBe(true);
+    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: ' On ' })).toBe(true);
+    expect(titleClean({ DOWNLOAD_TITLE_CLEAN: 'TRUE' })).toBe(true);
+    expect(cleanChapterHeading(undefined)).toBeUndefined();
+  });
+
+  const RAW = ['第1章 起（求月票）', '第2章 承', '第3章 转（三更）APP免费', '第4章 （求月票）'];
+  const CLEAN = ['第1章 起', '第2章 承', '第3章 转', '第4章 （求月票）'];
+  const wrap = (f: ReturnType<typeof setup>) => async (url: string, opts: { signal: AbortSignal; beforeRequest?: (s: AbortSignal) => Promise<void> }) => {
+    if (url === 'https://book15.net/books/details1.html') {
+      return { url, text: `<h1>测试书</h1><div class="d-info-panel"><a href="/author/1">作者甲</a></div><meta property="og:novel:book_name" content="测试书"><meta property="og:novel:author" content="作者甲"><div class="d-chapter-list" id="full-catalog">${RAW.map((t, i) => `<dd><a href="/read/${i + 1}">${t}</a></dd>`).join('')}</div>` };
+    }
+    return f.transport(url, opts);
+  };
+  type CleanManifest = { chapters: { title: string; heading?: string; file: string }[]; artifact: { sha256: string } };
+  const bookOf = (r: { manifestPath: string }) => readFileSync(join(dirname(r.manifestPath), 'book.txt'), 'utf8');
+  /** 照引擎口径用给定章名拼整本，逐字节比 book.txt。 */
+  const joined = (r: { manifestPath: string; manifest: unknown }, titles: string[]) => (r.manifest as CleanManifest).chapters
+    .map((c, i) => `${titles[i]}\n\n${readFileSync(join(dirname(r.manifestPath), c.file), 'utf8')}\n\n`).join('');
+
+  it('开：book.txt 用剥后的章名；manifest 的 title 原样、heading 只在不同时记；续跑同一份整本', async () => {
+    vi.stubEnv('DOWNLOAD_TITLE_CLEAN', '1');
+    const f = setup();
+    const r = await f.run(wrap(f));
+    expect(r.code).toBe(0);
+    const m = r.manifest as CleanManifest;
+    expect(m.chapters.map(c => c.title)).toEqual(RAW);
+    expect(m.chapters.map(c => c.heading)).toEqual(['第1章 起', undefined, '第3章 转', undefined]);
+    expect(bookOf(r)).toBe(joined(r, CLEAN));
+    expect(JSON.parse(readFileSync(r.manifestPath, 'utf8')).chapters[0].heading).toBe('第1章 起');
+
+    const again = await f.run(wrap(f));
+    expect(again.code).toBe(0);
+    expect((again.manifest as CleanManifest).artifact.sha256).toBe(m.artifact.sha256);
+  });
+
+  it('缺省关：book.txt 照原章名，manifest 无 heading', async () => {
+    const f = setup();
+    const r = await f.run(wrap(f));
+    expect(r.code).toBe(0);
+    expect((r.manifest as CleanManifest).chapters.every(c => c.heading === undefined)).toBe(true);
+    expect(bookOf(r)).toBe(joined(r, RAW));
   });
 });

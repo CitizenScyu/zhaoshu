@@ -22,17 +22,19 @@ function layout() {
   return { base, outOf };
 }
 
-/** 照 engine-download 落一本 done：章文件 + manifest（逐章 sha256）+ book.txt。返回整本 sha。 */
-function writeBook(adapterDir: string, n = 3): { dir: string; txt: string } {
+/** 照 engine-download 落一本 done：章文件 + manifest（逐章 sha256）+ book.txt。返回整本 sha。
+ * clean：章名带求票尾巴、另记剥后的 heading（titleclean1111 开时的落盘形态）。 */
+function writeBook(adapterDir: string, n = 3, clean = false): { dir: string; txt: string } {
   const dir = join(adapterDir, ENGINE_KEY);
   mkdirSync(dir, { recursive: true });
   const chapters = Array.from({ length: n }, (_, index) => {
-    const title = `第${index + 1}章 合成`;
+    const title = `第${index + 1}章 合成${clean ? '（求月票）' : ''}`;
+    const heading = clean ? `第${index + 1}章 合成` : undefined;
     const text = `合成正文${index}`.repeat(50);
     writeFileSync(join(dir, `${index}.txt`), text);
-    return { index, title, url: `https://reader.test/${index}`, chars: [...text].length, status: 'done', file: `${index}.txt`, sha256: sha(text) };
+    return { index, title, heading, url: `https://reader.test/${index}`, chars: [...text].length, status: 'done', file: `${index}.txt`, sha256: sha(text) };
   });
-  const txt = chapters.map(c => `${c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
+  const txt = chapters.map(c => `${c.heading ?? c.title}\n\n${readFileSync(join(dir, c.file), 'utf8')}\n\n`).join('');
   writeFileSync(join(dir, 'book.txt'), txt);
   writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
     status: 'done', errors: [], chapters_total: n, chapters_done: n, chars: chapters.reduce((s, c) => s + c.chars, 0),
@@ -80,6 +82,22 @@ describe('pubreplay1110 发布退避重领复用本地整本', () => {
     writeFileSync(join(dir, '1.txt'), '被改动的正文');
     expect(findReplay(out, [], 7)).toBeNull();
     writeBook(out, 4); // 同目录被别的任务重跑：manifest 的 artifact sha 变了
+    expect(findReplay(out, [], 7)).toBeNull();
+  });
+
+  it('titleclean1111：章有 heading 时按 heading 拼回（与引擎 book.txt 同口径）；heading 被抹掉则整本 sha 不符不命中', () => {
+    const { outOf } = layout();
+    const out = join(outOf('inst-1'), ADAPTER_KEY);
+    const { dir, txt } = writeBook(out, 3, true);
+    expect(txt.startsWith('第1章 合成\n\n')).toBe(true);
+    expect(txt).not.toContain('求月票');
+    recordReplay(out, 7, sha(txt));
+    unlinkSync(join(dir, 'book.txt'));
+    expect(findReplay(out, [], 7)).toEqual(expect.objectContaining({ txt }));
+    const manifestPath = join(dir, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { chapters: { heading?: string }[] };
+    for (const chapter of manifest.chapters) delete chapter.heading;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
     expect(findReplay(out, [], 7)).toBeNull();
   });
 

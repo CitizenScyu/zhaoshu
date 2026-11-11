@@ -798,9 +798,11 @@ export interface EngineAdapterOptions {
   sourceKind?: 'builtin' | 'engine';
 }
 
-/** 引擎清单里单章的记录（engine-download.mjs 每章写 title/chars/sha256/status，这里只取这四个字段）。 */
+/** 引擎清单里单章的记录（engine-download.mjs 每章写 title/chars/sha256/status，这里只取这几个字段）。 */
 export interface EngineChapterRecord {
   title?: unknown;
+  /** titleclean1111：拼整本时写进 book.txt 的章名（剥掉尾部附言后与 title 不同才有）。 */
+  heading?: unknown;
   chars?: unknown;
   sha256?: unknown;
   status?: unknown;
@@ -808,7 +810,7 @@ export interface EngineChapterRecord {
 
 /**
  * 按引擎拼整本的真实方式还原每章在 txt 里的字节边界：engine-download.mjs 把整本拼成逐章
- * `${title}\n\n${正文}\n\n` 的顺序串接（book.txt 即此串）。逐章核对——标题逐字相符、正文码点数
+ * `${heading ?? title}\n\n${正文}\n\n` 的顺序串接（book.txt 即此串）。逐章核对——章名逐字相符、正文码点数
  * 等于记录的 chars（`[...text].length` 口径）、正文 sha256 等于记录值、段尾是 `\n\n`，全部走完
  * 恰好到 txt 结尾；任一不符返回 null（调用方不给边界，发布器退回解析，不猜）。
  * 章名去掉首尾空白：阅读端按「首行 trim 后等于章名」去掉重复的标题行（ReaderClient）。
@@ -820,7 +822,8 @@ export function engineChapterRanges(txt: string, chapters: readonly EngineChapte
   let byte = 0; // UTF-8 字节偏移
   for (const [index, chapter] of chapters.entries()) {
     const record: EngineChapterRecord = chapter ?? {};
-    const { title, chars, sha256 } = record;
+    const { chars, sha256 } = record;
+    const title = record.heading === undefined ? record.title : record.heading;
     if (record.status !== 'done' || typeof title !== 'string' || typeof sha256 !== 'string'
       || typeof chars !== 'number' || !Number.isSafeInteger(chars) || chars < 0) return null;
     const head = `${title}\n\n`;

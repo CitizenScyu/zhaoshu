@@ -38,12 +38,13 @@ function rebuild(dir: string, manifest: EngineManifest): string | null {
   let txt = '';
   for (const chapter of chapters) {
     const file = (chapter as { file?: unknown }).file;
-    if (chapter.status !== 'done' || typeof chapter.title !== 'string' || typeof chapter.sha256 !== 'string'
+    const heading = chapter.heading === undefined ? chapter.title : chapter.heading; // titleclean1111
+    if (chapter.status !== 'done' || typeof heading !== 'string' || typeof chapter.sha256 !== 'string'
       || typeof file !== 'string' || !/^\d+\.txt$/.test(file)) return null;
     let text: string;
     try { text = readFileSync(join(dir, file), 'utf8'); } catch { return null; }
     if (sha256(text) !== chapter.sha256) return null;
-    txt += `${chapter.title}\n\n${text}\n\n`;
+    txt += `${heading}\n\n${text}\n\n`;
   }
   return sha256(txt) === manifest.artifact.sha256 ? txt : null;
 }
