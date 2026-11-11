@@ -9,13 +9,14 @@
 //
 // 流程：预检按（书名, 作者）查番茄搜索（共享限速，结果落 memo），命中就跳过原预检和扫池；下载腿拿不到（失败/
 // 残缺）退回原腿走免费源，下载器被占用则排队（host_occupied，不计 attempt）。TXT 去掉文件头、按目录标题切章，
-// 重排成引擎同款 `标题\n\n正文\n\n` 并给 chapterRanges。
+// 重排成引擎同款 `标题\n\n正文\n\n` 并给 chapterRanges；DOWNLOAD_TITLE_CLEAN 开时标题同引擎一样剥附言尾巴。
 // 日额度和熔断靠 <dir>/events-<UTC 日期>.log 追加记录（20 实例共用；O_APPEND 无竞争，当日 0 点起重新计）。
 // 文件只存书号和原因码，不存书名、作者。读写失败一律当无记忆（优化不是门，退回免费源）。
 import { createHash } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { basename, dirname, join } from 'node:path';
+import { cleanChapterHeadings, titleClean } from '../scripts/engine-download.mjs';
 import type { AdapterOutcome, SourceAdapter, TaskRow } from '../src/lib/download-worker';
 import type { TxtChapter } from '../src/lib/txt-chapters';
 import type { RateLimiterLike } from './engine';
@@ -170,9 +171,9 @@ function dropRepeatedHeads(lines: readonly string[], lineKeys: string[], titles:
  * 番茄 TXT → 引擎格式。文件头（书籍信息/简介）到分隔线为止；章节按目录标题找整行（前后都是空行），
  * 不靠「第N章」正则——番外、后记这类标题没有章号。正文里重复的标题行先按逐字相同裁掉；再严格按目录顺序找；
  * 找不齐再容许局部错位，但此时要求独立成行的目录标题恰好与目录一一对应（多一行都不认）。
- * 章节按目录顺序输出、标题以目录为准；找不齐返回 null（不猜）。
+ * 章节按目录顺序输出、标题以目录为准；找不齐返回 null（不猜）。headings 只换输出标题（标题清洗），切章仍按 titles。
  */
-export function rebuildFanqieTxt(raw: string, titles: readonly string[]): RebuiltBook | null {
+export function rebuildFanqieTxt(raw: string, titles: readonly string[], headings: readonly string[] = titles): RebuiltBook | null {
   if (!titles.length) return null;
   const rule = /^—{20,}$/m.exec(raw);
   if (!rule) return null;
@@ -197,7 +198,7 @@ export function rebuildFanqieTxt(raw: string, titles: readonly string[]): Rebuil
   let charsTotal = 0;
   let byte = 0;
   bodies.forEach((body, index) => {
-    const title = titles[index].trim();
+    const title = (headings[index] ?? titles[index]).trim();
     const part = `${title}\n\n${body}\n\n`;
     const size = Buffer.byteLength(part, 'utf8');
     parts.push(part);
@@ -398,7 +399,7 @@ export function createFanqieLeg(options: FanqieLegOptions): FanqieLeg {
     if (raw === null) return 'unreadable';
     if (result.missing) return 'text_damaged';
     const titles = Array.isArray(result.titles) ? result.titles.filter((t): t is string => typeof t === 'string') : [];
-    const book = rebuildFanqieTxt(raw, titles);
+    const book = rebuildFanqieTxt(raw, titles, titleClean() ? cleanChapterHeadings(titles) : titles);
     if (!book) return 'rebuild_failed';
     if (book.charsTotal < MIN_BOOK_CHARS) return 'too_short';
     const damaged = book.txt.match(DAMAGED_CHAR)?.length ?? 0;

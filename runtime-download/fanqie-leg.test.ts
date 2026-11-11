@@ -157,6 +157,13 @@ describe('rebuildFanqieTxt', () => {
     expect(rebuildFanqieTxt(raw('楔子', '零', '第1章 入学', '第一章 入学', '甲', '第2章 校规', '乙'), titles)!.txt)
       .toBe('楔子\n\n零\n\n第一章 入学\n\n第一章 入学\n\n甲\n\n第二章 校规\n\n乙\n\n');
   });
+  it('headings 只换输出标题和 chapterRanges，切章仍按目录原文', () => {
+    const titles = ['第1章 入学（求月票）', '第2章 校规'];
+    const book = rebuildFanqieTxt(raw('第1章 入学（求月票）', '甲', '第2章 校规', '乙'), titles, ['第1章 入学', '第2章 校规'])!;
+    expect(book.txt).toBe('第1章 入学\n\n甲\n\n第2章 校规\n\n乙\n\n');
+    expect(book.chapterRanges.map(r => r.title)).toEqual(['第1章 入学', '第2章 校规']);
+    expect(book.chapterRanges[1].endByte).toBe(Buffer.byteLength(book.txt, 'utf8'));
+  });
 });
 
 describe('预检', () => {
@@ -215,6 +222,26 @@ describe('下载腿', () => {
     expect(existsSync(join(dir, 'out', 'a.txt'))).toBe(false);
     const day = new Date().toISOString().slice(0, 10);
     expect(readFileSync(join(dir, `events-${day}.log`), 'utf8')).toBe(`ok ${ID} done\n`);
+  });
+  it('DOWNLOAD_TITLE_CLEAN=1 才剥章节标题的附言尾巴（同引擎）', async () => {
+    const titles = ['第1章 入学（求月票）'];
+    const reply = { rc: 0, result: { status: 'done', file: 'a.txt', titles, missing: 0, pua: 0, replacement: 0 } };
+    const run = async () => {
+      const { dir, adapter, precheck } = setup({ reply });
+      writeFileSync(join(dir, 'out', 'a.txt'), raw(titles[0], LONG));
+      await precheck(TASK);
+      const outcome = await adapter.download(TASK, context());
+      return outcome.kind === 'complete' ? outcome : null;
+    };
+    expect((await run())?.txt.startsWith('第1章 入学（求月票）\n\n')).toBe(true);
+    vi.stubEnv('DOWNLOAD_TITLE_CLEAN', '1');
+    try {
+      const outcome = await run();
+      expect(outcome?.txt.startsWith('第1章 入学\n\n')).toBe(true);
+      expect(outcome?.chapterRanges?.[0].title).toBe('第1章 入学');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
   it('占用：host_occupied 排队，不走原腿、不记事件', async () => {
     for (const reply of [{ rc: 75, result: null }, { rc: null, result: null }]) {
