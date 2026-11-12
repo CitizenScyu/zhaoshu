@@ -410,7 +410,8 @@ cmd_gapfill() {
 CREATE TEMP TABLE gf ON COMMIT DROP AS
 WITH d AS (
   SELECT DISTINCT ON (book_id) book_id, chapters_done, chapters_total, updated_at
-  FROM download_tasks WHERE status = 'done' ORDER BY book_id, id DESC
+  FROM download_tasks WHERE status IN ('done', 'partial') AND chapters_done > 0
+  ORDER BY book_id, id DESC
 ), t AS (
   SELECT book_id, count(*)::int AS tries, max(created_at) AS last_try
   FROM download_tasks WHERE source_revision LIKE 'gapfill-%' GROUP BY book_id
@@ -420,6 +421,11 @@ SELECT d.book_id AS id, d.chapters_total - d.chapters_done AS missing, COALESCE(
     + interval '1 hour' * :base * power(2, COALESCE(t.tries, 0)) <= now() AS due
 FROM d LEFT JOIN t ON t.book_id = d.book_id
 WHERE d.chapters_done < d.chapters_total
+  -- gapdead1112：只看最新 done 会漏掉「从没发布过、最新任务停在 partial 缺章」的书——它们既进不了
+  -- 补抓（最新任务不是 done）、gcrun 也把 missing_chapters 判 held 不删，永久卡死（生产 58 本）。
+  -- 取最新一条有进度的 done/partial 判定；已发布到全章的书（追更重下失败等）不再补抓。
+  AND NOT EXISTS (SELECT 1 FROM book_artifacts a
+                  WHERE a.labeled_book_id = d.book_id AND a.chapters_done >= d.chapters_total)
   AND NOT EXISTS (SELECT 1 FROM download_tasks a WHERE a.book_id = d.book_id AND a.status IN ('pending', 'running'));
 SELECT bucket || ' ' || count(*) || ' books ' || sum(missing) || ' chapters' FROM (
   SELECT missing, CASE WHEN tries >= :max THEN 'gap_capped' WHEN due THEN 'gap_due' ELSE 'gap_waiting' END AS bucket FROM gf) s
