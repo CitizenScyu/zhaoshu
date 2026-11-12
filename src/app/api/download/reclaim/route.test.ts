@@ -75,7 +75,8 @@ describe('GET /api/download/reclaim (F16 周期回收)', () => {
     expect(query).toContain("status = 'running' AND updated_at < now()");
     expect(query).toContain("interval '1 millisecond'");
     expect(sql.mock.calls[0].slice(1)).toEqual([
-      16, 16, 16, 15 * 60_000, 30 * 60_000, 16,
+      // nocand42reclaim：no_candidates 长曲线常量（1h/4h）先于短曲线参数传入。
+      16, 16, 16, 60 * 60_000, 4 * 60 * 60_000, 15 * 60_000, 30 * 60_000, 16,
       '\nworker 中断自动回收，退避后重新入队', '\nworker 中断自动回收', 30 * 60_000,
     ]);
   });
