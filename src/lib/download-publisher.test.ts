@@ -201,15 +201,16 @@ describe('T3 发布器:五阶段与合成 HTTP 故障', () => {
 
   // volprune1112:旧版卷数多于新版(书收缩/分卷参数变化)时,规范区尾卷是死字节——读端按清单
   // refs 优先快照区,多出的 vol-00N 永远读不到。清单提交后从后往前删;快照区内容寻址不动。
-  it('晋升后旧版多出的尾卷被删:3 卷旧版 → 1卷新版,vol-002/003 清掉,vol-001 与快照卷保留', async () => {
+  // 注:bookText 的书名/作者行使 parseTxtChapters 生成「前言」章,3 个【第N章】行 ⇒ 4 章 4 卷。
+  it('晋升后旧版多出的尾卷被删:4 卷旧版 → 1卷新版,vol-002/003/004 清掉,vol-001 与快照卷保留', async () => {
     const github = new MemoryGitHub();
     const { volumePath } = snapshotPaths(TITLE, AUTHOR);
-    // 旧版:3 章、卷上限压到每章一卷 ⇒ 3 卷
+    // 旧版:3 章正文、卷上限压到每章一卷 ⇒ 4 卷(含前言)
     await publishBookVersion(github, guardOk, {
       taskId: 41, title: TITLE, author: AUTHOR, txt: bookText(3, 1000),
       chaptersDone: 3, chaptersTotal: 3, charsTotal: 3000,
     }, { maxVolumeBytes: 1 });
-    expect(github.files.has(volumePath(2))).toBe(true); // 3 卷落地
+    expect(github.files.has(volumePath(3))).toBe(true); // 4 卷落地
     github.calls.length = 0;
     // 新版:更多章(晋升)且更大卷上限 ⇒ 单卷
     const result = await publishBookVersion(github, guardOk, {
@@ -220,10 +221,11 @@ describe('T3 发布器:五阶段与合成 HTTP 故障', () => {
     expect(github.files.has(volumePath(0))).toBe(true); // 新 vol-001 在
     expect(github.files.has(volumePath(1))).toBe(false); // vol-002 已删
     expect(github.files.has(volumePath(2))).toBe(false); // vol-003 已删
+    expect(github.files.has(volumePath(3))).toBe(false); // vol-004 已删
     // 删除发生在清单 PUT 之后(提交点之后才清理)
     const dels = github.calls.filter(call => call.op === 'del').map(call => call.path);
     const manifestPut = github.calls.findIndex(call => call.op === 'put' && call.path.endsWith('/index.json'));
-    expect(dels).toEqual([volumePath(1), volumePath(2)]);
+    expect(dels).toEqual([volumePath(1), volumePath(2), volumePath(3)]);
     expect(manifestPut).toBeGreaterThan(-1);
     for (const path of dels) {
       expect(github.calls.findIndex(call => call.op === 'del' && call.path === path)).toBeGreaterThan(manifestPut);

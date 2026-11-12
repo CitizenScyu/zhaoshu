@@ -360,8 +360,9 @@ export const QUERY_INSENSITIVE_OVERLAP = 0.8;
  * probebudget1112：联网取页（netjs1029 构造阶段、fieldnet1029 bookList 阶段）各最多 MAX_NET_FETCHES=4 页
  * 且每页独立 8s 超时——开关全关时只有主搜索+对照搜索 2 个请求（旧口径 16.35s）；searchNetJsEnabled 开时
  * 主/对照的 URL 构造各可再取 ≤4 页，字段联网 JS 生效时主/对照的 bookList 各可再取 ≤4 页，单探最坏涨到
- * 18 请求 × 8s + 节流。旧静态常量按 2 请求预留，最后一探会把整轮预算击穿约 10 倍、signal abort 后本轮
- * 已探结论全部不落库。改为函数按开关组合计算；关联网时值与旧常量逐字相等（21.35s 止损门不变）。
+ * 18 请求 ×（8s+节流）。旧静态常量按 2 请求预留，最后一探会把整轮预算击穿约 10 倍、signal abort 后本轮
+ * 已探结论全部不落库。改为函数按开关组合计算；关联网时值与旧常量逐字相等（probethrottle1112 后为
+ * 2×(8s+350ms)=16.7s 止损门）。
  */
 export function admissionProbeWorstMs(env: NodeJS.ProcessEnv = process.env): number {
   // 联网帧生效判定与 search-js.ts searchNetJsEnabled / compile.ts fieldNetJsEnabled 同口径：
@@ -378,8 +379,8 @@ export function admissionProbeWorstMs(env: NodeJS.ProcessEnv = process.env): num
   return requests * (ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS);
 }
 
-/** 兼容旧引用：关联网开关时的静态值（单测与既有断言口径）。 */
-export const ADMISSION_PROBE_WORST_MS = 2 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
+/** 兼容旧引用：关联网开关时的静态值（单测与既有断言口径）。probethrottle1112 后与函数全关值逐字相等。 */
+export const ADMISSION_PROBE_WORST_MS = admissionProbeWorstMs({} as NodeJS.ProcessEnv);
 
 /**
  * 探测侧熔断（probecircuit1026）：一轮里大面积 conn_fail 多半是探测端出网故障，不是源同时死了。

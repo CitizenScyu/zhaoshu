@@ -98,14 +98,20 @@ maybe('nosrc-tool.sh gc：章数下限闸门证据（held_gated）', () => {
   // gapzero1112：生产 6464「缺章 0/0：operation_timeout」——目录都没拿到，既不是 gapfill 的补抓对象
   // （没有缺口可算），也不在原 delkind 表内，会永远卡在「gc 判 held、gapfill 选不中」的空洞里。
   // 只对 chapters_total=0 生效：有章数的 partial 是缺章，交给 gapfill，不能因为原因不在表内就删半本书。
+  // bareBook：裸书夹具——book() 的基线行自带 chapters_total=300（QQ 付费墙书史），会触发
+  // gapclash1112 的「更早总量行」排除，本组用例要的正是「全书从没拿到过目录」。
+  const bareBook = async (title: string) => Number(((await pg.query(
+    `INSERT INTO labeled_books(title, author, source_url) VALUES ($1, '合成作者', 'https://book.qq.com/book-detail/1') RETURNING id`,
+    [title])).rows[0] as { id: number }).id);
+
   it('0/0 且原因不在原 delkind 表内（operation_timeout 等）⇒ 可删；有章数的同原因 partial ⇒ 不删', async () => {
-    const zeroTimeout = await book('合成零章超时书');
+    const zeroTimeout = await bareBook('合成零章超时书');
     await pg.query(
       `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
                                   source_revision, error, chapters_done, chapters_total)
        VALUES (NULL, $1, '合成书', '合成作者', 'partial', 'https://book.qq.com/book-detail/1', 'system', 'builtin',
                'lastcall-20261109', '缺章 0/0：operation_timeout', 0, 0)`, [zeroTimeout]);
-    const hasChapters = await book('合成有章超时书');
+    const hasChapters = await bareBook('合成有章超时书');
     await pg.query(
       `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
                                   source_revision, error, chapters_done, chapters_total)
@@ -126,6 +132,7 @@ maybe('nosrc-tool.sh gc：章数下限闸门证据（held_gated）', () => {
   // gapclash1112：gcrun 的 0/0 子句与 gapfill 补抓梯子跨冲突——gapfill 的 d CTE 会绕过 0/0 最新行、
   // 从更早的 chapters_total>0 行算缺口继续补抓（书正处 6 次/63 天梯子上）。若本书有更早总量行，
   // 0/0 只是补抓途中目录前超时：不删，让梯子走完；只有全书从没拿到过目录的 0/0 才按空洞删。
+  // onLadder 用 book()（基线行 300 章即「更早总量行」）；neverToc 用 bareBook（无任何基线任务行）。
   it('0/0 最新行 + 更早 chapters_total>0 行（gapfill 梯子上）⇒ 不删；全书无总量行的 0/0 ⇒ 仍可删', async () => {
     const onLadder = await book('合成梯子上书');
     await pg.query(
@@ -138,7 +145,7 @@ maybe('nosrc-tool.sh gc：章数下限闸门证据（held_gated）', () => {
                                   source_revision, error, chapters_done, chapters_total)
        VALUES (NULL, $1, '合成书', '合成作者', 'partial', 'https://book.qq.com/book-detail/1', 'system', 'builtin',
                'gapfill-20261112', '缺章 0/0：operation_timeout', 0, 0)`, [onLadder]);
-    const neverToc = await book('合成无目录书');
+    const neverToc = await bareBook('合成无目录书');
     await pg.query(
       `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
                                   source_revision, error, chapters_done, chapters_total)

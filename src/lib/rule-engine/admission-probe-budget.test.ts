@@ -11,7 +11,7 @@ const on = (env: Record<string, string>) => env as unknown as NodeJS.ProcessEnv;
 describe('probebudget1112：单探最坏墙钟按联网开关放大', () => {
   it('全关 = 旧静态常量（主搜索+节流+对照搜索，逐字相等）', () => {
     expect(admissionProbeWorstMs(on({}))).toBe(ADMISSION_PROBE_WORST_MS);
-    expect(admissionProbeWorstMs(on({}))).toBe(2 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS);
+    expect(admissionProbeWorstMs(on({}))).toBe(2 * (ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS));
   });
 
   it('只开搜索联网 JS（三开关齐）⇒ 主/对照各加 4 页构造，2+8 请求', () => {
