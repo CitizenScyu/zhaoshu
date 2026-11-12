@@ -35,6 +35,7 @@ class RecordingGitHub implements GitHubContents {
     const text = this.files.get(path);
     return text === undefined ? null : Buffer.from(text, 'utf8');
   }
+  async del(path: string): Promise<void> { this.calls++; this.files.delete(path); }
 }
 
 const guardOk = { check: async () => {} };

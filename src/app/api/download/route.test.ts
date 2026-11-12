@@ -65,9 +65,10 @@ function expectSafeReclaim(index: number) {
   expect(query).toMatch(/WHERE status = 'running' AND updated_at < now\(\) - \(\?::bigint \* interval '1 millisecond'\)$/);
   expect(sql.mock.calls[index].slice(1)).toEqual([
     // 退避梯封顶 30min（SOURCE_RETRY_MAX_DELAY_MS，download-task-policy.ts:13）；
-    // nocand42reclaim：no_candidates 标记走 1h/4h 长曲线常量（先于短曲线参数传入）；
+    // nocand42reclaim：no_candidates 标记走 1h/4h 长曲线常量，参数序与 SQL 一致——
+    // 两对 base 在前（NO_CAND 1h、SOURCE 15m）、两对 max 在后（NO_CAND 4h、SOURCE 30m）；
     // 末位 30min 为 DOWNLOAD_TASK_STALE_MS。
-    16, 16, 16, 60 * 60_000, 4 * 60 * 60_000, 15 * 60_000, 30 * 60_000, 16,
+    16, 16, 16, 60 * 60_000, 15 * 60_000, 4 * 60 * 60_000, 30 * 60_000, 16,
     '\nworker 中断自动回收，退避后重新入队', '\nworker 中断自动回收', 30 * 60_000,
   ]);
   // 41-zombieocc：回收紧随其后同步清僵尸占用行——占用行的 task 不在 running 即视为残留。

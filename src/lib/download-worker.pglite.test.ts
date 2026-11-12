@@ -52,6 +52,11 @@ class MemoryGitHub implements GitHubContents {
     const text = this.files.get(path);
     return text === undefined ? null : Buffer.from(text, 'utf8');
   }
+  async del(path: string): Promise<void> {
+    this.calls.push({ path, op: 'del' });
+    if (this.failAt?.op === 'del' && this.failAt.pathPattern.test(path)) throw this.failAt.error;
+    this.files.delete(path);
+  }
 }
 
 function scriptAdapter(outcome: AdapterOutcome | ((context: SourceAdapterContext) => Promise<AdapterOutcome>), hooks?: { onStart?: () => void; onProgressCalls?: { chaptersDone: number; chaptersTotal: number; charsTotal: number }[] }): SourceAdapter {

@@ -29,7 +29,7 @@ function candidate(overrides: Partial<PublishCandidate> = {}): PublishCandidate 
 
 class MemoryGitHub implements GitHubContents {
   files = new Map<string, string>();
-  calls: { path: string; op: 'put' | 'get'; message?: string }[] = [];
+  calls: { path: string; op: 'put' | 'get' | 'del'; message?: string }[] = [];
   constructor(public failures: Partial<Record<'snapshot' | 'manifest' | 'canonical' | 'pointer', Error>> = {}) {}
   // 阶段识别:按路径形态归类(与 publishBookVersion 的调用顺序无关,靠路径可区分)。
   private matches(stage: string, path: string): boolean {
@@ -56,6 +56,11 @@ class MemoryGitHub implements GitHubContents {
     if (path.endsWith('current.json')) this.check('pointer', path);
     const text = this.files.get(path);
     return text === undefined ? null : Buffer.from(text, 'utf8');
+  }
+  async del(path: string): Promise<void> {
+    this.calls.push({ path, op: 'del' });
+    if (this.matches('canonical', path)) this.check('canonical', path);
+    this.files.delete(path);
   }
 }
 
@@ -192,6 +197,54 @@ describe('T3 发布器:五阶段与合成 HTTP 故障', () => {
     expect(rejected).toMatchObject({ promoted: false, reason: 'superseded_by_incomplete' });
     expect(CHAPTER_PROMOTION_RATIO).toBe(0.9);
     expect(CHARS_PROMOTION_RATIO).toBe(0.7);
+  });
+
+  // volprune1112:旧版卷数多于新版(书收缩/分卷参数变化)时,规范区尾卷是死字节——读端按清单
+  // refs 优先快照区,多出的 vol-00N 永远读不到。清单提交后从后往前删;快照区内容寻址不动。
+  it('晋升后旧版多出的尾卷被删:3 卷旧版 → 1卷新版,vol-002/003 清掉,vol-001 与快照卷保留', async () => {
+    const github = new MemoryGitHub();
+    const { volumePath } = snapshotPaths(TITLE, AUTHOR);
+    // 旧版:3 章、卷上限压到每章一卷 ⇒ 3 卷
+    await publishBookVersion(github, guardOk, {
+      taskId: 41, title: TITLE, author: AUTHOR, txt: bookText(3, 1000),
+      chaptersDone: 3, chaptersTotal: 3, charsTotal: 3000,
+    }, { maxVolumeBytes: 1 });
+    expect(github.files.has(volumePath(2))).toBe(true); // 3 卷落地
+    github.calls.length = 0;
+    // 新版:更多章(晋升)且更大卷上限 ⇒ 单卷
+    const result = await publishBookVersion(github, guardOk, {
+      taskId: 42, title: TITLE, author: AUTHOR, txt: bookText(5, 1000),
+      chaptersDone: 5, chaptersTotal: 5, charsTotal: 5000,
+    }, { maxVolumeBytes: 10 * 1024 * 1024 });
+    expect(result.promoted).toBe(true);
+    expect(github.files.has(volumePath(0))).toBe(true); // 新 vol-001 在
+    expect(github.files.has(volumePath(1))).toBe(false); // vol-002 已删
+    expect(github.files.has(volumePath(2))).toBe(false); // vol-003 已删
+    // 删除发生在清单 PUT 之后(提交点之后才清理)
+    const dels = github.calls.filter(call => call.op === 'del').map(call => call.path);
+    const manifestPut = github.calls.findIndex(call => call.op === 'put' && call.path.endsWith('/index.json'));
+    expect(dels).toEqual([volumePath(1), volumePath(2)]);
+    expect(manifestPut).toBeGreaterThan(-1);
+    for (const path of dels) {
+      expect(github.calls.findIndex(call => call.op === 'del' && call.path === path)).toBeGreaterThan(manifestPut);
+    }
+    // 快照卷(内容寻址)不在清理范围
+    expect(github.calls.filter(call => call.op === 'del' && call.path.includes('/.snapshots/'))).toHaveLength(0);
+  });
+
+  it('卷数不缩(3 卷 → 3 卷):零删除,行为与旧版一致', async () => {
+    const github = new MemoryGitHub();
+    await publishBookVersion(github, guardOk, {
+      taskId: 41, title: TITLE, author: AUTHOR, txt: bookText(3, 1000),
+      chaptersDone: 3, chaptersTotal: 3, charsTotal: 3000,
+    }, { maxVolumeBytes: 1 });
+    github.calls.length = 0;
+    const result = await publishBookVersion(github, guardOk, {
+      taskId: 42, title: TITLE, author: AUTHOR, txt: bookText(4, 1000),
+      chaptersDone: 4, chaptersTotal: 4, charsTotal: 4000,
+    }, { maxVolumeBytes: 1 });
+    expect(result.promoted).toBe(true);
+    expect(github.calls.filter(call => call.op === 'del')).toHaveLength(0);
   });
 
   it('正常晋升:旧 50 章新 60 章 → 规范更新、指针前移、history 含两代', async () => {

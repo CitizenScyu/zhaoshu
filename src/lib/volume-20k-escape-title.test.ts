@@ -58,6 +58,7 @@ class MemoryGitHub implements GitHubContents {
     const text = this.files.get(path);
     return text === undefined ? null : Buffer.from(text, 'utf8');
   }
+  async del(path: string): Promise<void> { this.files.delete(path); }
 }
 
 /** 标题里含换行符的书源不存在(LF/CR 被 parseTxtChapters 当行分隔),故此类语料直接造 entries。 */

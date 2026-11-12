@@ -114,5 +114,24 @@ export function createGitHubContents({
       if (!res.ok) throw httpError(res.status);
       return Buffer.from(await res.arrayBuffer());
     },
+
+    // volprune1112：删文件（contents API DELETE，带 sha 防并发覆盖）。文件已不存在视为成功——
+    // 清理语义是「尾部卷不在」，别的发布者先删了同样是收敛。
+    async del(path, message) {
+      const { url } = apiUrl(repository, path);
+      for (let attempt = 0; ; attempt += 1) {
+        const sha = await currentSha(url);
+        if (sha === null) return;
+        const res = await request(url, 'application/vnd.github+json', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, sha, branch }),
+        });
+        if (res.ok) return;
+        if (res.status === 404) return;
+        if (res.status !== 409 || attempt >= conflictRetries) throw httpError(res.status);
+        await sleep(1000 * 2 ** attempt * (0.5 + Math.random()));
+      }
+    },
   };
 }

@@ -18,6 +18,7 @@ class MemoryStore implements GitHubContents, SnapshotGcStore {
     const text = this.files.get(path);
     return text === undefined ? null : Buffer.from(text, 'utf8');
   }
+  async del(path: string): Promise<void> { await this.deleteFile(path); }
   async listFiles(dir: string): Promise<string[]> {
     const prefix = `${dir}/`;
     return [...this.files.keys()]

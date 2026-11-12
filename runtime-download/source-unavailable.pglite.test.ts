@@ -63,6 +63,7 @@ class MemoryGitHub implements GitHubContents {
   calls: string[] = [];
   async put(path: string): Promise<void> { this.calls.push(`put ${path}`); }
   async getBytes(path: string): Promise<Buffer | null> { this.calls.push(`get ${path}`); return null; }
+  async del(path: string): Promise<void> { this.calls.push(`del ${path}`); }
 }
 
 /** 日预算替身：与 shell daily-budget 同语义（领取成功才扣 1，触顶拒绝），并记下每次退还的票据。 */

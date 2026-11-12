@@ -76,6 +76,7 @@ class MemoryGitHub implements GitHubContents {
     const text = this.files.get(path);
     return text === undefined ? null : Buffer.from(text, 'utf8');
   }
+  async del(path: string): Promise<void> { this.files.delete(path); }
 }
 
 const hostOf = (url: string) => new URL(url).hostname;

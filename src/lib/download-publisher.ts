@@ -107,6 +107,8 @@ export interface SnapshotManifest {
   chars: number;
   generated_at?: string;
   task_id?: number | string;
+  /** volprune1112:读回的 v2 清单自带卷表(旧单文件清单没有);尾卷清理按它数旧卷数。 */
+  volumes?: { path?: unknown }[];
   [key: string]: unknown;
 }
 
@@ -135,6 +137,8 @@ export interface SnapshotPaths {
 export interface GitHubContents {
   put(path: string, text: string, message: string): Promise<void>;
   getBytes(path: string): Promise<Buffer | null>;
+  /** volprune1112:删规范区尾卷(旧版卷数多于新版时)。 */
+  del(path: string, message: string): Promise<void>;
 }
 
 /** 写前租约检查;失败必须抛 LeaseLostError。 */
@@ -614,6 +618,18 @@ export async function publishBookVersion(
     const priorManifest = await github.getBytes(canonicalPath);
     if (priorManifest !== null && parseManifestBlobSha(priorManifest) === blobSha) return; // 已是本内容
     await github.put(canonicalPath, manifestText, `download: ${label}`);
+    // volprune1112:旧版卷数多于新版时,清单已提交 ⇒ 新版为真,规范区尾卷(vol-00N)是死字节。
+    // 读端 volumeReadPaths 优先快照区且按清单 refs 取卷,多出的尾卷永远读不到;快照区
+    // (v-<sha8>.txt)内容寻址、跨版本共享,不在清理范围。失败只丢清理不回滚发布(已提交点
+    // 之后);下一版(或同内容重试,上面 return 前)会再试。按旧清单声明的卷数从后往前删,
+    // 不用列目录——卷名就是本目录的 vol-00N 连续序。
+    const oldVolumeCount = baseline.manifest?.volumes?.length;
+    if (typeof oldVolumeCount === 'number' && Number.isSafeInteger(oldVolumeCount) && oldVolumeCount > volumes.length) {
+      for (let index = volumes.length; index < oldVolumeCount; index += 1) {
+        await guard.check();
+        await github.del(paths.volumePath(index), `prune: ${label}`);
+      }
+    }
   });
 
   await guarded('pointer', guard, async () => {
