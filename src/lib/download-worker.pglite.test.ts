@@ -218,7 +218,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     it('user 任务不拦（显式重下合法）：同产物、requested_by=user ⇒ 照常下载', async () => {
       await publishArtifact(1, 128, 128);
       const id = await insertTask();
-      await pg.query(`UPDATE download_tasks SET requested_by = 'user' WHERE id = $1`, [id]);
+      await pg.query(`UPDATE download_tasks SET requested_by = 'user', user_id = 1 WHERE id = $1`, [id]);
       const result = await runDownloadTask(
         skipOptions(scriptAdapter({ kind: 'complete', txt: completeText('测试书', 3), chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })),
         (await claimDownloadTask(sql as never, 'worker-a'))!,
