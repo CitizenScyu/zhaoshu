@@ -16,20 +16,20 @@ describe('probebudget1112：单探最坏墙钟按联网开关放大', () => {
 
   it('只开搜索联网 JS（三开关齐）⇒ 主/对照各加 4 页构造，2+8 请求', () => {
     const env = on({ ENGINE_SEARCH_NET_JS: '1', ENGINE_SYNTAX_JS: '1', ENGINE_SYNTAX_JSOUP: '1' });
-    expect(admissionProbeWorstMs(env)).toBe((2 + 2 * 4) * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS);
+    expect(admissionProbeWorstMs(env)).toBe((2 + 2 * 4) * (ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS));
   });
 
   it('只开字段联网 JS（三开关齐）⇒ 主/对照各加 4 页 bookList，2+8 请求', () => {
     const env = on({ ENGINE_FIELD_NET_JS: '1', ENGINE_SYNTAX_JS: '1', ENGINE_SYNTAX_JSOUP: '1' });
-    expect(admissionProbeWorstMs(env)).toBe((2 + 2 * 4) * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS);
+    expect(admissionProbeWorstMs(env)).toBe((2 + 2 * 4) * (ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS));
   });
 
-  it('两套联网全开（生产现状）⇒ 18 请求 × 8s + 节流 ≈ 144.35s', () => {
+  it('两套联网全开（生产现状）⇒ 18 请求 ×（8s+节流）≈ 150.3s（probethrottle1112：节流按请求数放大）', () => {
     const env = on({
       ENGINE_SEARCH_NET_JS: '1', ENGINE_FIELD_NET_JS: '1',
       ENGINE_SYNTAX_JS: '1', ENGINE_SYNTAX_JSOUP: '1',
     });
-    expect(admissionProbeWorstMs(env)).toBe(18 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS);
+    expect(admissionProbeWorstMs(env)).toBe(18 * (ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS));
     expect(admissionProbeWorstMs(env)).toBeGreaterThan(ADMISSION_PROBE_WORST_MS * 8);
   });
 

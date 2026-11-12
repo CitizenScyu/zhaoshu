@@ -371,7 +371,11 @@ export function admissionProbeWorstMs(env: NodeJS.ProcessEnv = process.env): num
   // 主搜索 + 对照搜索各 1 请求；联网开时每段再各加 MAX_NET_FETCHES(4) 页（构造 + bookList）。
   const netFetchesPerSide = (netJs ? 4 : 0) + (fieldNetJs ? 4 : 0);
   const requests = 2 + 2 * netFetchesPerSide;
-  return requests * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
+  // probethrottle1112：节流不止发 1 次——最坏路径里每个外部请求前都固定歇 ADMISSION_THROTTLE_MS
+  // （主/对照构造的分页间隔、搜索前、bookList 分页，约 requests-1 次），只计 1 次会漏掉约
+  // (requests-1)×350ms ≈ 5.95s（requests=18），起探时剩余预算恰在阈值边缘的话仍会击穿。
+  // 按请求数放大节流项，保守取 requests 次。
+  return requests * (ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS);
 }
 
 /** 兼容旧引用：关联网开关时的静态值（单测与既有断言口径）。 */
