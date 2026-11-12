@@ -291,6 +291,41 @@ maybe('v7 下载队列：迁移、幂等入队与租约 fencing', () => {
     expect(await taskState(eighth.id)).toMatchObject({ status: 'pending', attempt_count: 9, delay_min: 30 });
   });
 
+  // nocand42reclaim：崩溃的 no_candidates 书按 error 标记走长曲线（与 worker 腿 settleSourceUnavailable
+  // 同口径），否则会被打回 30m 短曲线多烧一轮出网。
+  async function staleSystemTaskWithError(bookId: number, attemptCount: number, error: string) {
+    const [{ id }] = (await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, status, requested_by, policy_version, enqueue_key, attempt_count, error)
+       VALUES (NULL, $1, '崩溃nocand', 'pending', 'system', 'p1', $2, $3, $4) RETURNING id`,
+      [bookId, `${bookId}:p1:`, attemptCount, error],
+    )).rows as { id: number }[];
+    await claimDownloadTask(sql as never, 'crashed-worker');
+    await pg.query("UPDATE download_tasks SET updated_at = now() - interval '2 hours' WHERE id = $1", [id]);
+    return id;
+  }
+
+  it('nocand42reclaim：error 带 no_candidates 标记 ⇒ 长曲线（第 3 次 ⇒ 4h 封顶）', async () => {
+    const id = await staleSystemTaskWithError(
+      64, 3, '源不可用（search 阶段，第 3 次）：no_candidates，自动退避重试',
+    );
+    await reclaimStaleTasks(sql as never);
+    expect(await taskState(id)).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 240 });
+  });
+
+  it('nocand42reclaim：无标记仍走短曲线（第 3 次 ⇒ 30m），达上限 failed 不受标记影响', async () => {
+    const id = await staleSystemTaskWithError(
+      65, 3, '源不可用（search 阶段，第 3 次）：source_unavailable，自动退避重试',
+    );
+    await reclaimStaleTasks(sql as never);
+    expect(await taskState(id)).toMatchObject({ status: 'pending', attempt_count: 4, delay_min: 30 });
+    await pg.query("UPDATE download_tasks SET status = 'done' WHERE id = $1", [id]);
+    const capped = await staleSystemTaskWithError(
+      66, 16, '源不可用（search 阶段，第 16 次）：no_candidates，自动退避重试',
+    );
+    await reclaimStaleTasks(sql as never);
+    expect(await taskState(capped)).toMatchObject({ status: 'failed', attempt_count: 16, delay_min: null });
+  });
+
   it('B2-03 reclaim：达上限（attempt_count=16）的 system 任务落 failed，不再入队', async () => {
     const { id } = await staleSystemTask(63, 16);
     await reclaimStaleTasks(sql as never);
