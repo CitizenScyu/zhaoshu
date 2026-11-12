@@ -79,10 +79,10 @@ describe('tocfloor1111 执行器透传', () => {
 
 // donedup1113：skipCompleted 透传给 worker（开 = 产物已完整的 system 任务领取即 done，不出网）。
 describe('donedup1113 执行器透传', () => {
-  const adapter = vi.fn(async () => complete) as unknown as SourceAdapter['download'];
-  const skipped = (): SourceAdapter => ({ kind: 'engine', download: adapter });
-  const doneRow = (): TaskRow => ({ ...row, artifact_complete: true });
+  const download = vi.fn(async (): Promise<AdapterOutcome> => complete);
+  const skipped = (): SourceAdapter => ({ kind: 'engine', download });
   const finish = vi.fn<WorkerStorage['finish']>().mockResolvedValue(true);
+  const doneRow = (): TaskRow => ({ ...row, artifact_complete: true });
   const harnessSkip = async (taskRow: TaskRow) => {
     const storage: WorkerStorage = {
       claim: async () => lease,
@@ -108,15 +108,15 @@ describe('donedup1113 执行器透传', () => {
   };
 
   it('skipCompleted 开 + artifact_complete ⇒ 不调用 adapter 直接 finish done', async () => {
-    finish.mockClear(); adapter.mockClear();
+    finish.mockClear(); download.mockClear();
     await harnessSkip(doneRow());
-    expect(adapter).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
     expect(finish).toHaveBeenCalledWith(lease, { status: 'done', error: '' });
   });
 
   it('skipCompleted 开但 artifact_complete 缺省（旧 storage）⇒ 照常下载', async () => {
-    finish.mockClear(); adapter.mockClear();
+    finish.mockClear(); download.mockClear();
     await harnessSkip(row);
-    expect(adapter).toHaveBeenCalled();
+    expect(download).toHaveBeenCalled();
   });
 });
