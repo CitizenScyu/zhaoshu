@@ -29,12 +29,16 @@ export function createWorkerStorage(sql: DownloadSql): RuntimeWorkerStorage {
     // tocfloor1111：chapter_floor = 同一本书全部任务行（含本行）chapters_done 的最大值；source_revision 以 nofloor- 开头的
     // 任务不带下限（NULL，供人工对个别书关掉下限闸门）。本行的 chapters_done/chapters_total/chars_total 一并取回，
     // 任务层开着 tocFloor 时用它作「历次最高进度」的初值（见 download-worker runDownloadTask）。
+    // donedup1113：artifact_complete = 本书已有完整已发布产物（published + chapters_total>0 + 全章）。
+    // chapters_total>0 不可省：预留行（reserveArtifactPath 建的）两值默认 0，0>=0 会误判完整。
     async taskRow(id) {
       const rows = await sql`
         SELECT t.id, t.book_id, t.title, t.author, t.status, t.source_url, t.source_kind, t.source_id, t.requested_by, t.attempt_count,
           t.chapters_done, t.chapters_total, t.chars_total,
           CASE WHEN t.source_revision LIKE 'nofloor-%' THEN NULL
-               ELSE (SELECT max(o.chapters_done) FROM download_tasks o WHERE o.book_id = t.book_id)::int END AS chapter_floor
+               ELSE (SELECT max(o.chapters_done) FROM download_tasks o WHERE o.book_id = t.book_id)::int END AS chapter_floor,
+          EXISTS (SELECT 1 FROM book_artifacts a WHERE a.labeled_book_id = t.book_id
+                  AND a.quality_status = 'published' AND a.chapters_total > 0 AND a.chapters_done >= a.chapters_total) AS artifact_complete
         FROM download_tasks t WHERE t.id = ${id}` as unknown as TaskRow[];
       return rows[0] ?? null;
     },

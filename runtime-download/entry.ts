@@ -478,6 +478,8 @@ export async function createDownloadExecutor(options: ProductionExecutorOptions)
     ...(env.DOWNLOAD_ARTIFACT_RELOCATE === '1' ? { relocateArtifacts: true } : {}),
     // tocfloor1111：章数下限闸门的任务层配套（见 WorkerOptions.tocFloor），与引擎共用 DOWNLOAD_TOC_FLOOR 的判定。缺省关。
     ...(tocFloor(env) ? { tocFloor: true } : {}),
+    // donedup1113：产物已完整的 system 任务领取即 done（见 WorkerOptions.skipCompleted）。缺省关。
+    ...(env.DOWNLOAD_SKIP_COMPLETED === '1' ? { skipCompleted: true } : {}),
     // 数据库配额（Neon 402）长退避：默认 30 分钟，env DB_QUOTA_BACKOFF_MS 覆盖；恢复后在 cron_health 补记。
     quotaBackoffMs: dbQuotaBackoffMs(env),
     recordQuotaSeen: quotaSql ? (seenAt => recordDbQuotaSeen(quotaSql, seenAt)) : undefined,

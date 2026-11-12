@@ -179,6 +179,88 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
     expect((await pg.query('SELECT count(*)::int AS n FROM book_artifacts')).rows[0].n).toBe(0);
   });
 
+  // donedup1113：产物已完整的 system 任务领取即 done（出网前拦）。生产背景：retrofix*/gapfill*
+  // 手工批次入列不查产物完整度，书已全章发布后任务仍在 no_candidates 退避循环里每轮重扫全池空烧。
+  // 用 createWorkerStorage 的真实 taskRow（拦截标志由那条 SELECT 计算），不是测试自己的内联绑定。
+  describe('donedup1113 产物已完整的 system 任务领取即收口', () => {
+    const publishArtifact = async (labeledBookId: number, done: number, total: number, status = 'published') => {
+      await pg.query(
+        `INSERT INTO book_artifacts (labeled_book_id, identity_key, repository_id, branch, canonical_path,
+                                      quality_status, published_at, blob_sha, bytes, version, chapters_total, chapters_done, chars)
+         VALUES ($1, 'donedup-' || $1::text, 1, 'main', 'donedup/' || $1::text || '/index.json',
+                 $2, CASE WHEN $2 = 'published' THEN now() ELSE NULL END,
+                 CASE WHEN $2 = 'published' THEN '0000000000000000000000000000000000000000' ELSE NULL END,
+                 CASE WHEN $2 = 'published' THEN 12345 ELSE 0 END,
+                 CASE WHEN $2 = 'published' THEN 'v1' ELSE '' END,
+                 $3, $4, 12345)`,
+        [labeledBookId, status, total, done],
+      );
+    };
+    const realStorage = () => createWorkerStorage(sql as never);
+    const skipOptions = (adapter: SourceAdapter): WorkerOptions =>
+      options([adapter], { skipCompleted: true, storage: { ...storage(), taskRow: id => realStorage().taskRow(id) } });
+
+    it('published 且全章 ⇒ 直接 done，adapter 不被调用、零出网', async () => {
+      await publishArtifact(1, 128, 128);
+      const id = await insertTask();
+      let adapterRan = false;
+      const result = await runDownloadTask(
+        skipOptions(scriptAdapter({ kind: 'failure', code: 'should_never_run' }, { onStart: () => { adapterRan = true; } })),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(adapterRan).toBe(false);
+      expect(result).toMatchObject({ processed: true, terminal: 'done', reason: 'artifact_already_complete' });
+      expect((await taskState(id)).status).toBe('done');
+      expect(github.calls).toHaveLength(0);
+    });
+
+    it('user 任务不拦（显式重下合法）：同产物、requested_by=user ⇒ 照常下载', async () => {
+      await publishArtifact(1, 128, 128);
+      const id = await insertTask();
+      await pg.query(`UPDATE download_tasks SET requested_by = 'user' WHERE id = $1`, [id]);
+      const result = await runDownloadTask(
+        skipOptions(scriptAdapter({ kind: 'complete', txt: completeText('测试书', 3), chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(result.terminal).toBe('done');
+      expect(result.reason).not.toBe('artifact_already_complete');
+    });
+
+    it('预留行（reserved、0/0）不算完整：reserveArtifactPath 建的行默认两值 0，照常下载', async () => {
+      await publishArtifact(1, 0, 0, 'reserved');
+      const id = await insertTask();
+      const result = await runDownloadTask(
+        skipOptions(scriptAdapter({ kind: 'complete', txt: completeText('测试书', 3), chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(result.terminal).toBe('done');
+      expect(result.reason).not.toBe('artifact_already_complete');
+    });
+
+    it('缺章的 published 产物（300/500）不算完整：照常下载', async () => {
+      await publishArtifact(1, 300, 500);
+      await insertTask();
+      const result = await runDownloadTask(
+        skipOptions(scriptAdapter({ kind: 'complete', txt: completeText('测试书', 3), chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(result.terminal).toBe('done');
+      expect(result.reason).not.toBe('artifact_already_complete');
+    });
+
+    it('skipCompleted 缺省关：同产物完整也不拦（与引入前逐字一致）', async () => {
+      await publishArtifact(1, 128, 128);
+      await insertTask();
+      const result = await runDownloadTask(
+        options([scriptAdapter({ kind: 'complete', txt: completeText('测试书', 3), chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })],
+          { storage: { ...storage(), taskRow: id2 => realStorage().taskRow(id2) } }),
+        (await claimDownloadTask(sql as never, 'worker-a'))!,
+      );
+      expect(result.terminal).toBe('done');
+      expect(result.reason).not.toBe('artifact_already_complete');
+    });
+  });
+
   it('adapter 失败（failure）置 failed，同样零发布', async () => {
     const id = await insertTask();
     const result = await runDownloadTask(options([scriptAdapter({ kind: 'failure', code: 'identity_mismatch_or_no_candidate' })]), (await claimDownloadTask(sql as never, 'worker-a'))!);

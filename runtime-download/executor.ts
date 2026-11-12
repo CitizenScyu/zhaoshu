@@ -134,6 +134,8 @@ export interface ExecutorDependencies {
   relocateArtifacts?: boolean;
   /** tocfloor1111：透传 WorkerOptions.tocFloor。entry 由 env DOWNLOAD_TOC_FLOOR（1/true/on）开，缺省关。 */
   tocFloor?: boolean;
+  /** donedup1113：透传 WorkerOptions.skipCompleted（产物已完整的 system 任务领取即 done）。entry 由 env DOWNLOAD_SKIP_COMPLETED=1 开，缺省关。 */
+  skipCompleted?: boolean;
   // ---- 测试注入缝 ----
   now?: () => number;
   /** 冷却等待；signal 中止时须尽快 resolve（不 reject）。 */
@@ -180,6 +182,7 @@ export function createExecutor(deps: ExecutorDependencies): DownloadExecutor {
     ...(deps.prePublishCheck ? { prePublishCheck: true } : {}),
     ...(deps.relocateArtifacts ? { relocateArtifacts: true } : {}),
     ...(deps.tocFloor ? { tocFloor: true } : {}),
+    ...(deps.skipCompleted ? { skipCompleted: true } : {}),
   });
   // 书源不可达的结构化日志：扣额度前预检与下载腿打同一行，只含原因码/阶段/源 host/下次可重试时刻。
   const logSourceUnavailable = (reason: string, stage: string, host: string, retryAt: string | null, hostWait = false) =>

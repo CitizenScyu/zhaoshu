@@ -57,6 +57,11 @@ export interface TaskRow {
   chapters_done?: number;
   chapters_total?: number;
   chars_total?: number;
+  /**
+   * donedup1113：本书已有完整已发布产物（quality_status='published' 且 chapters_total>0 且
+   * chapters_done>=chapters_total，与 nosrc-tool gapfill 的排除判据同口径）。旧调用方/桩可不带。
+   */
+  artifact_complete?: boolean;
 }
 
 export type AdapterOutcome =
@@ -270,6 +275,13 @@ export interface WorkerOptions {
    * 缺省关 = 与引入前逐字一致。
    */
   tocFloor?: boolean;
+  /**
+   * donedup1113：领取后、出网前拦「本书已有完整已发布产物」的 system 任务直接终态 done。
+   * 生产背景：61 个 retrofix*/gapfill* 手工批次任务在 no_candidates 退避循环空烧——批次入列不查
+   * 产物完整度，书实际早已全章发布，每轮退避重扫仍烧全池出网（约 110 次/本/轮）。user 任务不拦
+   * （显式重下合法）。缺省关 = 与引入前逐字一致。
+   */
+  skipCompleted?: boolean;
 }
 
 /** 切仓决策注入缝：端口（候选仓证据 + 显式时钟）与闭包重建工厂均由调用方（entry/测试）注入。 */
@@ -395,6 +407,16 @@ export async function runDownloadTask(
   if (task.status !== 'running') {
     // 领取语句与行读取之间被回收/终态化：停止，不写任何状态。
     return { processed: false, reason: 'task_not_running_after_claim' };
+  }
+
+  // donedup1113：system 任务的书已有完整已发布产物 ⇒ 直接终态 done（带产物真实章数），不再出网。
+  // retrofix*/gapfill* 手工批次入列不查产物完整度，书早已全章发布后任务仍会在 no_candidates
+  // 退避循环里每轮重扫全池（约 110 次出网/本/轮）空烧。user 任务不拦：显式重下合法。
+  // artifact_complete 缺省（旧 storage/桩）不拦，逐字同改前。
+  if (options.skipCompleted && task.requested_by === 'system' && task.artifact_complete) {
+    const written = await storage.finish(lease, { status: 'done', error: '' });
+    if (!written) throw new TaskLeaseLostError();
+    return { processed: true, terminal: 'done', reason: 'artifact_already_complete' };
   }
 
   // prepub1102：发布前预检（默认关）。identity_key 唯一 ⇒ 每本书只有一条落位，而

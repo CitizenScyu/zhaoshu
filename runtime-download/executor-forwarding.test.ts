@@ -12,7 +12,7 @@ const row: TaskRow = {
 };
 const complete: AdapterOutcome = { kind: 'complete', txt: '合成正文', chaptersTotal: 1, chaptersDone: 1, charsTotal: 4 };
 
-function harness(flags: { prePublishCheck?: boolean; tocFloor?: boolean }, adapter: SourceAdapter = { kind: 'engine', download: async () => complete }) {
+function harness(flags: { prePublishCheck?: boolean; tocFloor?: boolean; skipCompleted?: boolean }, adapter: SourceAdapter = { kind: 'engine', download: async () => complete }) {
   const findArtifactIdentityOwner = vi.fn<NonNullable<WorkerStorage['findArtifactIdentityOwner']>>().mockResolvedValue(null);
   const progress = vi.fn<WorkerStorage['progress']>().mockResolvedValue(true);
   const storage: WorkerStorage = {
@@ -74,5 +74,49 @@ describe('tocfloor1111 执行器透传', () => {
     const { run, progress } = harness({}, rejected());
     expect(await run()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     expect(progress.mock.calls.map(call => call[1].chaptersDone)).toEqual([120, 0]);
+  });
+});
+
+// donedup1113：skipCompleted 透传给 worker（开 = 产物已完整的 system 任务领取即 done，不出网）。
+describe('donedup1113 执行器透传', () => {
+  const adapter = vi.fn(async () => complete) as unknown as SourceAdapter['download'];
+  const skipped = (): SourceAdapter => ({ kind: 'engine', download: adapter });
+  const doneRow = (): TaskRow => ({ ...row, artifact_complete: true });
+  const finish = vi.fn<WorkerStorage['finish']>().mockResolvedValue(true);
+  const harnessSkip = async (taskRow: TaskRow) => {
+    const storage: WorkerStorage = {
+      claim: async () => lease,
+      taskRow: async () => taskRow,
+      heartbeat: async () => true,
+      progress: async () => true,
+      finish,
+      defer: async () => null,
+      reserveArtifactPath: async () => 1,
+      findArtifactBinding: async () => null,
+      registerArtifact: async () => 'registered',
+    };
+    const budget: DailyBudgetLike = {
+      read: async () => ({ used: 0, limit: 5 }),
+      consume: async () => ({ allowed: true, date: '2026-11-13' }),
+    };
+    const executor = createExecutor({
+      storage, github: { put: async () => {}, getBytes: async () => null, del: async () => {} },
+      adapters: [skipped()], budget, repositoryId: 1, branch: 'main', owner: 'owner',
+      decisions: DEFAULT_DECISIONS, skipCompleted: true,
+    });
+    await executor.runOnce();
+  };
+
+  it('skipCompleted 开 + artifact_complete ⇒ 不调用 adapter 直接 finish done', async () => {
+    finish.mockClear(); adapter.mockClear();
+    await harnessSkip(doneRow());
+    expect(adapter).not.toHaveBeenCalled();
+    expect(finish).toHaveBeenCalledWith(lease, { status: 'done', error: '' });
+  });
+
+  it('skipCompleted 开但 artifact_complete 缺省（旧 storage）⇒ 照常下载', async () => {
+    finish.mockClear(); adapter.mockClear();
+    await harnessSkip(row);
+    expect(adapter).toHaveBeenCalled();
   });
 });
