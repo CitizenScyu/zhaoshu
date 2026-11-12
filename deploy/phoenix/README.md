@@ -213,7 +213,8 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
     关停：`systemctl disable --now zhaoshu-nosrc-gc.timer`。
 - **备份**（`backup`）：全库 `pg_dump -Fc`，涉及的 7 张表（书、产物、任务、候选、预取、追更、
   容量预留）按书 id 导出 CSV，生成单事务的 `restore.sh`。gcrun 的备份在 `/root/zs-backup/nosrc-gc-<时间>/`，
-  回滚跑其中的 `restore.sh`。
+  回滚跑其中的 `restore.sh`。bakkeep1112：gcrun 收尾只保留最近 `ZS_GC_KEEP_BACKUPS`（默认 14）份
+  `nosrc-gc-*` 备份目录，旧的自动清掉（只匹配本脚本自己的目录名，其他备份不动）。
 - **删除**（`delete`）在一个事务里先做这些检查，任一不符就整体回滚：
   - 外键白名单、无用户触发器；
   - 锁住这些书，逐本复核仍符合清理条件（gc 模式在加锁后重算规则，期间被排上任务的书会让整批回滚）；

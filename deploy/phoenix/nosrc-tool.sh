@@ -16,6 +16,8 @@ GAP_MAX_TRIES=${ZS_GAP_MAX_TRIES:-6}
 GAP_MAX_ENQUEUE=${ZS_GAP_MAX_ENQUEUE:-100}
 GAP_BASE_HOURS=${ZS_GAP_BASE_HOURS:-24}
 [[ $GAP_MAX_TRIES =~ ^[0-9]+$ && $GAP_MAX_ENQUEUE =~ ^[0-9]+$ && $GAP_BASE_HOURS =~ ^[0-9]+$ ]] || { echo "bad ZS_GAP_*" >&2; exit 3; }
+GC_KEEP_BACKUPS=${ZS_GC_KEEP_BACKUPS:-14}
+[[ $GC_KEEP_BACKUPS =~ ^[0-9]+$ ]] || { echo "bad ZS_GC_KEEP_BACKUPS" >&2; exit 3; }
 GC_DELETE_WHERE="delkind AND final AND NOT freeok AND NOT gated"
 GC_LAST_WHERE="NOT ($GC_DELETE_WHERE) AND NOT had_last"
 REV=lastcall-20261109
@@ -401,6 +403,15 @@ cmd_gcrun() {
   fi
   if [ -s "$last" ]; then
     cmd_enqueue "$last" "gc-lastcall-$(date +%Y%m%d)"
+  fi
+  # bakkeep1112：gc 备份只保留最近 GC_KEEP_BACKUPS 份（每份是全库 dump + 7 表 CSV，无清理则
+  # 按天无界增长）。只匹配本脚本自己的 nosrc-gc-YYYYMMDD-HHMMSS 目录名；别的备份一概不动。
+  local old
+  old=$(ls -1d "$BASE"/nosrc-gc-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | sort | head -n -"$GC_KEEP_BACKUPS" || true)
+  if [ -n "$old" ]; then
+    echo "$old" | while IFS= read -r d; do
+      case $d in "$BASE"/nosrc-gc-[0-9]*-[0-9]*) rm -rf -- "$d" && echo "gc backup pruned: $d" ;; esac
+    done
   fi
 }
 
