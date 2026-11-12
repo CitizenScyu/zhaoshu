@@ -91,7 +91,11 @@ SELECT lb.id,
            -- 可算），也不在原 delkind 表内时，会永远留在「gc 判 held、gapfill 选不中」的空洞里
            -- （生产 6464：缺章 0/0：operation_timeout）。只对 0/0 生效——有章数的 partial 是缺章，交给
            -- gapfill 补抓，不能因为原因不在表内就删掉半本书。
-           OR (l.chapters_total = 0 AND l.error ~ '^(缺章 [0-9]+/0：)?(operation_timeout|toc_changed|budget_exhausted)$'),
+           -- gapclash1112：gapfill 的 d CTE 会绕过 0/0 最新行、从更早的 chapters_total>0 行算缺口继续补抓
+           -- （书正处 6 次/63 天补抓梯子上）。若本书存在更早的总量行，0/0 只是补抓途中目录前超时——
+           -- 排除，让梯子走完；只有全书从没拿到过目录（无更早总量行）的 0/0 才按空洞删。
+           OR (l.chapters_total = 0 AND l.error ~ '^(缺章 [0-9]+/0：)?(operation_timeout|toc_changed|budget_exhausted)$'
+               AND NOT EXISTS (SELECT 1 FROM download_tasks e WHERE e.book_id = l.book_id AND e.chapters_total > 0)),
            false) AS delkind,
   COALESCE(l.source_revision LIKE 'lastcall-%' OR l.source_revision LIKE 'gc-lastcall-%'
            OR (COALESCE(f.fails, 0) >= 2 AND l.created_at > now() - interval '14 days'), false) AS final,

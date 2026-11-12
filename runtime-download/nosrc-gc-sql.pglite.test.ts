@@ -123,6 +123,39 @@ maybe('nosrc-tool.sh gc：章数下限闸门证据（held_gated）', () => {
     ]);
   });
 
+  // gapclash1112：gcrun 的 0/0 子句与 gapfill 补抓梯子跨冲突——gapfill 的 d CTE 会绕过 0/0 最新行、
+  // 从更早的 chapters_total>0 行算缺口继续补抓（书正处 6 次/63 天梯子上）。若本书有更早总量行，
+  // 0/0 只是补抓途中目录前超时：不删，让梯子走完；只有全书从没拿到过目录的 0/0 才按空洞删。
+  it('0/0 最新行 + 更早 chapters_total>0 行（gapfill 梯子上）⇒ 不删；全书无总量行的 0/0 ⇒ 仍可删', async () => {
+    const onLadder = await book('合成梯子上书');
+    await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
+                                  source_revision, error, chapters_done, chapters_total)
+       VALUES (NULL, $1, '合成书', '合成作者', 'partial', 'https://book.qq.com/book-detail/1', 'system', 'builtin',
+               'gapfill-20261112', '缺章 300/500：missing_chapters', 300, 500)`, [onLadder]);
+    await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
+                                  source_revision, error, chapters_done, chapters_total)
+       VALUES (NULL, $1, '合成书', '合成作者', 'partial', 'https://book.qq.com/book-detail/1', 'system', 'builtin',
+               'gapfill-20261112', '缺章 0/0：operation_timeout', 0, 0)`, [onLadder]);
+    const neverToc = await book('合成无目录书');
+    await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
+                                  source_revision, error, chapters_done, chapters_total)
+       VALUES (NULL, $1, '合成书', '合成作者', 'partial', 'https://book.qq.com/book-detail/1', 'system', 'builtin',
+               'lastcall-20261109', '缺章 0/0：operation_timeout', 0, 0)`, [neverToc]);
+
+    await pg.exec('DROP TABLE IF EXISTS gc;');
+    await pg.exec(gcSql!);
+    const rows = (await pg.query(
+      `SELECT id, delkind, (${deleteWhere}) AS del FROM gc WHERE id IN (${onLadder}, ${neverToc}) ORDER BY id`))
+      .rows as { id: number; delkind: boolean; del: boolean }[];
+    expect(rows).toEqual([
+      { id: onLadder, delkind: false, del: false },
+      { id: neverToc, delkind: true, del: true },
+    ]);
+  });
+
   // cmd_enqueue 的 SQL 原文；psql 变量换成字面量。
   const enqueueSql = (ids: number[], rev: string) =>
     /\ncmd_enqueue\(\) \{\n[\s\S]*?cat <<'SQL' \| [^\n]*\n([\s\S]*?)\nSQL\n\}/.exec(script)![1]
