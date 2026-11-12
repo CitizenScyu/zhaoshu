@@ -33,16 +33,23 @@ maybe('nosrc-tool.sh gapfill：partial 缺章书也要补抓', () => {
      VALUES (NULL, $1, '合成书', '合成作者', $2, 'https://book15.net/b/1.html', 'system', 'builtin', $3, $4, $5,
              now() - interval '1 hour' * $6, now() - interval '1 hour' * $6)`,
     [bookId, status, status === 'partial' ? `缺章 ${done}/${total}：missing_chapters` : '', done, total, ageHours]);
+  // $1 同时进 int 列与 || 拼接：不显式 ::int 时 PGlite 会判 inconsistent types deduced for parameter $1。
+  // blob_sha 受 CHECK ^[a-f0-9]{40}$ 约束；published 还要求 bytes>0、version<>''。
   const artifact = (bookId: number, done: number, total: number) => pg.query(
     `INSERT INTO book_artifacts(labeled_book_id, identity_key, repository_id, branch, canonical_path, snapshot_path,
                                 version, blob_sha, bytes, chapters_total, chapters_done, chars, source_revision, quality_status, published_at)
-     VALUES ($1, 'k' || $1, 1, 'main', 'p/' || $1, 's/' || $1, 1, 'sha', 1, $2, $3, 1, '', 'ok', now())`,
+     VALUES ($1::int, 'k' || $1::int, 1, 'main', 'p/' || $1::int, 's/' || $1::int, 'v1', repeat('a', 40), 1, $2, $3, 1, '', 'published', now())`,
     [bookId, total, done]);
 
+  // 脚本里是 CREATE TEMP TABLE gf ON COMMIT DROP：psql 里整段包在 BEGIN/COMMIT 中，事务提交才丢；
+  // PGlite 逐条 autocommit，ON COMMIT DROP 会建完即删。测试里去掉该子句，靠下一轮 DROP 清理。
+  const gapDdl = gapSql!.replace('ON COMMIT DROP', '');
+  // gf 里含 gap_due / gap_waiting / gap_capped 三档；真正的入队集合是 due AND tries < max（脚本里 :max=6）。
   const selected = async () => {
     await pg.exec('DROP TABLE IF EXISTS gf;');
-    await pg.exec(gapSql!);
-    return (await pg.query('SELECT id, missing FROM gf ORDER BY id')).rows as { id: number; missing: number }[];
+    await pg.exec(gapDdl);
+    return (await pg.query('SELECT id, missing FROM gf WHERE due AND tries < 6 ORDER BY id')).rows as
+      { id: number; missing: number }[];
   };
 
   it('脚本里取得到 gapfill 选取 SQL', () => {
