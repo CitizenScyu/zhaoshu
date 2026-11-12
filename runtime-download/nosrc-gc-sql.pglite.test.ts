@@ -95,6 +95,34 @@ maybe('nosrc-tool.sh gc：章数下限闸门证据（held_gated）', () => {
     ]);
   });
 
+  // gapzero1112：生产 6464「缺章 0/0：operation_timeout」——目录都没拿到，既不是 gapfill 的补抓对象
+  // （没有缺口可算），也不在原 delkind 表内，会永远卡在「gc 判 held、gapfill 选不中」的空洞里。
+  // 只对 chapters_total=0 生效：有章数的 partial 是缺章，交给 gapfill，不能因为原因不在表内就删半本书。
+  it('0/0 且原因不在原 delkind 表内（operation_timeout 等）⇒ 可删；有章数的同原因 partial ⇒ 不删', async () => {
+    const zeroTimeout = await book('合成零章超时书');
+    await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
+                                  source_revision, error, chapters_done, chapters_total)
+       VALUES (NULL, $1, '合成书', '合成作者', 'partial', 'https://book.qq.com/book-detail/1', 'system', 'builtin',
+               'lastcall-20261109', '缺章 0/0：operation_timeout', 0, 0)`, [zeroTimeout]);
+    const hasChapters = await book('合成有章超时书');
+    await pg.query(
+      `INSERT INTO download_tasks(user_id, book_id, title, author, status, source_url, requested_by, source_kind,
+                                  source_revision, error, chapters_done, chapters_total)
+       VALUES (NULL, $1, '合成书', '合成作者', 'partial', 'https://book.qq.com/book-detail/1', 'system', 'builtin',
+               'lastcall-20261109', '缺章 0/46：operation_timeout', 0, 46)`, [hasChapters]);
+
+    await pg.exec('DROP TABLE IF EXISTS gc;');
+    await pg.exec(gcSql!);
+    const rows = (await pg.query(
+      `SELECT id, delkind, (${deleteWhere}) AS del FROM gc WHERE id IN (${zeroTimeout}, ${hasChapters}) ORDER BY id`))
+      .rows as { id: number; delkind: boolean; del: boolean }[];
+    expect(rows).toEqual([
+      { id: zeroTimeout, delkind: true, del: true },
+      { id: hasChapters, delkind: false, del: false },
+    ]);
+  });
+
   // cmd_enqueue 的 SQL 原文；psql 变量换成字面量。
   const enqueueSql = (ids: number[], rev: string) =>
     /\ncmd_enqueue\(\) \{\n[\s\S]*?cat <<'SQL' \| [^\n]*\n([\s\S]*?)\nSQL\n\}/.exec(script)![1]

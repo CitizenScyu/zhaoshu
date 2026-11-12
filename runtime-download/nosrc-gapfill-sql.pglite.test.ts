@@ -2,6 +2,7 @@
 // 钉住：最新任务停在 partial 缺章、从没发布过的书也要进补抓池——此前只取 status='done'，这批书
 // 既不会被 gapfill 选中、gcrun 又按 held 不删（missing_chapters），永久卡死（生产 58 本）。
 // 同时不得把已按全章发布的书（追更重下失败留下 partial 行）重新拉进补抓。不连生产。
+// gapzero1112：另钉「有总量、0 章进度」的书也要进补抓（旧条件 chapters_done > 0 会漏掉它们）。
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createSchema, loadPGlite, type PGliteLike } from './testing/pglite';
@@ -91,5 +92,26 @@ maybe('nosrc-tool.sh gapfill：partial 缺章书也要补抓', () => {
     await task(latestDone, 'partial', 5, 100, 72);
     await task(latestDone, 'done', 100, 100, 48);
     expect(await selected()).toEqual([]);
+  });
+
+  // gapzero1112：生产 6660「缺章 0/46：missing_chapters」——目录拿到了、一章没抓成。旧条件
+  // chapters_done > 0 让它进不了补抓，gcrun 又按 held_missing_chapters 不删，永久卡死。
+  it('有总量但一章没抓到（0/46）⇒ 入选；总量都不知道（0/0）⇒ 不入，避免无意义重下', async () => {
+    const zeroWithTotal = await book('合成零章有目录书');
+    await task(zeroWithTotal, 'partial', 0, 46);
+
+    const noTotal = await book('合成零章无目录书');
+    await task(noTotal, 'partial', 0, 0);
+
+    expect(await selected()).toEqual([{ id: zeroWithTotal, missing: 46 }]);
+  });
+
+  // 最新一条是 0/0（目录都没拿到），更早一条有进度：不能因为取最新行而丢掉可补的缺口。
+  it('最新行 0/0、更早行缺章 ⇒ 仍按更早有总量的一行入选', async () => {
+    const b = await book('合成退回零章书');
+    await task(b, 'partial', 20, 100, 72);
+    await task(b, 'partial', 0, 0, 48);
+
+    expect(await selected()).toEqual([{ id: b, missing: 80 }]);
   });
 });

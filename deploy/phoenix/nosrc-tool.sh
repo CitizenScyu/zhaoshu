@@ -66,7 +66,7 @@ gc_sql() {
 cat <<'SQL'
 CREATE TEMP TABLE gc AS
 WITH l AS (
-  SELECT DISTINCT ON (book_id) book_id, status, error, source_revision, created_at
+  SELECT DISTINCT ON (book_id) book_id, status, error, source_revision, created_at, chapters_total
   FROM download_tasks ORDER BY book_id, id DESC
 ), f AS (
   SELECT book_id, count(*) FILTER (WHERE status IN ('failed', 'partial')) AS fails,
@@ -84,7 +84,13 @@ SELECT lb.id,
    OR EXISTS (SELECT 1 FROM download_tasks g WHERE g.book_id = lb.id AND g.error = 'toc_below_floor'
               AND (f.nf_id IS NULL OR g.id > f.nf_id))) AS gated,
   COALESCE((l.status = 'failed' AND l.error ~ '^(identity_mismatch|identity_mismatch_or_no_candidate|download_failed|invalid_next_page|invalid_chapter|unsupported_toc_rule|preview_truncated|toc_limit)$')
-           OR l.error LIKE '源不可用（search 阶段，已连续 % 次，停止自动重试）：no_candidates', false) AS delkind,
+           OR l.error LIKE '源不可用（search 阶段，已连续 % 次，停止自动重试）：no_candidates'
+           -- gapzero1112：连目录都没拿到（chapters_total=0）的 partial 既不是 gapfill 的补抓对象（没有缺口
+           -- 可算），也不在原 delkind 表内时，会永远留在「gc 判 held、gapfill 选不中」的空洞里
+           -- （生产 6464：缺章 0/0：operation_timeout）。只对 0/0 生效——有章数的 partial 是缺章，交给
+           -- gapfill 补抓，不能因为原因不在表内就删掉半本书。
+           OR (l.chapters_total = 0 AND l.error ~ '^(缺章 [0-9]+/0：)?(operation_timeout|toc_changed|budget_exhausted)$'),
+           false) AS delkind,
   COALESCE(l.source_revision LIKE 'lastcall-%' OR l.source_revision LIKE 'gc-lastcall-%'
            OR (COALESCE(f.fails, 0) >= 2 AND l.created_at > now() - interval '14 days'), false) AS final,
   CASE WHEN l.book_id IS NULL THEN 'no_task'
@@ -398,9 +404,11 @@ cmd_gcrun() {
   fi
 }
 
-# Gap refill: a book whose latest done task still has placeholder chapters (chapters_done < chapters_total,
-# gappub1109) gets a fresh system task. Retry k waits base * 2^k after the later of the gap publish and the
-# previous try; at most GAP_MAX_TRIES tries per book. The publisher never promotes a version with fewer real chapters.
+# Gap refill: a book whose latest done/partial task has known chapter count and still has placeholder chapters
+# (chapters_total > 0, chapters_done < chapters_total, gappub1109; gapzero1112 dropped the old chapters_done > 0
+# filter so 0-chapter books with a known TOC are refilled too) gets a fresh system task. Retry k waits base * 2^k
+# after the later of the gap publish and the previous try; at most GAP_MAX_TRIES tries per book. The publisher
+# never promotes a version with fewer real chapters.
 cmd_gapfill() {
   local dry=0 end=COMMIT
   case $1 in '') ;; --dry-run) dry=1; end=ROLLBACK ;; *) die "usage: gapfill [--dry-run]" ;; esac
@@ -409,8 +417,12 @@ cmd_gapfill() {
   { echo 'BEGIN;'; cat <<'SQL'
 CREATE TEMP TABLE gf ON COMMIT DROP AS
 WITH d AS (
+  -- gapzero1112：条件从 chapters_done > 0 改为 chapters_total > 0。
+  -- 原条件漏掉「有总量、0 章进度」的书（缺章 0/46），它们进不了补抓、gcrun 又按 missing_chapters
+  -- 判 held 不删，永久卡死（生产 6660）。改按总量筛选只保留目录已拿到的行：
+  -- 0/0（连目录都没拿到）天然排除，且比直接取最新行更稳——最新一条 0/0 不会盖掉更早 300/500 的进度。
   SELECT DISTINCT ON (book_id) book_id, chapters_done, chapters_total, updated_at
-  FROM download_tasks WHERE status IN ('done', 'partial') AND chapters_done > 0
+  FROM download_tasks WHERE status IN ('done', 'partial') AND chapters_total > 0
   ORDER BY book_id, id DESC
 ), t AS (
   SELECT book_id, count(*)::int AS tries, max(created_at) AS last_try
