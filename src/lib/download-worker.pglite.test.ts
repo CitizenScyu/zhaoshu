@@ -184,16 +184,17 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
   // 用 createWorkerStorage 的真实 taskRow（拦截标志由那条 SELECT 计算），不是测试自己的内联绑定。
   describe('donedup1113 产物已完整的 system 任务领取即收口', () => {
     const publishArtifact = async (labeledBookId: number, done: number, total: number, status = 'published') => {
+      const suffix = String(labeledBookId);
       await pg.query(
         `INSERT INTO book_artifacts (labeled_book_id, identity_key, repository_id, branch, canonical_path,
                                       quality_status, published_at, blob_sha, bytes, version, chapters_total, chapters_done, chars)
-         VALUES ($1, 'donedup-' || $1::text, 1, 'main', 'donedup/' || $1::text || '/index.json',
+         VALUES ($1, $5, 1, 'main', $6,
                  $2, CASE WHEN $2 = 'published' THEN now() ELSE NULL END,
                  CASE WHEN $2 = 'published' THEN '0000000000000000000000000000000000000000' ELSE NULL END,
                  CASE WHEN $2 = 'published' THEN 12345 ELSE 0 END,
                  CASE WHEN $2 = 'published' THEN 'v1' ELSE '' END,
                  $3, $4, 12345)`,
-        [labeledBookId, status, total, done],
+        [labeledBookId, status, total, done, `donedup-${suffix}`, `donedup/${suffix}/index.json`],
       );
     };
     const realStorage = () => createWorkerStorage(sql as never);
