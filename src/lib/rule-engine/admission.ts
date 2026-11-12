@@ -31,7 +31,8 @@ import {
 } from './compile';
 import {
   engineSyntaxAioEnabled, engineSyntaxBookFieldsEnabled, engineSyntaxJsBindEnabled, engineSyntaxVarsBagEnabled, engineSyntaxVarsEnabled,
-  engineUrlOptionsEnabled, engineSyntaxBookVariableEnabled, engineSyntaxSourceBindEnabled,
+  engineUrlOptionsEnabled, engineSyntaxBookVariableEnabled, engineSyntaxSourceBindEnabled, engineFieldNetJsEnabled, engineSyntaxJsEnabled,
+  engineSyntaxJsoupEnabled,
 } from './syntax-flags';
 import { bookUrlMember, bookView, formatBookAuthor, formatBookName, type BookView } from './book-format';
 import { stripUrlOptions, urlOptionFields } from './url-options';
@@ -39,7 +40,7 @@ import { aioGroups, isAioListRule, ruleGroupOf } from './aio-syntax';
 import { preloadJsSandbox } from './js-sandbox';
 import {
   buildSearchRequestWithNet, buildSearchRequestWithVars, evaluateWithFieldNet, prepareSearchJs, SearchJsNotReadyError, SearchNetPendingError,
-  type SearchRequestWithVars,
+  searchNetJsEnabled, type SearchRequestWithVars,
 } from './search-js';
 import { resolveSourceVars } from './vars-subset';
 import { jsLibRuleProblem } from './js-lib';
@@ -352,10 +353,28 @@ export const QUERY_CONTROL_KEYWORDS = ['凡人修仙传', '诡秘之主', '庆�
 /** 两次搜索候选 URL 集 Jaccard 达到此值即判查询不敏感。 */
 export const QUERY_INSENSITIVE_OVERLAP = 0.8;
 /**
- * 开启对照搜索后**单个探测词一次尝试**的最坏墙钟：主搜索 + 节流 + 对照搜索。调用方的逐探预算止损（canProbe）
+ * 开启对照搜索后**单个探测词一次尝试**的最坏墙钟。调用方的逐探预算止损（canProbe）
  * 必须按这个值预留，否则最后一个探测会越过刷新预算。探测词兜底（ADMISSION_MAX_KEYWORD_TRIES）的后续尝试
  * 在起跑前再判一次 canProbe（同一预留），故本值口径不变、不按词数放大。
+ *
+ * probebudget1112：联网取页（netjs1029 构造阶段、fieldnet1029 bookList 阶段）各最多 MAX_NET_FETCHES=4 页
+ * 且每页独立 8s 超时——开关全关时只有主搜索+对照搜索 2 个请求（旧口径 16.35s）；searchNetJsEnabled 开时
+ * 主/对照的 URL 构造各可再取 ≤4 页，字段联网 JS 生效时主/对照的 bookList 各可再取 ≤4 页，单探最坏涨到
+ * 18 请求 × 8s + 节流。旧静态常量按 2 请求预留，最后一探会把整轮预算击穿约 10 倍、signal abort 后本轮
+ * 已探结论全部不落库。改为函数按开关组合计算；关联网时值与旧常量逐字相等（21.35s 止损门不变）。
  */
+export function admissionProbeWorstMs(env: NodeJS.ProcessEnv = process.env): number {
+  // 联网帧生效判定与 search-js.ts searchNetJsEnabled / compile.ts fieldNetJsEnabled 同口径：
+  // 前者还要 ENGINE_SEARCH_NET_JS+JSYNTAX_JS+JSOUP 三开关同开，后者要 ENGINE_FIELD_NET_JS+JS+JSOUP。
+  const netJs = searchNetJsEnabled(env);
+  const fieldNetJs = engineFieldNetJsEnabled(env) && engineSyntaxJsEnabled(env) && engineSyntaxJsoupEnabled(env);
+  // 主搜索 + 对照搜索各 1 请求；联网开时每段再各加 MAX_NET_FETCHES(4) 页（构造 + bookList）。
+  const netFetchesPerSide = (netJs ? 4 : 0) + (fieldNetJs ? 4 : 0);
+  const requests = 2 + 2 * netFetchesPerSide;
+  return requests * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
+}
+
+/** 兼容旧引用：关联网开关时的静态值（单测与既有断言口径）。 */
 export const ADMISSION_PROBE_WORST_MS = 2 * ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS;
 
 /**

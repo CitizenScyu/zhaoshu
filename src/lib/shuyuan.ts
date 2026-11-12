@@ -9,8 +9,8 @@ import {
   builtinSourceForHost, isActiveBuiltinHost, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
-  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_PROBE_WORST_MS,
-  admissionReadabilityShadowMax, assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
+  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX,
+  admissionProbeWorstMs, admissionReadabilityShadowMax, assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
 import { admissionSurveyOptions, engineSearchJsActive, selectCandidates, type RawSource } from '@/lib/rule-engine/compile-smoke';
@@ -113,7 +113,7 @@ export const REFRESH_BUDGET_MS = 180_000;
 // 42-admbudget：独立准入轮（/api/shuyuan/admission，现为冷备路由——vercel.json 的独立轮 cron
 // 已删，调度以 phoenix timer 为准，现网准入是 admrunner42 runner，见 deploy/phoenix/README.md）自带的整份预算。
 // 路由 maxDuration=295s；读源表 + 批次 + 写回 + 刷 host 门 + 发布源池产物都在本预算内，留 55s 给 ensureSchema、
-// 租约与平台余量。批次内 canProbe 照旧按 ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS 逐探止损。
+// 租约与平台余量。批次内 canProbe 照旧按 admissionProbeWorstMs() + WRITE_RESERVE_MS 逐探止损。
 export const ADMISSION_ROUND_BUDGET_MS = 240_000;
 // 准入租约时长：须 ≥ 任一持有者的最长存活（独立轮路由 295s、刷新尾部 ≤ REFRESH_BUDGET_MS），持有者被平台杀掉
 // 也最迟到期自动释放；不主动释放（两处触发相隔 12h，5 分钟租约不会挡住下一轮）。
@@ -2111,13 +2111,16 @@ async function admitRows(
       return 'skipped' in write ? write : { skipped: 'no_candidates' };
     }
     const readabilityShadow = admissionReadabilityShadowMax();
+    // probebudget1112：单探最坏按开关组合算——联网取页（netjs1029/fieldnet1029）开时单探最多
+    // 18 个各 8s 超时的请求，静态的 ADMISSION_PROBE_WORST_MS（16.35s）只覆盖 2 请求、会击穿预算。
+    const probeWorstMs = admissionProbeWorstMs();
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
-      // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（ADMISSION_PROBE_WORST_MS），止损按它预留。
+      // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（probeWorstMs），止损按它预留。
       controlQuery: true,
-      // 41-srcfix 改法1：探测词兜底，换词前按同一 canProbe 预留判预算（单词一次尝试最坏 = ADMISSION_PROBE_WORST_MS）。
+      // 41-srcfix 改法1：探测词兜底，换词前按同一 canProbe 预留判预算（单词一次尝试最坏 = probeWorstMs）。
       keywordFallback: true,
-      canProbe: () => !signal.aborted && budget.remainingMs > ADMISSION_PROBE_WORST_MS + WRITE_RESERVE_MS,
+      canProbe: () => !signal.aborted && budget.remainingMs > probeWorstMs + WRITE_RESERVE_MS,
       // admrunner42：只有 phoenix runner 传 okPrefix；Vercel 两条路径不传 ⇒ 展开为空对象，输入形状逐字不变。
       ...(options.okPrefix ? { okPrefix: options.okPrefix } : {}),
       // read1027：可读性影子腿（env ADMISSION_READABILITY_SHADOW_MAX，默认关）；只出日志，不改写库行。
