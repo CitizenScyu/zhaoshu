@@ -17,7 +17,9 @@ GAP_MAX_ENQUEUE=${ZS_GAP_MAX_ENQUEUE:-100}
 GAP_BASE_HOURS=${ZS_GAP_BASE_HOURS:-24}
 [[ $GAP_MAX_TRIES =~ ^[0-9]+$ && $GAP_MAX_ENQUEUE =~ ^[0-9]+$ && $GAP_BASE_HOURS =~ ^[0-9]+$ ]] || { echo "bad ZS_GAP_*" >&2; exit 3; }
 GC_KEEP_BACKUPS=${ZS_GC_KEEP_BACKUPS:-14}
-[[ $GC_KEEP_BACKUPS =~ ^[0-9]+$ ]] || { echo "bad ZS_GC_KEEP_BACKUPS" >&2; exit 3; }
+# bakfloor1112：GC_KEEP_BACKUPS=0 会连刚做的份一起删光（head -n -0 全量），误配即失去全部
+# 回滚点。下限 1：要彻底关闭备份清理由运维显式改 prune 循环，而不是靠一个数字归零。
+[[ $GC_KEEP_BACKUPS =~ ^[1-9][0-9]*$ ]] || { echo "bad ZS_GC_KEEP_BACKUPS (must be >= 1)" >&2; exit 3; }
 GC_DELETE_WHERE="delkind AND final AND NOT freeok AND NOT gated"
 GC_LAST_WHERE="NOT ($GC_DELETE_WHERE) AND NOT had_last"
 REV=lastcall-20261109
