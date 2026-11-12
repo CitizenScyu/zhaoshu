@@ -213,11 +213,13 @@ describe('readerux42-B 自动阅读', () => {
     expect(screen.queryByRole('group', { name: '自动阅读速度' })).toBeNull();
 
     // 停了就是停了:再走 2 秒,不滚动、不自行重试取章(重试只由用户点「重试」发起)。
+    // 派发竞态:ReaderClient 的反馈探测 effect 也会打 /api/feedback，它落地早晚取决于调度。
+    // 本用例钉的是「不再取章」，只按章节请求口径断言。
     const after = urls(apiFetch).length;
     const stopped = viewport.scrollTop;
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(viewport.scrollTop).toBe(stopped);
-    expect(urls(apiFetch).slice(after)).toEqual([]);
+    expect(urls(apiFetch).slice(after).filter((u) => u.startsWith('/api/read/source/chapter'))).toEqual([]);
   });
 
   it('最后一章滚到底:自动阅读停止并提示,不再发任何章节请求', async () => {
@@ -237,7 +239,8 @@ describe('readerux42-B 自动阅读', () => {
     expect(screen.getByRole('button', { name: '自动阅读' }).getAttribute('aria-pressed')).toBe('false');
     // 书源会话（srcend1103）：书源目录可能收录不全，提示的是「本书源目录末尾」。
     screen.getByText(textIs('已读到本书源目录末尾，自动阅读停止。'));
-    expect(urls(apiFetch).slice(before)).toEqual([]);
+    // 同上：只钉不再取章，反馈探测 effect 的落地时序不属本用例断言范围。
+    expect(urls(apiFetch).slice(before).filter((u) => u.startsWith('/api/read/source/chapter'))).toEqual([]);
   });
 
   it('用户滚轮即接管:自动阅读开着时用户一滚,自动滚停(开关可再开)', async () => {
