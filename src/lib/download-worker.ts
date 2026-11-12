@@ -277,8 +277,8 @@ export interface WorkerOptions {
   tocFloor?: boolean;
   /**
    * donedup1113：领取后、出网前拦「本书已有完整已发布产物」的 system 任务直接终态 done。
-   * 生产背景：61 个 retrofix*/gapfill* 手工批次任务在 no_candidates 退避循环空烧——批次入列不查
-   * 产物完整度，书实际早已全章发布，每轮退避重扫仍烧全池出网（约 110 次/本/轮）。user 任务不拦
+   * 生产背景：61 个 retrofix、gapfill 系手工批次任务在 no_candidates 退避循环空烧——批次入列不查
+   * 产物完整度，书实际早已全章发布，每轮退避重扫仍烧全池出网（约 110 次出网每本每轮）。user 任务不拦
    * （显式重下合法）。缺省关 = 与引入前逐字一致。
    */
   skipCompleted?: boolean;
