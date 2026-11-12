@@ -234,9 +234,11 @@ B 线 slice 另加了内存上限 `MemoryMax=10G`（`systemctl set-property`，d
   缺的章写「（本章源站下载失败，暂缺正文。）」照常发布；清单记 `chapters_missing`，任务行与 book_artifacts 的
   `chapters_done` 只算实有正文的章，书库显示「完成（缺 N 章）」。
 - 晋升保护：带缺章的新版本实有章数少于已发布版本时不晋升（`superseded_by_incomplete`）。
-- 自动补缺（`zhaoshu-gapfill.timer` 每天 11:00 跑 `nosrc-tool.sh gapfill`）：最新 done 任务仍有占位章
-  （`chapters_done < chapters_total`）且没有 pending/running 任务的书，插一条新系统任务重下
-  （`source_revision=gapfill-YYYYMMDD`）。第 k 次（从 0 起）要等「缺章发布与上次补抓中较晚者」之后
+- 自动补缺（`zhaoshu-gapfill.timer` 每天 11:00 跑 `nosrc-tool.sh gapfill`）：最新一条有进度的任务（`done` 或
+  `partial`）仍有缺章（`chapters_done < chapters_total`）且没有 pending/running 任务的书，插一条新系统任务重下
+  （`source_revision=gapfill-YYYYMMDD`）。gapdead1112：只看 `done` 会漏掉「从没发布过、最新任务停在 partial 缺章」
+  的书——它们进不了补抓、gcrun 又按 held 不删，会永久卡死（2026-11-12 生产 58 本）；已按全章发布的书不重下。
+  第 k 次（从 0 起）要等「缺章发布与上次补抓中较晚者」之后
   24h × 2^k，即 1、2、4、8、16、32 天；每本最多 6 次，每天最多 100 本。重下会重新选源，抓到正文就以更全的版本晋升；
   仍缺的照旧保留已发布版本。选中同一源时，续传（含 `DOWNLOAD_RESUME_PEERS` 从兄弟实例同键目录播种）只重抓占位章；
   带占位章的缓存目录 prune 按 14 天保留（读 manifest 末 4KB 的 `chapters_missing`），覆盖第 1/2/4/8 天四次补抓。
