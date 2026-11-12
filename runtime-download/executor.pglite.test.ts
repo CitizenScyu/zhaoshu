@@ -20,7 +20,7 @@ const maybe = PGliteCtor ? describe : describe.skip;
 
 class MemoryGitHub implements GitHubContents {
   files = new Map<string, string>();
-  calls: { path: string; op: 'put' | 'get' }[] = [];
+  calls: { path: string; op: 'put' | 'get' | 'del' }[] = [];
   async put(path: string, text: string): Promise<void> { this.calls.push({ path, op: 'put' }); this.files.set(path, text); }
   async getBytes(path: string): Promise<Buffer | null> {
     this.calls.push({ path, op: 'get' });

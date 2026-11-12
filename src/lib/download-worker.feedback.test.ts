@@ -54,6 +54,7 @@ function fixture(adapter: SourceAdapter, taskTimeoutMs = 600_000) {
   const github = {
     put: vi.fn<WorkerOptions['github']['put']>().mockResolvedValue(undefined),
     getBytes: vi.fn<WorkerOptions['github']['getBytes']>().mockResolvedValue(null),
+    del: vi.fn<WorkerOptions['github']['del']>().mockResolvedValue(undefined),
   };
   const options: WorkerOptions = { storage, github, adapters: [adapter], repositoryId: 1, branch: 'synthetic', taskTimeoutMs };
   return { storage, github, run: () => runDownloadTask(options, lease) };

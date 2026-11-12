@@ -39,8 +39,8 @@ function queryTag(pg: PGliteLike): SqlTag {
 
 class MemoryGitHub implements GitHubContents {
   files = new Map<string, string>();
-  calls: { path: string; op: 'put' | 'get' }[] = [];
-  constructor(public failAt?: { pathPattern: RegExp; op: 'put' | 'get'; error: Error }) {}
+  calls: { path: string; op: 'put' | 'get' | 'del' }[] = [];
+  constructor(public failAt?: { pathPattern: RegExp; op: 'put' | 'get' | 'del'; error: Error }) {}
   async put(path: string, text: string): Promise<void> {
     this.calls.push({ path, op: 'put' });
     if (this.failAt?.op === 'put' && this.failAt.pathPattern.test(path)) throw this.failAt.error;

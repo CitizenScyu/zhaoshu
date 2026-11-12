@@ -37,7 +37,7 @@ function harness(hostWait: boolean, extra: { progress?: boolean; outcome?: Adapt
   const refundBudget = vi.fn(async (_ticket: BudgetTicket): Promise<BudgetRefundOutcome> => 'refunded');
   const adapter: SourceAdapter = { kind: 'engine', download: async () => extra.outcome ?? occupied };
   const executor = createExecutor({
-    storage, github: { put: extra.put ?? (async () => {}), getBytes: async () => null }, adapters: [adapter], budget, refundBudget,
+    storage, github: { put: extra.put ?? (async () => {}), getBytes: async () => null, del: async () => {} }, adapters: [adapter], budget, refundBudget,
     repositoryId: 1, branch: 'main', owner: 'owner', decisions: DEFAULT_DECISIONS,
     log: (_level, message, fields) => { logged.push([message, fields]); },
     ...(hostWait ? { hostWait: true } : {}),

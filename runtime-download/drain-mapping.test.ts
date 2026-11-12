@@ -26,7 +26,7 @@ function fakeStorage(over: Partial<WorkerStorage> & { releaseClaim?: (l: Downloa
     ...over,
   } as WorkerStorage;
 }
-const github: GitHubContents = { put: async () => {}, getBytes: async () => null };
+const github: GitHubContents = { put: async () => {}, getBytes: async () => null, del: async () => {} };
 
 function budget(allowed: boolean, log: string[]): DailyBudgetLike {
   return {

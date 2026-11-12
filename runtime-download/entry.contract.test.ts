@@ -27,7 +27,7 @@ vi.mock('../src/lib/db-quota', () => ({ dbQuotaBackoffMs: () => 0, recordDbQuota
 import { createDownloadExecutor } from './entry';
 
 const storage = {} as RuntimeStorage;
-const github: GitHubContents = { put: vi.fn(), getBytes: vi.fn() };
+const github: GitHubContents = { put: vi.fn(), getBytes: vi.fn(), del: vi.fn() };
 const executor = { synthetic: true };
 const env = { NODE_ENV: 'test' as const, DATABASE_URL: 'synthetic-database', GITHUB_TOKEN: 'synthetic-token',
   ZHAOSHU_BOOKS_REPO: ' Storage/Books ', GITHUB_REPOSITORY: 'Runner/Execution' };

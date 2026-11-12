@@ -32,7 +32,7 @@ function harness(flags: { prePublishCheck?: boolean; tocFloor?: boolean }, adapt
     consume: async () => ({ allowed: true, date: '2026-11-05' }),
   };
   const executor = createExecutor({
-    storage, github: { put: async () => {}, getBytes: async () => null }, adapters: [adapter], budget,
+    storage, github: { put: async () => {}, getBytes: async () => null, del: async () => {} }, adapters: [adapter], budget,
     repositoryId: 1, branch: 'main', owner: 'owner', decisions: DEFAULT_DECISIONS,
     ...flags,
   });

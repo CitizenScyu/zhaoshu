@@ -26,6 +26,7 @@ function harness(step: Step, options: { on?: boolean; release?: boolean | 'none'
   const github: GitHubContents = {
     put: async (path, text) => { files.set(path, text); },
     getBytes: async path => { const text = files.get(path); return text === undefined ? null : Buffer.from(text, 'utf8'); },
+    del: async path => { files.delete(path); },
   };
   const storage: WorkerStorage = {
     claim: async () => { log.push('claim'); return lease; },

@@ -15,7 +15,7 @@ const row: TaskRow = {
   id: 1, book_id: 1, title: '测试书', author: '佚名', status: 'running',
   source_url: 'https://book15.example/x', source_kind: 'engine', source_id: null, requested_by: 'system',
 };
-const github: GitHubContents = { put: async () => {}, getBytes: async () => null };
+const github: GitHubContents = { put: async () => {}, getBytes: async () => null, del: async () => {} };
 const budget: DailyBudgetLike = { async read() { return { used: 0, limit: 20 }; }, async consume() { return { allowed: true }; } };
 
 /** 驱动对 402 实际抛出的错误（替身 fetch 回生产实测响应体；主机 .invalid 不出网）。 */

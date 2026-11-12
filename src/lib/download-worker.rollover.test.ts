@@ -40,11 +40,15 @@ const complete: AdapterOutcome = { kind: 'complete', txt: TXT, chaptersTotal: 1,
 /** 内存 GitHubContents：按实例记录调用，供「发布闭包归属哪个仓」的身份断言。 */
 class TaggedGitHub {
   files = new Map<string, string>();
-  calls: { op: 'put' | 'get'; path: string }[] = [];
+  calls: { op: 'put' | 'get' | 'del'; path: string }[] = [];
   constructor(readonly label: string) {}
   async put(path: string, text: string): Promise<void> {
     this.calls.push({ op: 'put', path });
     this.files.set(path, text);
+  }
+  async del(path: string): Promise<void> {
+    this.calls.push({ op: 'del', path });
+    this.files.delete(path);
   }
   async getBytes(path: string): Promise<Buffer | null> {
     this.calls.push({ op: 'get', path });

@@ -167,7 +167,7 @@ const row: TaskRow = {
   id: 14, book_id: 42, title: '希灵帝国', author: '远瞳', status: 'running',
   source_url: 'https://book15.net/books/details859.html', source_kind: 'builtin', source_id: null, requested_by: 'user',
 };
-const github: GitHubContents = { put: async () => {}, getBytes: async () => null };
+const github: GitHubContents = { put: async () => {}, getBytes: async () => null, del: async () => {} };
 
 function harness(result: PrecheckResult, options: {
   attemptCount?: number;

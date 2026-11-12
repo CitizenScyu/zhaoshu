@@ -12,7 +12,7 @@ const row: TaskRow = {
   id: 9, book_id: 1036, title: '九鼎狂尊', author: '上汤豆苗', status: 'running',
   source_url: 'https://book15.net/books/details3224.html', source_kind: 'builtin', source_id: null, requested_by: 'system',
 };
-const github: GitHubContents = { put: async () => {}, getBytes: async () => null };
+const github: GitHubContents = { put: async () => {}, getBytes: async () => null, del: async () => {} };
 
 function harness(result: PrecheckResult | Error | null, options: { used?: number; allowed?: boolean; storage?: Partial<WorkerStorage> } = {}) {
   const log: string[] = [];
