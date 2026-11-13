@@ -171,14 +171,15 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
       const { runAdmissionBatch } = await import('./rule-engine/admission');
       const hosts = Array.from({ length: 10 }, (_, i) => `cap${i}.example.com`);
       const candidates = hosts.map((host) => ({
-        url: `https://${host}`, source: {
+        url: `https://${host}`,
+        source: {
           bookSourceUrl: `https://${host}/`, bookSourceName: `源${host}`, searchUrl: `https://${host}/s?q={{key}}`,
           checkKeyWord: '测试关键字',
           ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
           ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: 'a@href' },
           ruleContent: { content: '.c' },
         },
-      });
+      }));
       const searches: number[] = [];
       const t0 = Date.now();
       const fetchPage = vi.fn((_input: unknown, init: { signal: AbortSignal }) => {
