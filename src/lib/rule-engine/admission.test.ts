@@ -2208,9 +2208,11 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
       // 降档后未测新源 h2 优先。existing 传第 1 轮写出的 h0 行（rules_hash 相同）。
       const hosts2 = [hangHost, 'h2.example.com'];
       const fetchPage2 = vi.fn<AdmissionTransport>(() => Promise.resolve(page('<html>no results</html>')));
+      const existing2 = new Map<string, AdmissionSourceRow>();
+      if (h0Row) existing2.set(h0Row.source_url, h0Row);
       const round2 = await runAdmissionBatch({
         candidates: candidatesFor(hosts2), declaredHosts: new Set(hosts2),
-        existing: new Map([h0Row ? [h0Row.source_url, h0Row] as const : []].flat()),
+        existing: existing2,
         fetchPage: fetchPage2, signal: signal(), throttleMs: 0, maxProbes: 1, probeCapMs: 5_000,
         timeoutSignal: (ms) => {
           const c = new AbortController();
