@@ -42,6 +42,7 @@ const { ensureSchema, getSql, sql, execute, transaction, readTransaction } = vi.
 vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import { refreshShuyuan, REFRESH_BUDGET_MS, ADMISSION_LEASE_ROW } from './shuyuan';
+import { createDeadline } from '@/lib/deadline';
 
 // probecap1113:admissionProbeCapMs 的 env 解析(夹取规则)。
 import { admissionProbeCapMs } from './shuyuan';
@@ -54,10 +55,16 @@ describe('probecap1113: ADMISSION_PROBE_CAP_MS env 解析', () => {
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '0' })).toBeUndefined();
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '-5000' })).toBeUndefined();
   });
-  it('正整数夹在 [8000, admissionProbeWorstMs()] 内(默认 env 全关口径 16.7s)', () => {
-    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '30000' })).toBe(30_000);
+  it('正整数夹在 [8000, admissionProbeWorstMs(env)] 内(默认 env 全关口径 16.7s)', () => {
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '30000' })).toBe(16_700);
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '5000' })).toBe(8_000);
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '999999' })).toBe(16_700);
+    // 联网开关全开(生产 confirm 轮口径):worst=18 请求×8.35s=150.3s,30s 不再被夹。
+    const netJsEnv = {
+      ADMISSION_PROBE_CAP_MS: '30000',
+      ENGINE_SEARCH_NET_JS: '1', ENGINE_SYNTAX_JS: '1', ENGINE_SYNTAX_JSOUP: '1',
+    };
+    expect(admissionProbeCapMs(netJsEnv)).toBe(30_000);
   });
 });
 
@@ -158,49 +165,60 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
     expect(batchLog?.[1]).toMatchObject({ candidates: 20, probed: 14 });
   });
 
-  it('probecap1113: cap=30s 时止损按 cap 预留——慢探被截短、起探次数多于无 cap 基线', async () => {
+  it('probecap1113: cap 止损预留小于理论最坏 ⇒ 同预算内起探更多(注入假时钟,直接驱动 runAdmissionBatch)', async () => {
     vi.useFakeTimers();
-    vi.stubEnv('ADMISSION_PROBE_CAP_MS', '30000');
-    // 同款 20 死站,但每探 25s 才返回(超时 abort 前):无 cap 时止损按 16.7s 预留,127s 剩余只够
-    // ~6 探;开 cap 后止损按 30+5s 预留,且单探 25s 内正常返回(未撞 cap)⇒ 能起更多探。
-    const dead = Array.from({ length: 20 }, (_, i) => ({
-      bookSourceUrl: `https://dead${i}.example/`, bookSourceName: `死站${i}`,
-      searchUrl: `https://dead${i}.example/s?q={{key}}`,
-      ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
-      ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: 'a@href' },
-      ruleContent: { content: '.c' },
-    }));
-    responses.clear();
-    responses.set(indexUrl, {
-      body: [11, 12, 13].map((id) => `<a href="/yuedu/shuyuans/content/id/${id}.html">合集 ${id}</a>`).join(''),
-      delayMs: 20_000,
-    });
-    responses.set(collectionUrl(11), { body: JSON.stringify(dead), delayMs: 11_000 });
-    responses.set(collectionUrl(12), { body: '[]', delayMs: 11_000 });
-    responses.set(collectionUrl(13), { body: '[]', delayMs: 11_000 });
-    let searches = 0;
-    fetchMock.mockImplementation((input, options) => {
-      const url = String(input);
-      const fixture = responses.get(url);
-      if (fixture) {
-        return new Promise<Response>((resolve) => setTimeout(() => resolve(new Response(fixture.body, { status: 200 })), fixture.delayMs));
-      }
-      if (/^https:\/\/dead\d+\.example\/s\?q=/.test(url)) {
-        searches += 1;
+    try {
+      const { runAdmissionBatch } = await import('./rule-engine/admission');
+      const hosts = Array.from({ length: 10 }, (_, i) => `cap${i}.example.com`);
+      const candidates = hosts.map((host) => ({
+        url: `https://${host}`, source: {
+          bookSourceUrl: `https://${host}/`, bookSourceName: `源${host}`, searchUrl: `https://${host}/s?q={{key}}`,
+          checkKeyWord: '测试关键字',
+          ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
+          ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: 'a@href' },
+          ruleContent: { content: '.c' },
+        },
+      });
+      const searches: number[] = [];
+      const t0 = Date.now();
+      const fetchPage = vi.fn((_input: unknown, init: { signal: AbortSignal }) => {
+        searches.push(Date.now() - t0);
         return new Promise<Response>((resolve, reject) => {
-          const timer = setTimeout(() => resolve(new Response('<html>no results</html>', { status: 200 })), 25_000);
-          options!.signal!.addEventListener('abort', () => { clearTimeout(timer); reject(options!.signal!.reason); }, { once: true });
+          const timer = setTimeout(() => resolve(new Response('<html>no results</html>', { status: 200 })), 20_000);
+          init.signal.addEventListener('abort', () => { clearTimeout(timer); reject(init.signal.reason); }, { once: true });
         });
-      }
-      return Promise.reject(new Error(`Unexpected network request: ${url}`));
-    });
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-    const settled = refreshShuyuan().then(() => 'resolved', () => 'rejected');
-    await vi.advanceTimersByTimeAsync(REFRESH_BUDGET_MS + 60_000);
-    const outcome = await settled;
-    expect(outcome).toBe('resolved');
-    // 无 cap 基线(每探 25s,止损预留 16.7+5=21.7s):127s 只起 4-5 探。
-    // 开 cap(止损 35s 预留,单探 25s 正常返回):起探严格更多——cap 的吞吐收益可观测。
-    expect(searches).toBeGreaterThan(5);
+      });
+      const run = (probeCapMs: number | undefined) => {
+        searches.length = 0;
+        const deadline = createDeadline(120_000);
+        const settled = runAdmissionBatch({
+          candidates, declaredHosts: new Set(hosts), existing: new Map(),
+          fetchPage: fetchPage as never, signal: deadline.signal, throttleMs: 0, maxProbes: 10,
+          ...(probeCapMs !== undefined ? { probeCapMs, timeoutSignal: (ms: number) => {
+            const c = new AbortController();
+            setTimeout(() => c.abort(new Error('probe cap exceeded')), ms);
+            return c.signal;
+          } } : {}),
+          canProbe: () => !deadline.signal.aborted
+            && deadline.remainingMs > (probeCapMs ?? 21_700) + 5_000,
+        }).then(() => 'resolved', () => 'rejected');
+        return { settled, deadline };
+      };
+      // 无 cap:止损按 16.7s 最坏 +5s 预留,每探 20s ⇒ 120s 只起 4-5 探。
+      const noCap = run(undefined);
+      await vi.advanceTimersByTimeAsync(130_000);
+      expect(await noCap.settled).toBe('resolved');
+      noCap.deadline.dispose();
+      const noCapSearches = searches.length;
+      // 开 cap=8s(=单请求超时下限,止损 13s 预留):每探要么 8s 内被截(占位),要么 20s 返回——
+      // 但截断后 12s 又能起下一探 ⇒ 起探次数严格多于无 cap。
+      const withCap = run(8_000);
+      await vi.advanceTimersByTimeAsync(130_000);
+      expect(await withCap.settled).toBe('resolved');
+      withCap.deadline.dispose();
+      expect(searches.length).toBeGreaterThan(noCapSearches);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1444,6 +1444,12 @@ export interface AdmissionBatchInput {
    * 而非 admissionProbeWorstMs()（理论最坏 18 请求×8.35s）预留，快探轮次不再被最坏值吓退。
    */
   probeCapMs?: number;
+  /**
+   * probecap1113：单探超时 signal 工厂（测试注入用）。缺省 AbortSignal.timeout。vitest 的
+   * useFakeTimers 接管不了 AbortSignal.timeout 的真时钟（Node 24 实测），测试要驱动超 cap
+   * 分支必须注入假时钟版工厂；生产不传 ⇒ 原生行为。
+   */
+  timeoutSignal?: (ms: number) => AbortSignal;
 }
 
 /** read1027：本轮可读性影子检查汇总（只在 readabilityShadow > 0 时出现）。明细按计划序，不含书名与规则原文。 */
@@ -1890,11 +1896,14 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       if (item.upgradedFirst) upgradedSlots -= 1;
       probed += 1;
       inflightHosts.add(item.mutexHost);
-      // probecap1113：单探硬上限——该探的 signal 与 timeout(cap) 合集，超 cap 即中止该探。
+      // probecap1113：单探硬上限——该探的 signal 与 timeout(cap) 合计，超 cap 即中止该探。
       // 超时中止不是源的结论：searchAdmission 在 signal.aborted 时抛出（不写判定），这里
       // 捕获后落「没轮到」占位，其余探测照常（预算级中止仍走 input.signal 的原路径）。
-      const perProbeSignal = input.probeCapMs !== undefined && input.probeCapMs > 0
-        ? AbortSignal.any([input.signal, AbortSignal.timeout(input.probeCapMs)])
+      // timeoutSignal 可注入（测试用假时钟版；AbortSignal.timeout 用真时钟，vi.useFakeTimers
+      // 接管不了它——admission.test.ts 的 probecap 用例靠注入才测得到超 cap 分支）。
+      const probeCapMs = input.probeCapMs;
+      const perProbeSignal = probeCapMs !== undefined && probeCapMs > 0
+        ? AbortSignal.any([input.signal, (input.timeoutSignal ?? AbortSignal.timeout)(probeCapMs)])
         : input.signal;
       const perProbeTimedOut = () => perProbeSignal.aborted && !input.signal.aborted;
       try {

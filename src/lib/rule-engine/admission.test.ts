@@ -2111,6 +2111,8 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
   it('probecap1113: 单探超 cap 中止 ⇒ 占位收口、批次不炸、其余探测照常', async () => {
     // 第 1 探挂起直到单探 signal 中止（超 cap），第 2、3 探立即完成。
     // 超 cap 的中止不是源的结论（不写 conn_fail），落「没轮到」占位（rulesChanged ⇒ 有占位行）。
+    // AbortSignal.timeout 走真时钟（vi.useFakeTimers 接管不了，Node 24 实测），注入
+    // setTimeout 版工厂让假时钟驱动超 cap 分支。
     vi.useFakeTimers();
     try {
       const hosts = ['p0.example.com', 'p1.example.com', 'p2.example.com'];
@@ -2126,6 +2128,11 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
       const batch = runAdmissionBatch({
         candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
         fetchPage, signal: signal(), throttleMs: 0, maxProbes: 20, probeCapMs: 5_000,
+        timeoutSignal: (ms) => {
+          const c = new AbortController();
+          setTimeout(() => c.abort(new Error('probe cap exceeded')), ms);
+          return c.signal;
+        },
       });
       const settled = batch.then(
         (r) => ({ ok: true as const, r }),

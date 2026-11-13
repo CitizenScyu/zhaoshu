@@ -126,12 +126,13 @@ export function admissionLeaseTtlMs(env: Record<string, string | undefined> = pr
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : ADMISSION_LEASE_TTL_MS;
 }
 // probecap1113：单探硬上限（env `ADMISSION_PROBE_CAP_MS`）。正整数即用（夹 [ADMISSION_TIMEOUT_MS,
-// admissionProbeWorstMs()]——低于单请求超时无意义、高于理论最坏无意义），缺失/非法 = undefined（关，
-// canProbe 止损与 probecap 之前逐字相同）。止损口径见 admitRows 的 stopLossMs。
+// admissionProbeWorstMs(env)]——低于单请求超时无意义、高于理论最坏无意义），缺失/非法 = undefined
+// （关，canProbe 止损与 probecap 之前逐字相同）。止损口径见 admitRows 的 stopLossMs。
+// 上限随同一 env 的联网开关算：关联网时 worst=16.7s，cap 设 30s 会被夹到 16.7s（再高无意义）。
 export function admissionProbeCapMs(env: Record<string, string | undefined> = process.env): number | undefined {
   const parsed = Number.parseInt(env.ADMISSION_PROBE_CAP_MS ?? '', 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
-  const floor = ADMISSION_TIMEOUT_MS, ceiling = admissionProbeWorstMs();
+  const floor = ADMISSION_TIMEOUT_MS, ceiling = admissionProbeWorstMs(env);
   return Math.min(Math.max(parsed, floor), ceiling);
 }
 // 租约借 cron_health 一行（不改 schema）：last_success_at 存的是**租约到期时刻**，不是成功时刻——
