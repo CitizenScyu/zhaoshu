@@ -2176,6 +2176,18 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
   it('probeover1113: cap 超时占位带 strike 前缀, 下轮 planProbeOrder 降 class 1 不再挤占未测源', async () => {
     vi.useFakeTimers();
     try {
+      const capTimeoutSignal = (ms: number) => {
+        const c = new AbortController();
+        setTimeout(() => c.abort(new Error('probe cap exceeded')), ms);
+        return c.signal;
+      };
+      // 时钟与批次并行推进:批次在等 cap timer 的 setTimeout,不推进就互相等死(同款模式见
+      // shuyuan.admission-stoploss.test.ts 的 drain)。
+      const runBatch = (input: Parameters<typeof runAdmissionBatch>[0]) => {
+        const settled = runAdmissionBatch(input);
+        const drain = async () => { for (let i = 0; i < 200; i += 1) await vi.advanceTimersByTimeAsync(100); };
+        return Promise.race([settled, drain().then(() => settled)]);
+      };
       // 第 1 轮: h0 挂起直到超 cap; h1 立即完成。占位行必须带 probe_timeout:1。
       const hangHost = 'h0.example.com';
       const hosts1 = [hangHost, 'h1.example.com'];
@@ -2187,22 +2199,18 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
         }
         return Promise.resolve(page('<html>no results</html>'));
       });
-      const round1 = await runAdmissionBatch({
+      const round1 = await runBatch({
         candidates: candidatesFor(hosts1), declaredHosts: new Set(hosts1), existing: new Map(),
         fetchPage: fetchPage1, signal: signal(), throttleMs: 0, maxProbes: 20, probeCapMs: 5_000,
-        timeoutSignal: (ms) => {
-          const c = new AbortController();
-          setTimeout(() => c.abort(new Error('probe cap exceeded')), ms);
-          return c.signal;
-        },
+        timeoutSignal: capTimeoutSignal,
       });
       const h0Row = round1.rows.find((r) => r.host === hangHost);
       expect(h0Row?.search_ok).toBeNull();
       expect(h0Row?.error).toBe('probe_timeout:1');
       expect(round1.probeTimedOut).toBe(1);
       // SearchJsNotReady 类瞬时失败仍写无前缀占位（不降档）——本用例用正常 no_result 钉住
-      // 「拿到结论的行不带前缀」。
-      expect(round1.rows.find((r) => r.host === 'h1.example.com')?.error).toBe('');
+      // 「拿到结论的行不带前缀」（no_result 的 error 固定为 bookList 说明文案）。
+      expect(round1.rows.find((r) => r.host === 'h1.example.com')?.error.startsWith('probe_timeout:')).toBe(false);
 
       // 第 2 轮: 名额只够 1 个（maxProbes=1）——h0 的超时占位行若还在 class 0 会先吃名额；
       // 降档后未测新源 h2 优先。existing 传第 1 轮写出的 h0 行（rules_hash 相同）。
@@ -2210,26 +2218,23 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
       const fetchPage2 = vi.fn<AdmissionTransport>(() => Promise.resolve(page('<html>no results</html>')));
       const existing2 = new Map<string, AdmissionSourceRow>();
       if (h0Row) existing2.set(h0Row.source_url, h0Row);
-      const round2 = await runAdmissionBatch({
+      const round2 = await runBatch({
         candidates: candidatesFor(hosts2), declaredHosts: new Set(hosts2),
         existing: existing2,
         fetchPage: fetchPage2, signal: signal(), throttleMs: 0, maxProbes: 1, probeCapMs: 5_000,
-        timeoutSignal: (ms) => {
-          const c = new AbortController();
-          setTimeout(() => c.abort(new Error('probe cap exceeded')), ms);
-          return c.signal;
-        },
+        timeoutSignal: capTimeoutSignal,
       });
-      // h2 被探（verdict no_result），h0 只写占位；strike 递增为 2。
+      // h2 被探（verdict no_result）；h0 名额被让出未被探——占位继承 strike 不变（递增只在
+      // 真超时发生时，本轮 h0 没探就没有新超时）。
       expect(round2.rows.find((r) => r.host === 'h2.example.com')?.search_verdict).toBe('no_result');
       const h0Again = round2.rows.find((r) => r.host === hangHost);
-      expect(h0Again?.error).toBe('probe_timeout:2');
+      expect(h0Again?.error).toBe('probe_timeout:1');
       expect(fetchPage2).toHaveBeenCalledTimes(1);
       expect(new URL(fetchPage2.mock.calls[0][0] as string).hostname).toBe('h2.example.com');
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 20_000);
 
   it('c>1 时调用方中止 ⇒ 被 host 挡住的 worker 不再发孤儿请求', async () => {
     // 5f3b506 实测:批次 reject 后,被同 host 挡住的 worker 被唤醒仍发出
