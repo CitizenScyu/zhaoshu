@@ -82,15 +82,15 @@ export class PersonalRequest {
     }
     return null;
   }
-  async commit<T>(operation: (write: PersonalWriter) => Promise<T>): Promise<T> {
+  async commit<T>(operation: (write: PersonalWriter) => Promise<T>, permission: 'find' | 'download' = 'find'): Promise<T> {
     this.assertActive();
     if (getSessionTokenFromRequest(this.request) !== this.originalToken) throw new AuthorizationRevokedError();
-    const auth = await this.run(() => revalidatePermission(this.request, this.principal, 'find', this.signal));
+    const auth = await this.run(() => revalidatePermission(this.request, this.principal, permission, this.signal));
     if (!auth.ok) throw new AuthResponseError(auth.response);
     this.assertActive();
     const { userId, role, authMethod } = this.principal;
     const authorization: WriteAuthorization = {
-      userId, role, method: authMethod,
+      userId, role, method: authMethod, permission,
       tokenHash: authMethod === 'session' && this.originalToken ? hashSessionToken(this.originalToken) : null,
       ownerTag: role === 'owner' && authMethod === 'session'
         ? ownerCredentialTag(getAuthSecuritySecret()!, process.env.APP_OWNER_TOKEN!) : null,

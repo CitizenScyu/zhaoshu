@@ -4,6 +4,7 @@ export type PersonalSql = ReturnType<typeof neon>;
 export type PersonalQuery = NeonQueryFunctionInTransaction<boolean, boolean>;
 export type PersonalBatch = (sql: PersonalQuery) => ReturnType<PersonalQuery>[];
 export type PersonalWriter = (batch: PersonalBatch) => Promise<Record<string, unknown>[][]>;
+export type WritePermission = 'find' | 'download';
 export type WriteAuthorization = {
   userId: number;
   role: 'owner' | 'member';
@@ -11,6 +12,8 @@ export type WriteAuthorization = {
   tokenHash: string | null;
   ownerTag: string | null;
   expiresAt: string;
+  /** 本次写事务要求的能力位；fence 按它核对 users 表对应列（缺省按 find，兼容旧 JSON）。 */
+  permission: WritePermission;
 };
 
 export class AuthorizationRevokedError extends Error {
@@ -33,7 +36,8 @@ function authorizationFence(sql: PersonalQuery) {
         RAISE EXCEPTION 'personal authorization changed' USING ERRCODE = '42501';
       END IF;
       PERFORM id FROM users WHERE id = (g->>'userId')::int
-        AND role = g->>'role' AND disabled_at IS NULL AND can_find FOR SHARE;
+        AND role = g->>'role' AND disabled_at IS NULL
+        AND CASE WHEN g->>'permission' = 'download' THEN can_download ELSE can_find END FOR SHARE;
       IF NOT FOUND THEN
         RAISE EXCEPTION 'personal authorization changed' USING ERRCODE = '42501';
       END IF;

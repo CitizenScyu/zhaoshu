@@ -40,9 +40,9 @@ const policies: Record<string, Record<string, 'find' | 'read' | 'download' | 'ow
   // 精确找书（task-77）：与 /api/find 同为「找书」能力，且同样会向豆瓣发外部请求，
   // 所以必须走同一套 withFindAccess（匿名必须在读写与外部副作用之前被拒）。
   'find/exact': { POST: 'find' }, 'find/exact/shelf': { POST: 'find' },
-  // finddl1113：找书结果直下全书（落库 + 系统任务），与 exact 同一 find 能力档
-  //（交互式导入序列放不进 commit 批处理，与 admin/download-requeue 同款顶层 getSql）。
-  'find/exact/download': { POST: 'find' },
+  // finddl1113：找书结果直下全书（落库 + 系统任务）。与 POST /api/download 同为建下载
+  // 任务的动作，能力档取 download（入口查 canDownload，写事务 fence 也按 download 验）。
+  'find/exact/download': { POST: 'download' },
   // audit-41 S5-1：匿名只读源池健康端点。刻意无鉴权——探针（GitHub Actions）不持任何凭据；
   // payload 只有聚合数字/时间戳，响应里不得有源站/域名/源名/用户标识（在路由自己的用例里钉死）。
   'health/sources': { GET: 'public-read' },

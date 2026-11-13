@@ -243,7 +243,7 @@ export function initialShelfPhase(onShelf: boolean | undefined): ShelfPhase {
 export type DownloadPhase = 'idle' | 'requesting' | 'queued' | 'error';
 
 /**
- * 下载请求的结果映射：200 = 已入队（created/existing/artifact_exists 都算——任务在队列里，
+ * 下载请求的结果映射：200/201 = 已入队（created/existing/artifact_exists 都算——任务在队列里，
  * 或产物已完整，殊途同归到「等下载完成」）；网络失败 = error。
  */
 export function downloadOutcome(status: number): DownloadPhase {

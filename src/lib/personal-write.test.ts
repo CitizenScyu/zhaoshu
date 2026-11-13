@@ -6,7 +6,7 @@ function fixture() {
   const sql = Object.assign(vi.fn((parts: TemplateStringsArray, ...values: unknown[]) => {
     const query = { text: parts.join('?'), values }; queries.push(query); return query;
   }), { transaction: vi.fn(async (build: (tx: unknown) => unknown[]) => { build(sql); return [[], [], [{ id: 7 }], []]; }) });
-  const actor: WriteAuthorization = { userId: 2, role: 'member', method: 'session', tokenHash: 'a'.repeat(64), ownerTag: null, expiresAt: new Date(Date.now() + 10_000).toISOString() };
+  const actor: WriteAuthorization = { userId: 2, role: 'member', method: 'session', tokenHash: 'a'.repeat(64), ownerTag: null, expiresAt: new Date(Date.now() + 10_000).toISOString(), permission: 'find' };
   return { sql, queries, actor };
 }
 

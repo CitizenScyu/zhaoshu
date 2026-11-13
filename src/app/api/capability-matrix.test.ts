@@ -60,6 +60,7 @@ import { GET as readGet } from '@/app/api/read/[id]/[resource]/route';
 import { GET as sourceReadGet } from '@/app/api/read/source/[resource]/route';
 import { GET as sourceProbeGet } from '@/app/api/read/source-probe/route';
 import { GET as downloadGet, POST as downloadPost, DELETE as downloadDelete } from '@/app/api/download/route';
+import { POST as findExactDownloadPost } from '@/app/api/find/exact/download/route';
 import { GET as downloadFileGet } from '@/app/api/download/[id]/file/route';
 import { GET as shuyuanGet, POST as shuyuanPost } from '@/app/api/shuyuan/route';
 
@@ -107,6 +108,8 @@ const ROUTES: { name: string; path: string; method: string; handler: Handler; pa
   { name: 'GET /api/read/source-probe', path: '/api/read/source-probe', method: 'GET', handler: sourceProbeGet as Handler, requires: 'read' },
   { name: 'GET /api/download', path: '/api/download', method: 'GET', handler: downloadGet as Handler, requires: 'download' },
   { name: 'POST /api/download', path: '/api/download', method: 'POST', handler: downloadPost as Handler, requires: 'download' },
+  // finddl1113：找书结果直下全书，与 POST /api/download 同为建下载任务的动作（download 档）。
+  { name: 'POST /api/find/exact/download', path: '/api/find/exact/download', method: 'POST', handler: findExactDownloadPost as Handler, requires: 'download' },
   { name: 'DELETE /api/download', path: '/api/download', method: 'DELETE', handler: downloadDelete as Handler, requires: 'download' },
   { name: 'GET /api/download/[id]/file', path: '/api/download/1/file', method: 'GET', handler: downloadFileGet as Handler, params: { id: '1' }, requires: 'download' },
   { name: 'GET /api/shuyuan', path: '/api/shuyuan', method: 'GET', handler: shuyuanGet as Handler, requires: 'download' },
@@ -189,6 +192,7 @@ describe('§5.2 能力矩阵：逐一直接调用受保护方法', () => {
       'GET /api/feedback', 'POST /api/feedback', 'GET /api/library', 'GET /api/stats', 'GET /api/export',
       'GET /api/read/[id]/[resource]', 'GET /api/read/source/[resource]', 'GET /api/read/source-probe',
       'GET /api/download', 'POST /api/download', 'DELETE /api/download', 'GET /api/download/[id]/file',
+      'POST /api/find/exact/download',
       'GET /api/shuyuan', 'POST /api/shuyuan',
       // T6 新增：管理员只读的下载漏斗聚合（requireOwner，非 §5.2 原表，同 §5.2 方式纳入）。
       'GET /api/admin/download-stats',

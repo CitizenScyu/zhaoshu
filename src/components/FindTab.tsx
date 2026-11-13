@@ -711,8 +711,9 @@ function ExactBookCard({ item, index }: { item: ExactBook; index: number }) {
               <ReadBookLink taskId={item.sharedReadTaskId} title={item.title} author={item.author} from="find" label="直接阅读" />
             )}
             {/* finddl1113：没有正文的书（本地 metadata 命中、豆瓣候选）给「下载全书」——
-                落库 + 建系统任务，worker 按书名扫源池。已有 TXT 的不给（重复且无意义）。 */}
-            {item.readAvailability !== 'txt' && (
+                落库 + 建系统任务，worker 按书名扫源池。txt 已有全文、online 已有
+                「直接阅读」入口（想收藏走书库页），都不并列下载按钮；旧响应缺字段时保守不给。 */}
+            {(item.readAvailability === 'metadata' || item.readAvailability === 'unknown') && (
               <button
                 className="chip hover:border-[var(--cinnabar)] hover:text-[var(--cinnabar)] transition-colors !inline-flex min-h-11 items-center !px-4"
                 onClick={() => void requestDownload()}
