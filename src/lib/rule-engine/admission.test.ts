@@ -2228,6 +2228,8 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
       vi.useRealTimers();
     }
   });
+
+  it('c>1 时调用方中止 ⇒ 被 host 挡住的 worker 不再发孤儿请求', async () => {
     // 5f3b506 实测:批次 reject 后,被同 host 挡住的 worker 被唤醒仍发出
     // fetch#3(callerAborted=true)。逐探判 signal 后该请求必须消失。
     const controller = new AbortController();
