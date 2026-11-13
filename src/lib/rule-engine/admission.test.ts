@@ -2173,7 +2173,61 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
     }
   });
 
-  it('c>1 时调用方中止 ⇒ 被 host 挡住的 worker 不再发孤儿请求', async () => {
+  it('probeover1113: cap 超时占位带 strike 前缀, 下轮 planProbeOrder 降 class 1 不再挤占未测源', async () => {
+    vi.useFakeTimers();
+    try {
+      // 第 1 轮: h0 挂起直到超 cap; h1 立即完成。占位行必须带 probe_timeout:1。
+      const hangHost = 'h0.example.com';
+      const hosts1 = [hangHost, 'h1.example.com'];
+      const fetchPage1 = vi.fn<AdmissionTransport>((_input, init) => {
+        if (new URL(_input).hostname === hangHost) {
+          return new Promise<Response>((_resolve, reject) => {
+            init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+          });
+        }
+        return Promise.resolve(page('<html>no results</html>'));
+      });
+      const round1 = await runAdmissionBatch({
+        candidates: candidatesFor(hosts1), declaredHosts: new Set(hosts1), existing: new Map(),
+        fetchPage: fetchPage1, signal: signal(), throttleMs: 0, maxProbes: 20, probeCapMs: 5_000,
+        timeoutSignal: (ms) => {
+          const c = new AbortController();
+          setTimeout(() => c.abort(new Error('probe cap exceeded')), ms);
+          return c.signal;
+        },
+      });
+      const h0Row = round1.rows.find((r) => r.host === hangHost);
+      expect(h0Row?.search_ok).toBeNull();
+      expect(h0Row?.error).toBe('probe_timeout:1');
+      expect(round1.probeTimedOut).toBe(1);
+      // SearchJsNotReady 类瞬时失败仍写无前缀占位（不降档）——本用例用正常 no_result 钉住
+      // 「拿到结论的行不带前缀」。
+      expect(round1.rows.find((r) => r.host === 'h1.example.com')?.error).toBe('');
+
+      // 第 2 轮: 名额只够 1 个（maxProbes=1）——h0 的超时占位行若还在 class 0 会先吃名额；
+      // 降档后未测新源 h2 优先。existing 传第 1 轮写出的 h0 行（rules_hash 相同）。
+      const hosts2 = [hangHost, 'h2.example.com'];
+      const fetchPage2 = vi.fn<AdmissionTransport>(() => Promise.resolve(page('<html>no results</html>')));
+      const round2 = await runAdmissionBatch({
+        candidates: candidatesFor(hosts2), declaredHosts: new Set(hosts2),
+        existing: new Map([h0Row ? [h0Row.source_url, h0Row] as const : []].flat()),
+        fetchPage: fetchPage2, signal: signal(), throttleMs: 0, maxProbes: 1, probeCapMs: 5_000,
+        timeoutSignal: (ms) => {
+          const c = new AbortController();
+          setTimeout(() => c.abort(new Error('probe cap exceeded')), ms);
+          return c.signal;
+        },
+      });
+      // h2 被探（verdict no_result），h0 只写占位；strike 递增为 2。
+      expect(round2.rows.find((r) => r.host === 'h2.example.com')?.search_verdict).toBe('no_result');
+      const h0Again = round2.rows.find((r) => r.host === hangHost);
+      expect(h0Again?.error).toBe('probe_timeout:2');
+      expect(fetchPage2).toHaveBeenCalledTimes(1);
+      expect(new URL(fetchPage2.mock.calls[0][0] as string).hostname).toBe('h2.example.com');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
     // 5f3b506 实测:批次 reject 后,被同 host 挡住的 worker 被唤醒仍发出
     // fetch#3(callerAborted=true)。逐探判 signal 后该请求必须消失。
     const controller = new AbortController();

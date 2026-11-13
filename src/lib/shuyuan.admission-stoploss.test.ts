@@ -55,9 +55,9 @@ describe('probecap1113: ADMISSION_PROBE_CAP_MS env 解析', () => {
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '0' })).toBeUndefined();
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '-5000' })).toBeUndefined();
   });
-  it('正整数夹在 [8000, admissionProbeWorstMs(env)] 内(默认 env 全关口径 16.7s)', () => {
+  it('正整数夹在 [单探最小口径, admissionProbeWorstMs(env)] 内(默认 env 全关口径 16.7s)', () => {
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '30000' })).toBe(16_700);
-    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '5000' })).toBe(8_000);
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '5000' })).toBe(16_700);
     expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '999999' })).toBe(16_700);
     // 联网开关全开(生产 confirm 轮口径):worst=18 请求×8.35s=150.3s,30s 不再被夹。
     const netJsEnv = {
@@ -65,6 +65,19 @@ describe('probecap1113: ADMISSION_PROBE_CAP_MS env 解析', () => {
       ENGINE_SEARCH_NET_JS: '1', ENGINE_SYNTAX_JS: '1', ENGINE_SYNTAX_JSOUP: '1',
     };
     expect(admissionProbeCapMs(netJsEnv)).toBe(30_000);
+  });
+  // probeover1113：探测恒开对照搜索，单探最少主搜+对照 2 请求——cap 低于 2×(超时+节流)
+  // 时截断的是正常探测（轮轮超时落占位），下限从旧的 8s 提到单探最小口径。
+  it('下限 = 2×(超时+节流)：cap=8s/9s 被夹到 16.7s 并打夹取告警(观测缺口)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '8000' })).toBe(16_700);
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '9000' })).toBe(16_700);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][1]).toMatchObject({ requested: 8_000, effective: 16_700, worstMs: 16_700 });
+    // 不被夹时不告警。
+    warn.mockClear();
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '16700' })).toBe(16_700);
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 

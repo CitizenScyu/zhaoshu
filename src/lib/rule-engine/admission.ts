@@ -178,6 +178,22 @@ export const ADMISSION_CHALLENGE_MAX_STRIKES = 3;
 /** challenge 行 error 的 strike 前缀：`challenge_strike:<n>:<原因>`。无前缀的旧 challenge 行按 1 次计。 */
 export const ADMISSION_CHALLENGE_STRIKE_PREFIX = 'challenge_strike:';
 /**
+ * probecap1113 补丁（probeover1113）：cap 超时占位行的 strike 前缀 `probe_timeout:<n>`。
+ * 没有它，固有耗时 > cap 的源每轮都写 search_ok=null 占位 → planProbeOrder 归 class 0 未测
+ * 优先 → 永远排最前、每轮吃一个名额、必超时、永无结论（Haiku 巡查发现的饿死循环）。
+ * 与 challengeStrike 同思路：占位 error 记连续超时次数，planProbeOrder 把带前缀的占位行
+ * 从 class 0 降到 class 1（checkedAtMs 未变天然最旧优先），超时源排到复测队尾轮转，
+ * 未测新源不再被挤；探测正常拿到结论时 ON CONFLICT 整行覆盖、前缀自然洗掉。
+ * strike 无上限：cap 超时不是源的结论，不该像 challenge 那样转终态——它只影响排队。
+ */
+export const ADMISSION_PROBE_TIMEOUT_PREFIX = 'probe_timeout:';
+/** 占位行已累计的 cap 超时次数：无前缀 = 0。 */
+export function probeTimeoutStrikes(row: Pick<AdmissionSourceRow, 'error'>): number {
+  if (!row.error.startsWith(ADMISSION_PROBE_TIMEOUT_PREFIX)) return 0;
+  const n = Number.parseInt(row.error.slice(ADMISSION_PROBE_TIMEOUT_PREFIX.length), 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : 1;
+}
+/**
  * ok 源长周期复核窗（41-B2-OK-RECHECK）：源一旦判 ok 即永久在池，站点改版/上反爬/关站后
  * 系统仍认为它 search_ok=true，用户每次阅读都白等它一轮切片。ok 行 search_checked_at 距今
  * ≥ 本窗（或时间戳缺失/非法）即到期复核。取 7d 与 conn_fail 衰减同窗：池内源每周最多吃
@@ -1472,6 +1488,11 @@ export interface AdmissionBatchResult {
   circuitOpen: boolean;
   /** 熔断时按「没轮到」处理、未写 conn_fail 结论的探测数（未熔断恒 0）。 */
   suppressedConnFail: number;
+  /**
+   * probeover1113：本轮单探超 cap 的次数（probecap1113 开启才可能出现）。probed 把超时
+   * 占位与真实探测混计，运维要区分「花了名额但没结论」与「拿到结论」就看这个。
+   */
+  probeTimedOut?: number;
   /** read1027：可读性影子汇总，仅 readabilityShadow > 0 时出现。 */
   readability?: AdmissionReadabilitySummary;
 }
@@ -1670,6 +1691,11 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
     const rulesChanged = !previous || previous.rules_hash !== hash;
     let probeClass: ProbeClass = 3;
     if (!previous || previous.search_ok === null) probeClass = 0; // 从未测过（含占位行）
+    // probeover1113：cap 超时占位（probe_timeout:<n> 前缀）降 class 1——固有耗时 > cap 的源
+    // 若停在 class 0 会永远排最前、每轮必超时（饿死循环）；降档后它排复测队尾轮转，让开未测新源。
+    // 规则未变才降档：规则变过的占位意味着上游改版，值得按新规则重探一次 class 0。
+    if (probeClass === 0 && previous && previous.rules_hash === hash
+      && probeTimeoutStrikes(previous) > 0) probeClass = 1;
     else if (rulesChanged
       || isRetestDue(previous, nowMs, () => searchUrlStillInvalid(candidate.source, input.declaredHosts))) {
       // 41-B2-OK-RECHECK：干净 ok 行的长周期复核排最后（class 2），其余到期者（deferred /
@@ -1770,6 +1796,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
   let compileRejected = 0;
   let grandfathered = 0;
   let probed = 0;
+  // probeover1113：本轮 cap 超时的探测数（只有 probeCapMs 开启才可能 >0）。
+  let probeTimedOut = 0;
   let probeSlots = Math.max(0, input.maxProbes ?? admissionMaxProbes());
   // 41-srcfix 改法2 放量控制：http 升级源的首探（class 0）另受每轮上限，占总名额内。
   let upgradedSlots = Math.max(0, input.upgradedMaxProbes ?? admissionUpgradedMaxProbes());
@@ -1901,10 +1929,20 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       // 捕获后落「没轮到」占位，其余探测照常（预算级中止仍走 input.signal 的原路径）。
       // timeoutSignal 可注入（测试用假时钟版；AbortSignal.timeout 用真时钟，vi.useFakeTimers
       // 接管不了它——admission.test.ts 的 probecap 用例靠注入才测得到超 cap 分支）。
+      // probeover1113：探完显式 clear 定时器——AbortSignal.timeout 的 timer 只 unref 不清除，
+      // 高并发轮会留一串悬空 timer 挂到 cap 到期。
       const probeCapMs = input.probeCapMs;
-      const perProbeSignal = probeCapMs !== undefined && probeCapMs > 0
-        ? AbortSignal.any([input.signal, (input.timeoutSignal ?? AbortSignal.timeout)(probeCapMs)])
-        : input.signal;
+      let clearCapTimer: (() => void) | undefined;
+      let perProbeSignal = input.signal;
+      if (probeCapMs !== undefined && probeCapMs > 0) {
+        const timeoutFactory = input.timeoutSignal ?? ((ms: number) => {
+          const cap = new AbortController();
+          const timer = setTimeout(() => cap.abort(new Error('probe cap exceeded')), ms);
+          clearCapTimer = () => clearTimeout(timer);
+          return cap.signal;
+        });
+        perProbeSignal = AbortSignal.any([input.signal, timeoutFactory(probeCapMs)]);
+      }
       const perProbeTimedOut = () => perProbeSignal.aborted && !input.signal.aborted;
       try {
         let result: AdmissionSearchResult;
@@ -1913,8 +1951,10 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
             fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: perProbeSignal,
             throttleMs: input.throttleMs, sleep: input.sleep, controlQuery: input.controlQuery,
             // 41-srcfix 改法1：换词不另占名额，但每次换词前与起探同一口径判预算/中止。
+            // probeover1113：perProbeSignal 已中止（cap 超时）也不再换词——换了也会被立即
+            // 中止，白做一次构建+节流等待。
             keywordFallback: input.keywordFallback,
-            canRetryKeyword: () => canProbe() && !input.signal.aborted,
+            canRetryKeyword: () => canProbe() && !input.signal.aborted && !perProbeSignal.aborted,
             ...(shadowMax > 0 ? { sampleBook: true } : {}),
           });
         } catch (error) {
@@ -1922,7 +1962,16 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           // probecap1113：单探超 cap 的中止同样不是源的结论（fetch error @ signal.aborted 会
           // 原样抛到这里）——占位收口，其余探测照常；预算级中止（input.signal）仍向上抛。
           if (error instanceof SearchJsNotReadyError || perProbeTimedOut()) {
-            if (item.placeholder) results[item.index] = item.placeholder;
+            if (perProbeTimedOut() && item.placeholder) {
+              // probeover1113：cap 超时占位带 strike 计数——planProbeOrder 据此把该源降 class 1
+              // 轮转（防饿死）；SearchJsNotReady 仍写无前缀占位（沙箱问题与源无关，不降档）。
+              probeTimedOut += 1;
+              const prior = item.previous && item.previous.rules_hash === item.hash
+                ? probeTimeoutStrikes(item.previous) : 0;
+              results[item.index] = { ...item.placeholder, error: `${ADMISSION_PROBE_TIMEOUT_PREFIX}${prior + 1}` };
+            } else if (item.placeholder) {
+              results[item.index] = item.placeholder;
+            }
             continue;
           }
           throw error;
@@ -1968,6 +2017,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           shadowResults.set(item.index, { host: item.host, ...shadow });
         }
       } finally {
+        clearCapTimer?.();
         inflightHosts.delete(item.mutexHost);
         releaseWaiters();
       }
@@ -2001,7 +2051,8 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
 
   // 汇总:按计划顺序输出(先落槽后汇总 ⇒ 与完成先后无关;undefined 槽即本批无行)。
   for (const row of results) if (row !== undefined) rows.push(row);
-  const summary: AdmissionBatchResult = { rows, compileOk, compileRejected, probed, verdicts, grandfathered, circuitOpen, suppressedConnFail };
+  const summary: AdmissionBatchResult = { rows, compileOk, compileRejected, probed, verdicts, grandfathered, circuitOpen, suppressedConnFail,
+    ...(probeTimedOut > 0 ? { probeTimedOut } : {}) };
   if (shadowMax > 0) {
     const samples = [...shadowResults.entries()].sort((a, b) => a[0] - b[0]).map(([, sample]) => sample);
     const tally: Record<string, number> = {};

@@ -9,7 +9,7 @@ import {
   builtinSourceForHost, isActiveBuiltinHost, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
-  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_TIMEOUT_MS,
+  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_THROTTLE_MS, ADMISSION_TIMEOUT_MS,
   admissionProbeWorstMs, admissionReadabilityShadowMax, assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
@@ -125,15 +125,23 @@ export function admissionLeaseTtlMs(env: Record<string, string | undefined> = pr
   const parsed = Number.parseInt(env.ADMISSION_LEASE_TTL_MS ?? '', 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : ADMISSION_LEASE_TTL_MS;
 }
-// probecap1113：单探硬上限（env `ADMISSION_PROBE_CAP_MS`）。正整数即用（夹 [ADMISSION_TIMEOUT_MS,
-// admissionProbeWorstMs(env)]——低于单请求超时无意义、高于理论最坏无意义），缺失/非法 = undefined
+// probecap1113：单探硬上限（env `ADMISSION_PROBE_CAP_MS`）。正整数即用（夹 [单探最小口径,
+// admissionProbeWorstMs(env)]——低于最小无意义、高于理论最坏无意义），缺失/非法 = undefined
 // （关，canProbe 止损与 probecap 之前逐字相同）。止损口径见 admitRows 的 stopLossMs。
 // 上限随同一 env 的联网开关算：关联网时 worst=16.7s，cap 设 30s 会被夹到 16.7s（再高无意义）。
+// probeover1113：下限用 2×(超时+节流)（≈16.7s）——探测恒开对照搜索（espfix41），单探最少
+// 主搜+对照 2 请求；cap 低于它时几乎每探必超（截断正常探测轮轮落占位），旧的 8s 下限形同虚设。
 export function admissionProbeCapMs(env: Record<string, string | undefined> = process.env): number | undefined {
   const parsed = Number.parseInt(env.ADMISSION_PROBE_CAP_MS ?? '', 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
-  const floor = ADMISSION_TIMEOUT_MS, ceiling = admissionProbeWorstMs(env as NodeJS.ProcessEnv);
-  return Math.min(Math.max(parsed, floor), ceiling);
+  const floor = 2 * (ADMISSION_TIMEOUT_MS + ADMISSION_THROTTLE_MS);
+  const ceiling = admissionProbeWorstMs(env as NodeJS.ProcessEnv);
+  const effective = Math.min(Math.max(parsed, floor), ceiling);
+  // probeover1113：夹取即告警（观测缺口——原来只有 env 调用点知道原始值，runner 日志里看不见）。
+  if (effective !== parsed) {
+    console.warn('shuyuan probe cap clamped', { requested: parsed, effective, worstMs: ceiling });
+  }
+  return effective;
 }
 // 租约借 cron_health 一行（不改 schema）：last_success_at 存的是**租约到期时刻**，不是成功时刻——
 // 与 db-quota.ts 的 db_quota_exceeded 行同一借用法；readCronSuccessTimes 只认已知行名，不受影响。
@@ -2129,12 +2137,6 @@ async function admitRows(
     // （66+71 到期源轮转一圈要 11h）；cap 把单探截短后，剩余预算 > cap+5s 就允许起下一探，
     // 快探轮次能探满名额。单探超 cap 记「没轮到」占位（不是源的结论），下轮接着测。
     const probeCapMs = admissionProbeCapMs();
-    if (probeCapMs !== undefined) {
-      const raw = Number.parseInt(process.env.ADMISSION_PROBE_CAP_MS ?? '', 10);
-      if (Number.isSafeInteger(raw) && raw > 0 && probeCapMs !== raw) {
-        console.warn('shuyuan probe cap clamped', { requested: raw, effective: probeCapMs, worstMs: probeWorstMs });
-      }
-    }
     const stopLossMs = probeCapMs ?? probeWorstMs;
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
@@ -2157,6 +2159,8 @@ async function admitRows(
       compileRejected: result.compileRejected,
       grandfathered: result.grandfathered,
       probed: result.probed,
+      // probeover1113：cap 超时数单列（probed 混计真探与超时占位）。
+      ...(result.probeTimedOut ? { probeTimedOut: result.probeTimedOut } : {}),
       ...(result.circuitOpen ? { circuitOpen: true, suppressedConnFail: result.suppressedConnFail, verdicts: result.verdicts } : {}),
     });
     if (result.readability) {
