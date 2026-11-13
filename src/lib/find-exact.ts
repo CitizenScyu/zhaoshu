@@ -237,3 +237,24 @@ export function shelfButtonLabel(phase: ShelfPhase): string {
 export function initialShelfPhase(onShelf: boolean | undefined): ShelfPhase {
   return onShelf ? 'saved' : 'idle';
 }
+
+/* ---------- 下载全书（finddl1113） ---------- */
+
+export type DownloadPhase = 'idle' | 'requesting' | 'queued' | 'error';
+
+/**
+ * 下载请求的结果映射：200 = 已入队（created/existing/artifact_exists 都算——任务在队列里，
+ * 或产物已完整，殊途同归到「等下载完成」）；网络失败 = error。
+ */
+export function downloadOutcome(status: number): DownloadPhase {
+  return status === 200 || status === 201 ? 'queued' : 'error';
+}
+
+export function downloadButtonLabel(phase: DownloadPhase): string {
+  if (phase === 'requesting') return '提交中…';
+  if (phase === 'queued') return '✓ 已入下载队列';
+  return '下载全书';
+}
+
+/** queued 后的进度提示：下载任务几分钟后完成，到「书库」标签页看书。 */
+export const DOWNLOAD_QUEUED_NOTE = '已加入下载队列，通常几分钟到十几分钟完成。完成后在「书库」里可读全文。';

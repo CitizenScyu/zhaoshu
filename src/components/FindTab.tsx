@@ -23,11 +23,15 @@ import {
   exactReducer,
   exactResultNote,
   initialShelfPhase,
+  downloadButtonLabel,
+  downloadOutcome,
+  DOWNLOAD_QUEUED_NOTE,
   parseExactResponse,
   readAvailabilityLabel,
   shelfButtonLabel,
   shelfOutcome,
   showExactEmpty,
+  type DownloadPhase,
   type ExactBook,
   type FindMode,
   type ShelfPhase,
@@ -613,6 +617,28 @@ function ExactBookCard({ item, index }: { item: ExactBook; index: number }) {
   const { apiFetch } = useOwner();
   const [shelf, setShelf] = useState<ShelfPhase>(() => initialShelfPhase(item.onShelf));
   const [note, setNote] = useState('');
+  // finddl1113：下载全书。已有 TXT 的书不需要（直接阅读即可），只有 metadata/unknown 给按钮。
+  const [download, setDownload] = useState<DownloadPhase>('idle');
+  const [downloadNote, setDownloadNote] = useState('');
+
+  async function requestDownload() {
+    if (download === 'requesting' || download === 'queued') return;
+    setDownload('requesting');
+    setDownloadNote('');
+    try {
+      const res = await apiFetch('/api/find/exact/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: item.title, author: item.author }),
+      });
+      const outcome = downloadOutcome(res.status);
+      setDownload(outcome);
+      setDownloadNote(outcome === 'queued' ? DOWNLOAD_QUEUED_NOTE : `下载请求失败（HTTP ${res.status}）`);
+    } catch {
+      setDownload('error');
+      setDownloadNote('下载请求失败，请重试。');
+    }
+  }
 
   async function addToShelf() {
     if (shelf === 'saving' || shelf === 'saved') return;
@@ -684,8 +710,23 @@ function ExactBookCard({ item, index }: { item: ExactBook; index: number }) {
             {(item.readAvailability === 'txt' || item.readAvailability === 'online') && (
               <ReadBookLink taskId={item.sharedReadTaskId} title={item.title} author={item.author} from="find" label="直接阅读" />
             )}
+            {/* finddl1113：没有正文的书（本地 metadata 命中、豆瓣候选）给「下载全书」——
+                落库 + 建系统任务，worker 按书名扫源池。已有 TXT 的不给（重复且无意义）。 */}
+            {item.readAvailability !== 'txt' && (
+              <button
+                className="chip hover:border-[var(--cinnabar)] hover:text-[var(--cinnabar)] transition-colors !inline-flex min-h-11 items-center !px-4"
+                onClick={() => void requestDownload()}
+                disabled={download === 'requesting' || download === 'queued'}
+                aria-pressed={download === 'queued'}
+              >
+                {downloadButtonLabel(download)}
+              </button>
+            )}
           </div>
 
+          {downloadNote && (
+            <p className="mt-2 text-xs" role="status" style={{ color: download === 'error' ? 'var(--cinnabar)' : 'var(--ink-faint)' }}>{downloadNote}</p>
+          )}
           {note && <p className="mt-2 text-xs" role="alert" style={{ color: 'var(--cinnabar)' }}>{note}</p>}
         </div>
       </div>
