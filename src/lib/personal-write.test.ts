@@ -25,7 +25,9 @@ describe('最终写事务的授权边界', () => {
     expect(JSON.parse(String(queries[0].values[1]))).toEqual(actor);
     for (const query of [queries[1], queries[3]]) {
       expect(query.text).toContain('FOR SHARE');
-      expect(query.text).toContain('disabled_at IS NULL AND can_find');
+      // 能力位按 WriteAuthorization.permission 分支（find→can_find，download→can_download）。
+      expect(query.text).toContain('CASE WHEN');
+      expect(query.text).toContain('can_download');
       expect(query.text).toContain('members_enabled');
       expect(query.text).toContain("token_hash = g->>'tokenHash'");
       expect(query.text).toContain("user_id = (g->>'userId')::int");

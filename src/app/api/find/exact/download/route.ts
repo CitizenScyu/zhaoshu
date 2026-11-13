@@ -70,21 +70,23 @@ async function handlePOST(req: NextRequest) {
       await access.run(ensureSchema);
       // 滥用闸：复用 auth_rate_limits 的原子滑动窗口，键是 secret 对 userId 的 HMAC
       //（数据库不存裸用户 id）。先 bump 再判定，超限直接 429，不进入写事务。
+      // secret 未配置时不放行——以 userId 原值做键（限速不能因配置缺失而失效）。
       const secret = getAuthSecuritySecret();
-      if (secret) {
-        const bump = await access.run(() => bumpAuthRateLimit(getSql(), DOWNLOAD_RATE_LIMIT,
-          rateLimitKeyHash(secret, DOWNLOAD_RATE_LIMIT.scope, String(access.principal.userId))));
-        const decision = decideRateLimit(bump, DOWNLOAD_RATE_LIMIT.limit);
-        if (!decision.allowed) {
-          return NextResponse.json(
-            { error: '请求过于频繁，请稍后再试', code: 'RATE_LIMITED', retryAfterSeconds: decision.retryAfterSeconds },
-            { status: 429, headers: { 'Retry-After': String(decision.retryAfterSeconds) } },
-          );
-        }
+      const rateKey = secret
+        ? rateLimitKeyHash(secret, DOWNLOAD_RATE_LIMIT.scope, String(access.principal.userId))
+        : `${DOWNLOAD_RATE_LIMIT.scope}:${access.principal.userId}`;
+      const bump = await access.run(() => bumpAuthRateLimit(getSql(), DOWNLOAD_RATE_LIMIT, rateKey));
+      const decision = decideRateLimit(bump, DOWNLOAD_RATE_LIMIT.limit);
+      if (!decision.allowed) {
+        return NextResponse.json(
+          { error: '请求过于频繁，请稍后再试', code: 'RATE_LIMITED', retryAfterSeconds: decision.retryAfterSeconds },
+          { status: 429, headers: { 'Retry-After': String(decision.retryAfterSeconds) } },
+        );
       }
       // 单条 CTE（审查 blocker 1）：整条语句作为 PersonalBatch 放进 access.commit——
       // 写前 revalidatePermission + 事务内两次 authorizationFence + statement_timeout
-      // 全部生效。enqueue_key 传 NULL 绕开事件唯一索引，互斥靠活动任务部分索引。
+      // 全部生效；第二参数 'download' 让围栏按 can_download 验能力位。
+      // enqueue_key 传 NULL 绕开事件唯一索引，互斥靠活动任务部分索引。
       const rows = await access.commit((write) => write((tx) => [
         tx`
         WITH upserted AS (
@@ -92,7 +94,7 @@ async function handlePOST(req: NextRequest) {
             (title, author, category, finish_status, source_site, source_url,
              chars_labeled, labels, labeled_at, primary_genre, sub_tags, quality)
           VALUES (${title}, ${author}, '', '', '书源池搜索', ${SEARCH_SEED_URL},
-                  0, '[]'::jsonb, now(), '', '[]'::jsonb, NULL)
+                  0, '{}'::jsonb, now(), '', '[]'::jsonb, NULL)
           ON CONFLICT (title_key, author_key) DO UPDATE SET
             id = labeled_books.id
           RETURNING id, title, author, source_url
@@ -109,7 +111,7 @@ async function handlePOST(req: NextRequest) {
           INSERT INTO download_tasks
             (user_id, book_id, title, author, source_url, status, requested_by,
              source_kind, source_id, source_revision, policy_version, enqueue_key)
-          SELECT NULL, u.id, u.title, u.author, u.source_url, 'pending', 'system',
+          SELECT NULL, u.id, u.title, u.author, ${SEARCH_SEED_URL}, 'pending', 'system',
                  'builtin', NULL, 'finddl-1113', ${DEFAULT_POLICY_VERSION}, NULL
           FROM upserted u
           WHERE NOT EXISTS (SELECT 1 FROM artifact_done d WHERE d.id = u.id)
@@ -132,8 +134,10 @@ async function handlePOST(req: NextRequest) {
                (SELECT id FROM inserted)             AS created_task_id,
                (SELECT id FROM existing_task)        AS existing_task_id,
                (SELECT id FROM artifact_done)        AS artifact_book_id`,
-      ]));
-      const row = (rows[0] ?? {}) as Record<string, unknown>;
+      ]), 'download');
+      // authorizedTransaction 返回「每条语句一个行数组」：批处理只有一条主 CTE，
+      // 行在 rows[0][0]（与 shelf 路由的 rows[1][0] 同理，前面还有两条 fence 语句被切掉）。
+      const row = (rows[0]?.[0] ?? {}) as Record<string, unknown>;
       const bookId = Number(row.labeled_book_id);
       const created = Number(row.created_task_id);
       const existing = Number(row.existing_task_id);

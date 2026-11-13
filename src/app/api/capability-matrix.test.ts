@@ -191,8 +191,7 @@ describe('§5.2 能力矩阵：逐一直接调用受保护方法', () => {
       'DELETE /api/shelf/unprocessed',
       'GET /api/feedback', 'POST /api/feedback', 'GET /api/library', 'GET /api/stats', 'GET /api/export',
       'GET /api/read/[id]/[resource]', 'GET /api/read/source/[resource]', 'GET /api/read/source-probe',
-      'GET /api/download', 'POST /api/download', 'DELETE /api/download', 'GET /api/download/[id]/file',
-      'POST /api/find/exact/download',
+      'GET /api/download', 'POST /api/download', 'POST /api/find/exact/download', 'DELETE /api/download', 'GET /api/download/[id]/file',
       'GET /api/shuyuan', 'POST /api/shuyuan',
       // T6 新增：管理员只读的下载漏斗聚合（requireOwner，非 §5.2 原表，同 §5.2 方式纳入）。
       'GET /api/admin/download-stats',

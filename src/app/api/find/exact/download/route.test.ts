@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { mockSql, type RecordedQuery } from '@/lib/fixtures/mock-sql';
 
 const mocks = vi.hoisted(() => ({
@@ -125,8 +125,10 @@ describe('POST /api/find/exact/download', () => {
     expect(insert).toBeDefined();
     expect(fences[0]).toBeLessThan(queries.indexOf(insert!));
     expect(fences[fences.length - 1]).toBeGreaterThan(queries.indexOf(insert!));
-    // fence 按本次写事务的 permission=download 验能力位。
-    expect(queries[fences[0]].text).toContain('can_download');
+    // 围栏按本次写事务的能力位验 download：set_config 传入的授权 JSON 里 permission
+    // 必须是 'download'（fence 的 CASE 文本按它分支），不能只是 fence 文本碰巧含词。
+    const config = queries.find((q) => q.text.includes('set_config') && q.values.some((v) => typeof v === 'string' && v.includes('"permission":"download"')));
+    expect(config).toBeDefined();
     // 一条语句里既有书库 UPSERT 也有 download_tasks 插入（原子性）。
     expect(insert!.text).toContain('INSERT INTO download_tasks');
     expect(insert!.text).toContain("'system'");
