@@ -1690,12 +1690,14 @@ function planProbeOrder(input: AdmissionBatchInput, nowMs: number): AdmissionPla
     const hash = rulesHash(candidate.source);
     const rulesChanged = !previous || previous.rules_hash !== hash;
     let probeClass: ProbeClass = 3;
-    if (!previous || previous.search_ok === null) probeClass = 0; // 从未测过（含占位行）
-    // probeover1113：cap 超时占位（probe_timeout:<n> 前缀）降 class 1——固有耗时 > cap 的源
-    // 若停在 class 0 会永远排最前、每轮必超时（饿死循环）；降档后它排复测队尾轮转，让开未测新源。
-    // 规则未变才降档：规则变过的占位意味着上游改版，值得按新规则重探一次 class 0。
-    if (probeClass === 0 && previous && previous.rules_hash === hash
-      && probeTimeoutStrikes(previous) > 0) probeClass = 1;
+    if (!previous || previous.search_ok === null) {
+      probeClass = 0; // 从未测过（含占位行）
+      // probeover1113：cap 超时占位（probe_timeout:<n> 前缀）降 class 1——固有耗时 > cap 的源
+      // 若停在 class 0 会永远排最前、每轮必超时（饿死循环）；降档后与复测到期者同队按
+      // checkedAtMs 轮转（超时占位带真实 checked_at ⇒ 最新 ⇒ 排队尾），让开未测新源。
+      // 规则未变才降档：规则变过的占位意味着上游改版，值得按新规则重探一次 class 0。
+      if (previous && previous.rules_hash === hash && probeTimeoutStrikes(previous) > 0) probeClass = 1;
+    }
     else if (rulesChanged
       || isRetestDue(previous, nowMs, () => searchUrlStillInvalid(candidate.source, input.declaredHosts))) {
       // 41-B2-OK-RECHECK：干净 ok 行的长周期复核排最后（class 2），其余到期者（deferred /
@@ -1869,12 +1871,18 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
     // 保留旧行原样（rules_hash 不更新），下一轮 rulesChanged 仍成立、仍优先排队真探，
     // 复测拿到名额后正常改写——不放松任何判据，只是没轮到时不清掉旧结论。
     // 名额/canProbe/signal 不在这里判(41-ADMIT-CONC-FIX):占位先算好,判定挪到 worker 每次起探前。
+    // probeover1113：超时占位行的 strike 与 checked_at 要继承——strike 让下轮仍降 class 1，
+    // checked_at 让它在 class 1 内按「最新排最后」轮转（null 会被解析成最旧、又恒排最前）。
+    const priorTimeouts = previous && previous.rules_hash === hash ? probeTimeoutStrikes(previous) : 0;
     const placeholder: AdmissionSourceRow | undefined =
-      rulesChanged && !(previous?.search_ok === true && previous.compile_ok === true)
+      (rulesChanged || priorTimeouts > 0) && !(previous?.search_ok === true && previous.compile_ok === true)
         ? {
           source_url: candidate.url, tier: 'M1', compile_ok: true, core_field_mask: compile.coreFieldMask,
-          search_ok: null, search_verdict: '', search_checked_at: null, rules_hash: hash,
-          engine_semantics_version: semanticsVersionOf(hash), host, error: '', compile_diagnostics: [],
+          search_ok: null, search_verdict: '',
+          search_checked_at: priorTimeouts > 0 && !rulesChanged ? previous!.search_checked_at : null,
+          rules_hash: hash,
+          engine_semantics_version: semanticsVersionOf(hash), host,
+          error: priorTimeouts > 0 && !rulesChanged ? previous!.error : '', compile_diagnostics: [],
         }
         : undefined;
     probes.push({
@@ -1965,6 +1973,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
             if (perProbeTimedOut() && item.placeholder) {
               // probeover1113：cap 超时占位带 strike 计数——planProbeOrder 据此把该源降 class 1
               // 轮转（防饿死）；SearchJsNotReady 仍写无前缀占位（沙箱问题与源无关，不降档）。
+              // 占位已在构建时继承 checked_at/前缀，这里只递增。
               probeTimedOut += 1;
               const prior = item.previous && item.previous.rules_hash === item.hash
                 ? probeTimeoutStrikes(item.previous) : 0;
@@ -1975,8 +1984,7 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
             continue;
           }
           throw error;
-        }
-        verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
+        }        verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
         probedVerdicts.set(pick, result.verdict);
         // 41-B2-OK-RECHECK:写库结论走 recheckOutcome——干净 ok 行首次复核失败记 strike 不出池。
         // 必须用 item.previous:worker 是独立函数,闭包拿不到外层循环的 previous。
