@@ -8,49 +8,6 @@
 // 用法: node source-bucket-dryrun.mjs
 // 出口码: 0=ok, 1=error
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { hostname } from 'node:os';
-
-const execFileAsync = promisify(execFile);
-
-const SQL = `
-WITH last24 AS (
-  SELECT
-    host,
-    search_ok,
-    search_verdict,
-    error,
-    search_checked_at,
-    tier,
-    source_url,
-    rules_hash
-  FROM source_admission
-  WHERE search_checked_at > NOW() - INTERVAL '24 hours'
-),
-agg AS (
-  SELECT
-    host,
-    MAX(CASE WHEN search_ok AND error NOT LIKE 'phoenix_ok:%' THEN 1 ELSE 0 END) AS has_clean_recent,
-    COUNT(*) FILTER (WHERE search_ok = true)                                     AS ok_24h,
-    COUNT(*)                                                                     AS tot_24h
-  FROM last24 GROUP BY host
-)
-SELECT
-  la.source_url, la.host, la.tier, la.search_ok, la.error, la.search_checked_at,
-  COALESCE(a.has_clean_recent, 0) AS has_clean_recent,
-  COALESCE(a.ok_24h, 0)           AS ok_24h,
-  COALESCE(a.tot_24h, 0)          AS tot_24h
-FROM last24 la
-LEFT JOIN agg a USING (host)
-ORDER BY la.search_checked_at DESC NULLS LAST
-LIMIT 400;
-`.trim();
-
-async function psql(sql) {
-  throw new Error('(stubbed) 不联网 — mock 模式');
-}
-
 // 由于跨 shell/ssh 引号陷阱, 直接读现网太费;改为在脚本内置 mock 一份典型分布(基于 17:19 实测)
 // 这样脚本完全离线运行,零执行。
 

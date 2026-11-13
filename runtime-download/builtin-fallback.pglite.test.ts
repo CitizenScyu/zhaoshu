@@ -19,7 +19,6 @@ import { createWorkerStorage, type DownloadSql } from './storage';
 import { createDownloadExecutor } from './entry';
 import { DEFAULT_DECISIONS } from './executor';
 import { assembleEngineModules } from './engine';
-import { MAX_FALLBACK_SOURCES } from './builtin-fallback';
 import type { GitHubContents } from '../src/lib/download-publisher';
 import { recordHostFailure, recordHostSuccess } from '../src/lib/source-host-health';
 

@@ -10,10 +10,6 @@ import {
   isHostActiveInSources, isRetiredBuiltinHost, sourceForHostIn, type SupportedSource,
 } from './supported-sources';
 
-const base = {
-  searchUrl: 'https://example.invalid/s?q={{key}}', rules: {}, tier: 'builtin' as const,
-};
-
 function entry(url: string, over: Partial<SupportedSource> = {}): SupportedSource {
   return {
     url, name: url, searchUrl: `${url}s?q={{key}}`, rules: {}, tier: 'builtin',

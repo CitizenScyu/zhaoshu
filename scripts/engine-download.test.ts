@@ -1787,7 +1787,9 @@ describe('hostburst1030 按站连抓静置', () => {
   /** 相邻请求间隔 < gapMs 的连续段长度。 */
   const runs = (times: number[], gapMs: number) => {
     const out = [1];
-    for (let i = 1; i < times.length; i++) times[i] - times[i - 1] >= gapMs ? out.push(1) : out[out.length - 1]++;
+    for (let i = 1; i < times.length; i++) {
+      if (times[i] - times[i - 1] >= gapMs) out.push(1); else out[out.length - 1] += 1;
+    }
     return out;
   };
 

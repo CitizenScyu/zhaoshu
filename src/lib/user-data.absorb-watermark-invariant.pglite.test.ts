@@ -72,18 +72,6 @@ maybe('真实 PostgreSQL：异步吸收水位不越过已喂行（F41-F1 不变�
     });
     return result;
   }) as SqlTag;
-  const schemaTag = Object.assign(baseTag, {
-    transaction: async (builder: (tx: SqlTag) => Statement[]) => {
-      const statements = builder(baseTag);
-      await pg.exec('BEGIN');
-      try {
-        const results = [];
-        for (const statement of statements) results.push((await pg.query(statement.text, statement.params)).rows);
-        await pg.exec('COMMIT');
-        return results;
-      } catch (error) { await pg.exec('ROLLBACK').catch(() => {}); throw error; }
-    },
-  }) as unknown as SqlTag;
 
   const run = async (statement: Statement) => (await pg.query(statement.text, statement.params)).rows;
   const claim = (userId: number, token: string, leaseMs = 60_000) =>

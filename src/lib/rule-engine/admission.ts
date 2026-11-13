@@ -10,7 +10,6 @@
 // - admissionFetch / validateAdmissionUrl **不导出**（任务 4 有导出快照断言）。
 
 import { checkSourceUrl, upgradeRedirectLocation, upgradeSourceTemplateUrl, SourcePolicyError } from '@/lib/source-policy';
-import { sourceRevision } from '@/lib/source-revision';
 import { preservesSourcePostRedirect, sourceAbortable } from '@/lib/source-fetch';
 import { type SourceSearchRequest, type SourceUrlValidator } from '@/lib/source-parser';
 import { charsetFromContentType, encodeToBytes, type SourceCharset } from '@/lib/source-charset';

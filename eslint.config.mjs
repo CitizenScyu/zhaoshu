@@ -19,6 +19,21 @@ const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
   {
+    // 下划线前缀 = 有意忽略的占位（mock 签名对齐、转发器参数占位等），不算未用。
+    files: ["**/*.{ts,tsx,mjs,js}"],
+    rules: {
+      "@typescript-eslint/no-unused-vars": [
+        "warn",
+        {
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrorsIgnorePattern: "^_",
+        },
+      ],
+      "no-unused-vars": "off",
+    },
+  },
+  {
     files: clientFiles,
     rules: {
       "no-restricted-properties": [

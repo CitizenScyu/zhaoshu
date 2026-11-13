@@ -14,7 +14,6 @@ import {
   type CurrentActivation,
   type OriginalVerification,
   type ReconciliationSource,
-  type ReconcileInput,
   type VerifiedOriginalIdentity,
 } from './artifact-capacity-reconcile';
 

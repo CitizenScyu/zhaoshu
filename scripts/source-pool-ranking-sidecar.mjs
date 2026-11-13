@@ -112,8 +112,6 @@ async function main() {
   const curUrls = cur.map(r => r.source_url);
   const proUrls = pro.map(r => r.source_url);
   const movedCount = curUrls.filter((u, i) => proUrls[i] !== u).length;
-  const promoted = proUrls.filter((u, i) => curUrls.indexOf(u) > i);
-  const demoted = curUrls.filter((u, i) => proUrls.indexOf(u) > i || proUrls.indexOf(u) === -1);
 
   const record = {
     ts: new Date().toISOString(),

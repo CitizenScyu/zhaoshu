@@ -73,7 +73,7 @@ describe('capacitySqlFromNeon adapter boundary', () => {
   it('does not execute a statement until it is placed in a transaction batch', () => {
     const stub = boundary(() => { throw new Error('must not execute'); });
     const port = capacitySqlFromNeon(stub.client);
-    port`SELECT ${1}`;                                          // 仅构造，未进批、未执行
+    port`SELECT ${1}`; // eslint-disable-line @typescript-eslint/no-unused-expressions -- 仅构造，未进批、未执行
     expect(stub.constructed).toHaveLength(1);                   // 句柄确已构造
     expect(stub.batches).toHaveLength(0);                       // 未发起事务、未执行
   });

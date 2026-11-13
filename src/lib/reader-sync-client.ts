@@ -36,7 +36,6 @@ export interface ReaderSyncOptions {
   request: ReaderSyncRequest;
   store: ReaderSyncStore;
   delayMs?: number;
-  now?: () => number;
 }
 
 export interface ReaderSync {
@@ -52,7 +51,6 @@ export interface ReaderSync {
 export function createReaderSync(options: ReaderSyncOptions): ReaderSync {
   const { userId, request, store } = options;
   const delayMs = options.delayMs ?? READER_SYNC_PUSH_DELAY_MS;
-  const now = options.now ?? Date.now;
   const pending = new Map<string, ReaderSyncEntry>();
   let enabled = false;
   let timer: ReturnType<typeof setTimeout> | null = null;

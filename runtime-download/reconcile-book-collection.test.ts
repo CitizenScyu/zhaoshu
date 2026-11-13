@@ -222,7 +222,7 @@ describe('collectFixedBookManifestCandidate (fixed single-book collection compos
     // 直接计数真正被调用的 badCommit 两个方法（不绕过计数包装）。
     const counts = { getCommit: 0, getTree: 0 };
     const badCommit: GitTreePort = {
-      getCommit: (t) => { counts.getCommit++; return Promise.resolve({ commitSha: 'not-hex', treeSha: TREE_SHA }); },
+      getCommit: (_t) => { counts.getCommit++; return Promise.resolve({ commitSha: 'not-hex', treeSha: TREE_SHA }); },
       getTree: (t, sha, o) => { counts.getTree++; return base.getTree(t, sha, o); },
     };
     const { counts: bc, port: blob } = countBlob(realBlob(built.bytes, manifestSha));
@@ -428,7 +428,7 @@ describe('collectFixedBookManifestCandidate (fixed single-book collection compos
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
     const gated: GitTreePort = {
-      getCommit: async (t) => { await gate; return { commitSha: COMMIT_SHA, treeSha: TREE_SHA }; },
+      getCommit: async (_t) => { await gate; return { commitSha: COMMIT_SHA, treeSha: TREE_SHA }; },
       getTree: treePortOf(entries).getTree,
     };
     const { port: blob } = countBlob(realBlob(built.bytes, manifestSha));

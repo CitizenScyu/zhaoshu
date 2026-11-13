@@ -148,7 +148,7 @@ maybe('T8 执行器端到端：领取 → 合成抓取 → 五阶段发布 → D
     const executor = createExecutor(deps([engineAdapter({ total: 1, done: 1, chars: bigTxt.length }, bigTxt)], fakeBudget()));
     expect(await executor.runOnce()).toBe(DEFAULT_DECISIONS.TASK_DONE);
     expect((await taskState(id)).status).toBe('done');
-    const { canonicalPath, dir } = snapshotPaths('测试书', '佚名');
+    const { canonicalPath } = snapshotPaths('测试书', '佚名');
     const row = (await pg.query('SELECT canonical_path, snapshot_path, bytes FROM book_artifacts')).rows[0] as
       { canonical_path: string; snapshot_path: string; bytes: number };
     expect(row.canonical_path.endsWith('/index.json')).toBe(true);

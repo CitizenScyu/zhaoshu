@@ -131,7 +131,7 @@ describe('readerux42-C 书架最近在读', () => {
     window.localStorage.setItem(userReadingProgressKey(5, 302), progress(2, now - 10 * MIN));
     // 6 本独立书,时间递减 ⇒ 第 6 本(最旧)被 5 本上限裁掉。
     items.slice(2).forEach((it, i) => {
-      const { read_task_id, title } = it as { read_task_id: number; title: string };
+      const { read_task_id } = it as { read_task_id: number; title: string };
       window.localStorage.setItem(userReadingProgressKey(5, read_task_id), progress(0, now - (30 + i * 10) * MIN));
     });
 

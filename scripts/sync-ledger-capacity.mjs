@@ -106,8 +106,8 @@ const MAX_DRILL_DOWN_DEPTH = 8;
 
 const USAGE = '用法: sync-ledger-capacity.mjs --database-url-env=<变量名> --github-token-env=<变量名> [--tree-root=books] [--dry-run | --apply]';
 
-/** @param {string[]} argv @param {Record<string, string | undefined>} [env] */
-export function parseSyncArgs(argv, env = process.env) {
+/** @param {string[]} argv @param {Record<string, string | undefined>} [_env] */
+export function parseSyncArgs(argv, _env = process.env) {
   let dbEnv = null;
   let ghEnv = null;
   let treeRoot = DEFAULT_TREE_ROOT;

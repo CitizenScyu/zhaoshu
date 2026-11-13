@@ -61,19 +61,6 @@ maybe('真实 PostgreSQL：profile_feedback_queue 租约与退避（F15 残留�
     });
     return { text, params };
   }) as SqlTag;
-  // initializeBusinessSchema 走 transaction 批量 DDL（与既有 pglite 测试同款适配）。
-  const schemaTag = Object.assign(baseTag, {
-    transaction: async (builder: (tx: SqlTag) => { text: string; params: unknown[] }[]) => {
-      const statements = builder(baseTag);
-      await pg.exec('BEGIN');
-      try {
-        const results = [];
-        for (const statement of statements) results.push((await pg.query(statement.text, statement.params)).rows);
-        await pg.exec('COMMIT');
-        return results;
-      } catch (error) { await pg.exec('ROLLBACK').catch(() => {}); throw error; }
-    },
-  }) as unknown as SqlTag;
   const run = async (statement: { text: string; params: unknown[] }) =>
     (await pg.query(statement.text, statement.params)).rows;
   const claim = (userId: number, token: string, leaseMs: number) =>

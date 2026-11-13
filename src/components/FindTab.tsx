@@ -491,10 +491,12 @@ function ExactSearchSection({ onFallback }: { onFallback: (query: string) => voi
   const [state, dispatch] = useReducer(exactReducer, restored?.value.state ?? EMPTY_EXACT_STATE);
   const request = useRef<AbortController | null>(null);
   useEffect(() => () => { request.current?.abort(); }, [apiFetch]);
-  // 落定(done)才写;error 不写,理由与口味推荐一致。
+  // 落定(done)才写;error 不写,理由与口味推荐一致。state 是 reducer 态引用,phase 变化即整体
+  // 换新引用——依赖数组只放 state.phase 就足够触发,直接依赖 state 会在无关 dispatch 时重复写。
   useEffect(() => {
     if (state.phase !== 'done') return;
     saveExactSnapshot(userId, { title, author, state });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 见上注:按 phase 触发即可。
   }, [state.phase, title, author, userId]);
 
   async function search() {

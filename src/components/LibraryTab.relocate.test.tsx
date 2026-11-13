@@ -70,7 +70,7 @@ async function openDetail(apiFetch: ReturnType<typeof makeApiFetch>) {
 
 const entryName = '⟳ 换活跃源重下';
 
-async function offerRelocate(apiFetch: ReturnType<typeof makeApiFetch>) {
+async function offerRelocate(_apiFetch: ReturnType<typeof makeApiFetch>) {
   fireEvent.click(screen.getByRole('button', { name: '⬇ 下载全书' }));
   const entry = await screen.findByRole('button', { name: entryName });
   return entry;

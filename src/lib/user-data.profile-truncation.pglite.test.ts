@@ -42,18 +42,6 @@ maybe('真实 PostgreSQL：F41-F1 反馈吸收 LIMIT 截断与水位推进', () 
     return result;
   }) as SqlTag;
   // initializeBusinessSchema 走 transaction 批量 DDL（与既有 pglite 测试同款适配）。
-  const schemaTag = Object.assign(baseTag, {
-    transaction: async (builder: (tx: SqlTag) => Statement[]) => {
-      const statements = builder(baseTag);
-      await pg.exec('BEGIN');
-      try {
-        const results = [];
-        for (const statement of statements) results.push((await pg.query(statement.text, statement.params)).rows);
-        await pg.exec('COMMIT');
-        return results;
-      } catch (error) { await pg.exec('ROLLBACK').catch(() => {}); throw error; }
-    },
-  }) as unknown as SqlTag;
 
   const run = async (statement: Statement) => (await pg.query(statement.text, statement.params)).rows;
   const informativeFor = async (userId: number, afterId = 0) =>
