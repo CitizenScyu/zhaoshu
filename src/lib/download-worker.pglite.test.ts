@@ -229,6 +229,7 @@ maybe('T3 worker 任务层：租约、单写者、五阶段对账（PGlite + moc
 
     it('预留行（reserved、0/0）不算完整：reserveArtifactPath 建的行默认两值 0，照常下载', async () => {
       await publishArtifact(1, 0, 0, 'reserved');
+      await insertTask();
       const result = await runDownloadTask(
         skipOptions(scriptAdapter({ kind: 'complete', txt: completeText('测试书', 3), chaptersTotal: 3, chaptersDone: 3, charsTotal: 3 * 810 })),
         (await claimDownloadTask(sql as never, 'worker-a'))!,
