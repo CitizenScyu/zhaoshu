@@ -166,6 +166,9 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
   });
 
   it('probecap1113: cap 止损预留小于理论最坏 ⇒ 同预算内起探更多(注入假时钟,直接驱动 runAdmissionBatch)', async () => {
+    // 生产 confirm 轮口径:联网 JS 全开时 probeWorst=150.3s,无 cap 止损预留 155.3s>
+    // 预算 ⇒ 0 探(这正是 11-12 备档的「每轮只探 ~6 个」的根源);开 cap=30s 预留 35s
+    // ⇒ 快探能持续起探。canProbe 阈值按 shuyuan.ts admitRows 同款(stopLoss+WRITE_RESERVE)。
     vi.useFakeTimers();
     try {
       const { runAdmissionBatch } = await import('./rule-engine/admission');
@@ -189,6 +192,7 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
           init.signal.addEventListener('abort', () => { clearTimeout(timer); reject(init.signal.reason); }, { once: true });
         });
       });
+      const PROBE_WORST_MS = 18 * 8_350; // 联网全开口径 150.3s(与 admissionProbeWorstMs 同式)
       const run = (probeCapMs: number | undefined) => {
         searches.length = 0;
         const deadline = createDeadline(120_000);
@@ -201,27 +205,25 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
             return c.signal;
           } } : {}),
           canProbe: () => !deadline.signal.aborted
-            && deadline.remainingMs > (probeCapMs ?? 21_700) + 5_000,
+            && deadline.remainingMs > (probeCapMs ?? PROBE_WORST_MS) + 5_000,
         }).then(() => 'resolved', () => 'rejected');
         // 时钟与批次并行推进:批次等 fetch 的 setTimeout,不推进就互相等死。
         const drain = async () => { for (let i = 0; i < 400; i += 1) await vi.advanceTimersByTimeAsync(500); };
         return { settled, deadline, drain };
       };
-      // 无 cap:止损按 16.7s 最坏 +5s 预留,每探 20s ⇒ 起探数受限。
+      // 无 cap(生产 confirm 轮现状):止损预留 155.3s > 120s 预算 ⇒ 一次探都不起。
       const noCap = run(undefined);
       await Promise.race([noCap.settled.then(() => 'done'), noCap.drain().then(() => 'drained')]);
       expect(await noCap.settled).toBe('resolved');
       noCap.deadline.dispose();
-      const noCapSearches = searches.length;
-      // eslint-disable-next-line no-console
-      console.log('DIAG noCap search starts(ms):', searches.join(','), 'count', noCapSearches);
-      // 开 cap=8s(=单请求超时下限,止损 13s 预留):每探 8s 被截(占位)后又能起下一探
-      // ⇒ 起探次数严格多于无 cap。
-      const withCap = run(8_000);
+      expect(searches).toHaveLength(0);
+      // 开 cap=30s:预留 35s,每探 20s 正常返回(不撞 cap)⇒ 120s 内持续起探。
+      const withCap = run(30_000);
       await Promise.race([withCap.settled.then(() => 'done'), withCap.drain().then(() => 'drained')]);
       expect(await withCap.settled).toBe('resolved');
       withCap.deadline.dispose();
-      expect(searches.length).toBeGreaterThan(noCapSearches);
+      expect(searches.length).toBeGreaterThan(3);
+      expect(searches.at(-1)).toBeLessThan(120_000);
     } finally {
       vi.useRealTimers();
     }
