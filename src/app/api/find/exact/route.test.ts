@@ -167,7 +167,9 @@ describe('POST /api/find/exact', () => {
     expect(body.items[0].sharedReadTaskId).toBe(canRead ? 88 : undefined);
     expect(body.items[0]).not.toHaveProperty('owner');
     expect(body.items[0]).not.toHaveProperty('canonical_path');
-    expect(db.queries.some((query) => query.text.includes('to_regclass'))).toBe(canRead);
+    // audit1113：to_regclass 极便宜且 has_txt 全员同口径，不按 canRead 门控；
+    // 权限只体现在 sharedReadTaskId 不带出。
+    expect(db.queries.some((query) => query.text.includes('to_regclass'))).toBe(true);
     expect(mocks.searchBooks).not.toHaveBeenCalled();
   });
 

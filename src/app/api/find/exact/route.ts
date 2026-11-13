@@ -138,10 +138,14 @@ async function handlePOST(req: NextRequest) {
     const sql = getSql();
     const canRead = hasPermission(access.principal, 'read');
     // 注册表是独立部署能力，旧库仍使用 legacy 文件定位；此处不建表、不探测远端文件。
-    const registry = canRead ? await access.run(async () => sql`
+    // has_txt 对所有用户同口径（audit1113）：to_regclass 是目录级查询、极便宜，不能按
+    // canRead 门控——否则无 read 权限用户拿到 artifactRegistryAvailable=false，readableArtifact
+    // 退化为仅 legacy 无指针任务，有 published 产物的书 has_txt 误降 false。canRead 只该
+    // 门控 shared_read_task_id（无权限不带出任务指针），不该门控数据事实本身。
+    const registry = await access.run(async () => sql`
       SELECT to_regclass('book_artifacts') IS NOT NULL
         AND to_regclass('storage_repositories') IS NOT NULL AS available
-    `) as { available: boolean }[] : [];
+    `) as { available: boolean }[];
 
     // 1) 本地书库：免费即时，命中就不再打豆瓣。
     const rows = await access.run(async () =>

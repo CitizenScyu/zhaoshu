@@ -132,7 +132,7 @@ export function admissionLeaseTtlMs(env: Record<string, string | undefined> = pr
 export function admissionProbeCapMs(env: Record<string, string | undefined> = process.env): number | undefined {
   const parsed = Number.parseInt(env.ADMISSION_PROBE_CAP_MS ?? '', 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
-  const floor = ADMISSION_TIMEOUT_MS, ceiling = admissionProbeWorstMs(env);
+  const floor = ADMISSION_TIMEOUT_MS, ceiling = admissionProbeWorstMs(env as NodeJS.ProcessEnv);
   return Math.min(Math.max(parsed, floor), ceiling);
 }
 // 租约借 cron_health 一行（不改 schema）：last_success_at 存的是**租约到期时刻**，不是成功时刻——
@@ -2129,6 +2129,12 @@ async function admitRows(
     // （66+71 到期源轮转一圈要 11h）；cap 把单探截短后，剩余预算 > cap+5s 就允许起下一探，
     // 快探轮次能探满名额。单探超 cap 记「没轮到」占位（不是源的结论），下轮接着测。
     const probeCapMs = admissionProbeCapMs();
+    if (probeCapMs !== undefined) {
+      const raw = Number.parseInt(process.env.ADMISSION_PROBE_CAP_MS ?? '', 10);
+      if (Number.isSafeInteger(raw) && raw > 0 && probeCapMs !== raw) {
+        console.warn('shuyuan probe cap clamped', { requested: raw, effective: probeCapMs, worstMs: probeWorstMs });
+      }
+    }
     const stopLossMs = probeCapMs ?? probeWorstMs;
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
