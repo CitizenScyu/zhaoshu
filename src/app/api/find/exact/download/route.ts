@@ -38,16 +38,18 @@ async function handlePOST(req: NextRequest) {
     }
     try {
       await access.run(ensureSchema);
-      const outcome = await access.commit((write) =>
-        write((sql) => importLabelWithSystemTask(asImporterSql(sql), {
-          record: {
-            title, author,
-            category: '', finishStatus: '', sourceSite: '书源池搜索', sourceUrl: SEARCH_SEED_URL,
-            charsLabeled: 0, labels: {}, primaryGenre: '', subTags: [], quality: null,
-          },
-          marker: 'ready',
-          task: { policyVersion: DEFAULT_POLICY_VERSION, sourceKind: 'builtin', sourceId: null, sourceRevision: 'finddl-1113' },
-        })));
+      // importLabelWithSystemTask 是交互式多语句序列（先查身份/产物再分支 UPSERT），
+      // 放不进 access.commit 的非交互批处理；与 admin/download-requeue 同款在
+      // access.run 里以顶层 getSql() 执行，权限闸（withFindAccess）已在前面完成。
+      const outcome = await access.run(() => importLabelWithSystemTask(asImporterSql(getSql()), {
+        record: {
+          title, author,
+          category: '', finishStatus: '', sourceSite: '书源池搜索', sourceUrl: SEARCH_SEED_URL,
+          charsLabeled: 0, labels: {}, primaryGenre: '', subTags: [], quality: null,
+        },
+        marker: 'ready',
+        task: { policyVersion: DEFAULT_POLICY_VERSION, sourceKind: 'builtin', sourceId: null, sourceRevision: 'finddl-1113' },
+      }));
       return NextResponse.json({
         ok: true,
         bookId: outcome.labeledBookId,
