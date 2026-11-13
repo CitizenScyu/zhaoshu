@@ -141,6 +141,11 @@ describe('POST /api/find/exact/download', () => {
     // 断言按文本匹配；values 只有 title/author/SEED/policyVersion。
     expect(insert!.text).toContain("'finddl-1113'");
     expect(insert!.text).toMatch(/'finddl-1113', \?, NULL/);
+    // haiku 复审 major 回归：labeled_books.source_url 落空串字面量（has_online_source
+    // 按 source_url <> '' 判真，落种子 URL 会让下载按钮消失、失败后无法重试）；
+    // 种子 URL 只允许出现在 values 的 download_tasks 槽位，恰好一次。
+    expect(insert!.text).toContain("'书源池搜索', ''");
+    expect(insert!.values.filter((v) => v === 'https://book15.net/')).toHaveLength(1);
   });
 
   it('existing active task resolves to existing, no second insert', async () => {

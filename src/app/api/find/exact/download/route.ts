@@ -16,8 +16,13 @@ import { getAuthSecuritySecret } from '@/lib/auth-session';
 //
 // 数据安全（审查 blocker 2）：已有书的行不做字段更新——ON CONFLICT DO UPDATE SET
 // id = labeled_books.id 是无操作写（只为 RETURNING 已有行），labels/finish_status/
-// primary_genre 等打标数据绝不被占位值覆盖；下载任务的 source_url 用**已有行**的
-// 真实 source_url（新书才是 book15 占位）。
+// primary_genre 等打标数据绝不被占位值覆盖。
+//
+// source_url 两处语义不同（haiku 复审 major）：labeled_books.source_url 必须落**空串**——
+// user-data 的 has_online_source 按 source_url <> '' 判真，落 book15 占位 URL 会让
+// 搜索命中该书行时 readAvailability='online'、下载按钮消失，任务失败后无法重试；
+// 空串让新书停在 'metadata'（按钮常在）。download_tasks.source_url 仍是种子 URL：
+// worker 按 builtin 种子搜池，source_kind='builtin' 的 host 校验要求非空。
 //
 // 幂等与重试（审查 major 5）：enqueue_key 传 NULL——事件唯一索引是 partial
 // (WHERE enqueue_key IS NOT NULL)，NULL 不受约束；重复点击由 system_active_book_idx
@@ -27,7 +32,8 @@ export const maxDuration = 30;
 const MAX_BODY_BYTES = 4 * 1024;
 const MAX_TITLE_LENGTH = 200;
 const MAX_AUTHOR_LENGTH = 200;
-/** 搜索种子 URL：builtin host 的规范 origin（supported-sources 识别集合内）。 */
+/** 搜索种子 URL：builtin host 的规范 origin（supported-sources 识别集合内）。
+ * 只用于 download_tasks.source_url（worker 种子）；labeled_books.source_url 落空串。 */
 const SEARCH_SEED_URL = 'https://book15.net/';
 /** 滥用闸（审查 major 4）：每用户每窗口最多提交次数；超限 429 带重试秒数。 */
 const DOWNLOAD_RATE_LIMIT = { scope: 'finddl-user', limit: 10, windowSeconds: 3600 } as const;
@@ -93,7 +99,7 @@ async function handlePOST(req: NextRequest) {
           INSERT INTO labeled_books
             (title, author, category, finish_status, source_site, source_url,
              chars_labeled, labels, labeled_at, primary_genre, sub_tags, quality)
-          VALUES (${title}, ${author}, '', '', '书源池搜索', ${SEARCH_SEED_URL},
+          VALUES (${title}, ${author}, '', '', '书源池搜索', '',
                   0, '{}'::jsonb, now(), '', '[]'::jsonb, NULL)
           ON CONFLICT (title_key, author_key) DO UPDATE SET
             id = labeled_books.id
