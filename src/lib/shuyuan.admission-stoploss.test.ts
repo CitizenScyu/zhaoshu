@@ -213,6 +213,8 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
       expect(await noCap.settled).toBe('resolved');
       noCap.deadline.dispose();
       const noCapSearches = searches.length;
+      // eslint-disable-next-line no-console
+      console.log('DIAG noCap search starts(ms):', searches.join(','), 'count', noCapSearches);
       // 开 cap=8s(=单请求超时下限,止损 13s 预留):每探 8s 被截(占位)后又能起下一探
       // ⇒ 起探次数严格多于无 cap。
       const withCap = run(8_000);
