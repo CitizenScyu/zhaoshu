@@ -137,9 +137,10 @@ describe('POST /api/find/exact/download', () => {
     expect(insert!.text).not.toContain('EXCLUDED.labels');
     expect(insert!.text).not.toContain('EXCLUDED.finish_status');
     expect(insert!.text).not.toContain('EXCLUDED.source_url');
-    // source_revision 标记找书直下批次；enqueue_key 传 NULL（失败终态后可重试）。
-    expect(insert!.values).toContain('finddl-1113');
-    expect(insert!.values).toContain(null);
+    // source_revision 与 enqueue_key 的 NULL 都是 CTE 内 SQL 字面量（非插值参数），
+    // 断言按文本匹配；values 只有 title/author/SEED/policyVersion。
+    expect(insert!.text).toContain("'finddl-1113'");
+    expect(insert!.text).toMatch(/'finddl-1113', \?, NULL/);
   });
 
   it('existing active task resolves to existing, no second insert', async () => {
