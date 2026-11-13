@@ -1437,6 +1437,13 @@ export interface AdmissionBatchInput {
    * 结果不带 readability 字段，输入输出逐字不变。开时只观测，rows 与 verdicts 不受影响。
    */
   readabilityShadow?: number;
+  /**
+   * probecap1113：单个探测的硬墙钟上限（毫秒）。缺省关（行为逐字不变）。
+   * 开启后每次起探把该探的 signal 换成与「AbortSignal.timeout(cap)」的合集——单探超 cap 即中止，
+   * 记为「没轮到」占位（不是源的结论），其余探测照常。调用方的 canProbe 止损可按 cap+写库预留
+   * 而非 admissionProbeWorstMs()（理论最坏 18 请求×8.35s）预留，快探轮次不再被最坏值吓退。
+   */
+  probeCapMs?: number;
 }
 
 /** read1027：本轮可读性影子检查汇总（只在 readabilityShadow > 0 时出现）。明细按计划序，不含书名与规则原文。 */
@@ -1883,11 +1890,18 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
       if (item.upgradedFirst) upgradedSlots -= 1;
       probed += 1;
       inflightHosts.add(item.mutexHost);
+      // probecap1113：单探硬上限——该探的 signal 与 timeout(cap) 合集，超 cap 即中止该探。
+      // 超时中止不是源的结论：searchAdmission 在 signal.aborted 时抛出（不写判定），这里
+      // 捕获后落「没轮到」占位，其余探测照常（预算级中止仍走 input.signal 的原路径）。
+      const perProbeSignal = input.probeCapMs !== undefined && input.probeCapMs > 0
+        ? AbortSignal.any([input.signal, AbortSignal.timeout(input.probeCapMs)])
+        : input.signal;
+      const perProbeTimedOut = () => perProbeSignal.aborted && !input.signal.aborted;
       try {
         let result: AdmissionSearchResult;
         try {
           result = await searchAdmission(item.candidate.source, {
-            fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: input.signal,
+            fetchPage: input.fetchPage, declaredHosts: input.declaredHosts, signal: perProbeSignal,
             throttleMs: input.throttleMs, sleep: input.sleep, controlQuery: input.controlQuery,
             // 41-srcfix 改法1：换词不另占名额，但每次换词前与起探同一口径判预算/中止。
             keywordFallback: input.keywordFallback,
@@ -1896,9 +1910,13 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
           });
         } catch (error) {
           // searchjs1027：沙箱瞬时不可用（预算耗尽/重载中）不是源的结论，按「没轮到」写占位。
-          if (!(error instanceof SearchJsNotReadyError)) throw error;
-          if (item.placeholder) results[item.index] = item.placeholder;
-          continue;
+          // probecap1113：单探超 cap 的中止同样不是源的结论（fetch error @ signal.aborted 会
+          // 原样抛到这里）——占位收口，其余探测照常；预算级中止（input.signal）仍向上抛。
+          if (error instanceof SearchJsNotReadyError || perProbeTimedOut()) {
+            if (item.placeholder) results[item.index] = item.placeholder;
+            continue;
+          }
+          throw error;
         }
         verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
         probedVerdicts.set(pick, result.verdict);

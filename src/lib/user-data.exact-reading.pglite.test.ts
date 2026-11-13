@@ -87,10 +87,22 @@ maybe('精确找书：共享完成 TXT 定位', () => {
     expect((await search('未完成任务'))[0]).toMatchObject({ has_txt: false, shared_read_task_id: null });
   });
 
+  it.each([false, true])('done 任务只指向未发布产物时 has_txt 为 false（books=%s）', async (inBooks) => {
+    // hastx1113 失真场景：任务 done、产物被降级/未发布 ⇒ 按钮口径不能再是「已有 TXT」。
+    const id = await addBook('降级正文', inBooks);
+    await addArtifact(id, 'rejected');
+    // 只有 done 任务、无 published 产物、无 legacy 无指针任务。
+    await pg.query(`INSERT INTO download_tasks(book_id,title,author,user_id,status,artifact_id)
+      VALUES ($1,'降级正文','测试作者',2,'done',(SELECT id FROM book_artifacts WHERE labeled_book_id = $1))`, [id]);
+    expect((await search('降级正文'))[0]).toMatchObject({ has_txt: false });
+  });
+
   it.each(['reserved', 'candidate', 'rejected'])('done 任务指向 %s 注册产物时不直达', async (status) => {
     const id = await addBook('未发布正文');
     await addTask(id, '未发布正文', 'done', await addArtifact(id, status));
     expect((await search('未发布正文'))[0].shared_read_task_id).toBeNull();
+    // hastx1113：has_txt 与 shared_read_task_id 同口径——未发布产物不得让行标成「已有 TXT」。
+    expect((await search('未发布正文'))[0]).toMatchObject({ has_txt: false });
   });
 
   it('失效非空指针不能当 legacy，仍可选到更早的合法任务', async () => {

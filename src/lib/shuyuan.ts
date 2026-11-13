@@ -9,7 +9,7 @@ import {
   builtinSourceForHost, isActiveBuiltinHost, type SupportedSourceTier,
 } from '@/lib/supported-sources';
 import {
-  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX,
+  ADMISSION_MAX_REDIRECTS, ADMISSION_MIN_BUDGET_MS, ADMISSION_PHOENIX_OK_PREFIX, ADMISSION_TIMEOUT_MS,
   admissionProbeWorstMs, admissionReadabilityShadowMax, assertAdmissionVersionConsistent, defaultAdmissionTransport, rulesHash, runAdmissionBatch,
   type AdmissionCandidate, type AdmissionSourceRow,
 } from '@/lib/rule-engine/admission';
@@ -124,6 +124,15 @@ export const ADMISSION_LEASE_TTL_MS = 300_000;
 export function admissionLeaseTtlMs(env: Record<string, string | undefined> = process.env): number {
   const parsed = Number.parseInt(env.ADMISSION_LEASE_TTL_MS ?? '', 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : ADMISSION_LEASE_TTL_MS;
+}
+// probecap1113：单探硬上限（env `ADMISSION_PROBE_CAP_MS`）。正整数即用（夹 [ADMISSION_TIMEOUT_MS,
+// admissionProbeWorstMs()]——低于单请求超时无意义、高于理论最坏无意义），缺失/非法 = undefined（关，
+// canProbe 止损与 probecap 之前逐字相同）。止损口径见 admitRows 的 stopLossMs。
+export function admissionProbeCapMs(env: Record<string, string | undefined> = process.env): number | undefined {
+  const parsed = Number.parseInt(env.ADMISSION_PROBE_CAP_MS ?? '', 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
+  const floor = ADMISSION_TIMEOUT_MS, ceiling = admissionProbeWorstMs();
+  return Math.min(Math.max(parsed, floor), ceiling);
 }
 // 租约借 cron_health 一行（不改 schema）：last_success_at 存的是**租约到期时刻**，不是成功时刻——
 // 与 db-quota.ts 的 db_quota_exceeded 行同一借用法；readCronSuccessTimes 只认已知行名，不受影响。
@@ -2114,13 +2123,20 @@ async function admitRows(
     // probebudget1112：单探最坏按开关组合算——联网取页（netjs1029/fieldnet1029）开时单探最多
     // 18 个各 8s 超时的请求，静态的 ADMISSION_PROBE_WORST_MS（16.35s）只覆盖 2 请求、会击穿预算。
     const probeWorstMs = admissionProbeWorstMs();
+    // probecap1113：单探硬上限（env ADMISSION_PROBE_CAP_MS，默认关）。开时 canProbe 止损按
+    // cap+写库预留而非理论最坏（150.3s 全开）——confirm 轮止损按最坏预留会让每轮只探 ~6 个
+    // （66+71 到期源轮转一圈要 11h）；cap 把单探截短后，剩余预算 > cap+5s 就允许起下一探，
+    // 快探轮次能探满名额。单探超 cap 记「没轮到」占位（不是源的结论），下轮接着测。
+    const probeCapMs = admissionProbeCapMs();
+    const stopLossMs = probeCapMs ?? probeWorstMs;
     const result = await runAdmissionBatch({
       candidates: [...candidates, ...frozen], declaredHosts, existing, fetchPage: defaultAdmissionTransport, signal,
       // espfix41：开查询不敏感对照搜索，单探最坏 = 主搜索 + 对照搜索（probeWorstMs），止损按它预留。
       controlQuery: true,
       // 41-srcfix 改法1：探测词兜底，换词前按同一 canProbe 预留判预算（单词一次尝试最坏 = probeWorstMs）。
       keywordFallback: true,
-      canProbe: () => !signal.aborted && budget.remainingMs > probeWorstMs + WRITE_RESERVE_MS,
+      canProbe: () => !signal.aborted && budget.remainingMs > stopLossMs + WRITE_RESERVE_MS,
+      ...(probeCapMs !== undefined ? { probeCapMs } : {}),
       // admrunner42：只有 phoenix runner 传 okPrefix；Vercel 两条路径不传 ⇒ 展开为空对象，输入形状逐字不变。
       ...(options.okPrefix ? { okPrefix: options.okPrefix } : {}),
       // read1027：可读性影子腿（env ADMISSION_READABILITY_SHADOW_MAX，默认关）；只出日志，不改写库行。

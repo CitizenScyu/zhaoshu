@@ -2108,6 +2108,64 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
     expect(outcome.r.rows.filter((r) => r.search_ok === null)).toHaveLength(14);
   });
 
+  it('probecap1113: 单探超 cap 中止 ⇒ 占位收口、批次不炸、其余探测照常', async () => {
+    // 第 1 探挂起直到单探 signal 中止（超 cap），第 2、3 探立即完成。
+    // 超 cap 的中止不是源的结论（不写 conn_fail），落「没轮到」占位（rulesChanged ⇒ 有占位行）。
+    vi.useFakeTimers();
+    try {
+      const hosts = ['p0.example.com', 'p1.example.com', 'p2.example.com'];
+      const fetchPage = vi.fn<AdmissionTransport>((_input, init) => {
+        const host = new URL(_input).hostname;
+        if (host === 'p0.example.com') {
+          return new Promise<Response>((_resolve, reject) => {
+            init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+          });
+        }
+        return Promise.resolve(page('<html>no results</html>'));
+      });
+      const batch = runAdmissionBatch({
+        candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+        fetchPage, signal: signal(), throttleMs: 0, maxProbes: 20, probeCapMs: 5_000,
+      });
+      const settled = batch.then(
+        (r) => ({ ok: true as const, r }),
+        (e: unknown) => ({ ok: false as const, e }),
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      const outcome = await settled;
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+      // p0 超时占位（search_ok=null，未写源结论）；p1/p2 正常得出 no_result。
+      expect(outcome.r.rows).toHaveLength(3);
+      expect(outcome.r.rows.filter((r) => r.search_ok === null)).toHaveLength(1);
+      expect(outcome.r.rows.filter((r) => r.search_verdict === 'no_result')).toHaveLength(2);
+      expect(fetchPage).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('probecap1113: 预算级中止（input.signal）仍整批拒绝，不被 cap 吞掉', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const hosts = ['q0.example.com', 'q1.example.com'];
+      const fetchPage = vi.fn<AdmissionTransport>(() => new Promise<Response>((_resolve, reject) => {
+        controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true });
+      }));
+      const batch = runAdmissionBatch({
+        candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+        fetchPage, signal: controller.signal, throttleMs: 0, maxProbes: 20, probeCapMs: 5_000,
+      });
+      const settled = batch.then(() => 'resolved', () => 'rejected');
+      controller.abort(new Error('budget'));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await settled).toBe('rejected');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('c>1 时调用方中止 ⇒ 被 host 挡住的 worker 不再发孤儿请求', async () => {
     // 5f3b506 实测:批次 reject 后,被同 host 挡住的 worker 被唤醒仍发出
     // fetch#3(callerAborted=true)。逐探判 signal 后该请求必须消失。

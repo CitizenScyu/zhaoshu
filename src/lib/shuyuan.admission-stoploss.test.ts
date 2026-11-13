@@ -43,6 +43,24 @@ vi.mock('@/lib/db', () => ({ ensureSchema, getSql }));
 
 import { refreshShuyuan, REFRESH_BUDGET_MS, ADMISSION_LEASE_ROW } from './shuyuan';
 
+// probecap1113:admissionProbeCapMs 的 env 解析(夹取规则)。
+import { admissionProbeCapMs } from './shuyuan';
+
+describe('probecap1113: ADMISSION_PROBE_CAP_MS env 解析', () => {
+  afterEach(() => vi.restoreAllMocks());
+  it('缺失/非法/≤0 → undefined(关,行为逐字不变)', () => {
+    expect(admissionProbeCapMs({})).toBeUndefined();
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: 'abc' })).toBeUndefined();
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '0' })).toBeUndefined();
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '-5000' })).toBeUndefined();
+  });
+  it('正整数夹在 [8000, admissionProbeWorstMs()] 内(默认 env 全关口径 16.7s)', () => {
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '30000' })).toBe(30_000);
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '5000' })).toBe(8_000);
+    expect(admissionProbeCapMs({ ADMISSION_PROBE_CAP_MS: '999999' })).toBe(16_700);
+  });
+});
+
 const indexUrl = 'https://www.yckceo.com/yuedu/shuyuans/index.html';
 const collectionUrl = (id: number) => `https://www.yckceo.com/yuedu/shuyuans/json/id/${id}.json`;
 const zeroCounts = { total: 0, active: 0, enabled: 0, disabled: 0, unprobed: 0, pending: 0, reachable: 0, failed: 0 };
@@ -80,6 +98,7 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
   });
 
@@ -137,5 +156,51 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
     expect(written).toHaveLength(20);
     expect(written.filter((row) => row.search_verdict === 'conn_fail')).toHaveLength(14);
     expect(batchLog?.[1]).toMatchObject({ candidates: 20, probed: 14 });
+  });
+
+  it('probecap1113: cap=30s 时止损按 cap 预留——慢探被截短、起探次数多于无 cap 基线', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('ADMISSION_PROBE_CAP_MS', '30000');
+    // 同款 20 死站,但每探 25s 才返回(超时 abort 前):无 cap 时止损按 16.7s 预留,127s 剩余只够
+    // ~6 探;开 cap 后止损按 30+5s 预留,且单探 25s 内正常返回(未撞 cap)⇒ 能起更多探。
+    const dead = Array.from({ length: 20 }, (_, i) => ({
+      bookSourceUrl: `https://dead${i}.example/`, bookSourceName: `死站${i}`,
+      searchUrl: `https://dead${i}.example/s?q={{key}}`,
+      ruleSearch: { bookList: '.i', name: '.t@text', bookUrl: 'a@href', author: '.a@text' },
+      ruleToc: { chapterList: '.toc@li', chapterName: 'a@text', chapterUrl: 'a@href' },
+      ruleContent: { content: '.c' },
+    }));
+    responses.clear();
+    responses.set(indexUrl, {
+      body: [11, 12, 13].map((id) => `<a href="/yuedu/shuyuans/content/id/${id}.html">合集 ${id}</a>`).join(''),
+      delayMs: 20_000,
+    });
+    responses.set(collectionUrl(11), { body: JSON.stringify(dead), delayMs: 11_000 });
+    responses.set(collectionUrl(12), { body: '[]', delayMs: 11_000 });
+    responses.set(collectionUrl(13), { body: '[]', delayMs: 11_000 });
+    let searches = 0;
+    fetchMock.mockImplementation((input, options) => {
+      const url = String(input);
+      const fixture = responses.get(url);
+      if (fixture) {
+        return new Promise<Response>((resolve) => setTimeout(() => resolve(new Response(fixture.body, { status: 200 })), fixture.delayMs));
+      }
+      if (/^https:\/\/dead\d+\.example\/s\?q=/.test(url)) {
+        searches += 1;
+        return new Promise<Response>((resolve, reject) => {
+          const timer = setTimeout(() => resolve(new Response('<html>no results</html>', { status: 200 })), 25_000);
+          options!.signal!.addEventListener('abort', () => { clearTimeout(timer); reject(options!.signal!.reason); }, { once: true });
+        });
+      }
+      return Promise.reject(new Error(`Unexpected network request: ${url}`));
+    });
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const settled = refreshShuyuan().then(() => 'resolved', () => 'rejected');
+    await vi.advanceTimersByTimeAsync(REFRESH_BUDGET_MS + 60_000);
+    const outcome = await settled;
+    expect(outcome).toBe('resolved');
+    // 无 cap 基线(每探 25s,止损预留 16.7+5=21.7s):127s 只起 4-5 探。
+    // 开 cap(止损 35s 预留,单探 25s 正常返回):起探严格更多——cap 的吞吐收益可观测。
+    expect(searches).toBeGreaterThan(5);
   });
 });

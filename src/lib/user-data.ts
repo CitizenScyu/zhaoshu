@@ -721,6 +721,9 @@ export function feedbackSnapshotForUserQuery(sql: PersonalQuery, userId: number,
 // 只计算 author_match：作者不符的保留但标 false。
 // F10/B：has_txt（有完成 TXT）与 has_online_source（书库行有在线书源 URL）都从数据推导，
 // 调用方据此给「已有 TXT / 在线书源待确认 / 找到记录」——**不得**对无正文记录承诺可读。
+// hastx1113：has_txt 与 shared_read_task_id 同口径（readableArtifact）——done 任务指向
+// 未发布产物（reserved/rejected/降级）时不得承诺「已有 TXT」，否则用户点「直接阅读」落空；
+// legacy 无指针任务仍算（阅读器按原协议定位）。
 //
 // 输入只归一一次（identityOf），与所有其他 books 身份查询同源。
 const MAX_EXACT_LIBRARY_HITS = 5;
@@ -766,7 +769,7 @@ export function exactLibraryBooksForUserQuery(
         EXISTS (SELECT 1 FROM download_tasks dt
           WHERE lower(btrim(dt.title)) = lower(btrim(b.title))
             AND lower(COALESCE(NULLIF(btrim(dt.author), ''), '佚名')) = lower(COALESCE(NULLIF(btrim(b.author), ''), '佚名'))
-            AND dt.status = 'done') AS has_txt,
+            AND dt.status = 'done' AND ${readableArtifact}) AS has_txt,
         EXISTS (SELECT 1 FROM labeled_books lb
           WHERE lb.title_key = b.title_key AND lb.author_key = b.author_key AND lb.source_url <> '') AS has_online_source,
         ${booksReadTask} AS shared_read_task_id
@@ -777,7 +780,7 @@ export function exactLibraryBooksForUserQuery(
         EXISTS (SELECT 1 FROM recommendations r JOIN books b2 ON b2.id = r.book_id
           WHERE b2.title_key = lb.title_key AND b2.author_key = lb.author_key AND r.user_id = ${userId}),
         (${book.author} = '' OR lb.author_key = ${book.author}),
-        EXISTS (SELECT 1 FROM download_tasks dt WHERE dt.book_id = lb.id AND dt.status = 'done'),
+        EXISTS (SELECT 1 FROM download_tasks dt WHERE dt.book_id = lb.id AND dt.status = 'done' AND ${readableArtifact}),
         (lb.source_url <> ''),
         ${labeledReadTask}
       -- 同一身份只出一条：两表都有时以 books 行（带豆瓣元数据）为准，labeled_books
