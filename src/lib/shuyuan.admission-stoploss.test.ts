@@ -203,18 +203,20 @@ describe('41-ADMIT-CONC-FIX:refreshShuyuan 准入逐探止损(端到端,c 缺省
           canProbe: () => !deadline.signal.aborted
             && deadline.remainingMs > (probeCapMs ?? 21_700) + 5_000,
         }).then(() => 'resolved', () => 'rejected');
-        return { settled, deadline };
+        // 时钟与批次并行推进:批次等 fetch 的 setTimeout,不推进就互相等死。
+        const drain = async () => { for (let i = 0; i < 400; i += 1) await vi.advanceTimersByTimeAsync(500); };
+        return { settled, deadline, drain };
       };
-      // 无 cap:止损按 16.7s 最坏 +5s 预留,每探 20s ⇒ 120s 只起 4-5 探。
+      // 无 cap:止损按 16.7s 最坏 +5s 预留,每探 20s ⇒ 起探数受限。
       const noCap = run(undefined);
-      await vi.advanceTimersByTimeAsync(130_000);
+      await Promise.race([noCap.settled.then(() => 'done'), noCap.drain().then(() => 'drained')]);
       expect(await noCap.settled).toBe('resolved');
       noCap.deadline.dispose();
       const noCapSearches = searches.length;
-      // 开 cap=8s(=单请求超时下限,止损 13s 预留):每探要么 8s 内被截(占位),要么 20s 返回——
-      // 但截断后 12s 又能起下一探 ⇒ 起探次数严格多于无 cap。
+      // 开 cap=8s(=单请求超时下限,止损 13s 预留):每探 8s 被截(占位)后又能起下一探
+      // ⇒ 起探次数严格多于无 cap。
       const withCap = run(8_000);
-      await vi.advanceTimersByTimeAsync(130_000);
+      await Promise.race([withCap.settled.then(() => 'done'), withCap.drain().then(() => 'drained')]);
       expect(await withCap.settled).toBe('resolved');
       withCap.deadline.dispose();
       expect(searches.length).toBeGreaterThan(noCapSearches);
