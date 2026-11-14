@@ -2236,6 +2236,38 @@ describe('41-ADMIT-CONC:准入探测受限并发', () => {
     }
   }, 20_000);
 
+  it('probeworker1114: 单探未分类异常（非中止）落 conn_fail 行, 批次不炸, 其余探测照常', async () => {
+    // 第 1 探的 fetch 立即 reject 一个非中止错误（模拟 undici 'terminated'——响应流中途被掐，
+    // searchAdmissionOnce 的分类路径覆盖不到的形态）；第 2 探正常完成。改前该异常沿
+    // probeWorker 的 throw error 炸掉 Promise.all，同批已探完的结论全部丢弃（batch failed）。
+    const hosts = ['w0.example.com', 'w1.example.com'];
+    const fetchPage = vi.fn<AdmissionTransport>((_input, init) => {
+      if (new URL(_input).hostname === 'w0.example.com') {
+        void init;
+        return Promise.reject(new Error('terminated'));
+      }
+      return Promise.resolve(page('<html>no results</html>'));
+    });
+    const outcome = await runAdmissionBatch({
+      candidates: candidatesFor(hosts), declaredHosts: new Set(hosts), existing: new Map(),
+      fetchPage, signal: signal(), throttleMs: 0, maxProbes: 20,
+    }).then(
+      (r) => ({ ok: true as const, r }),
+      (e: unknown) => ({ ok: false as const, e }),
+    );
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // w0 落 conn_fail（error 留原错误文案）；w1 照常 no_result；两探都真实发出。
+    expect(outcome.r.rows).toHaveLength(2);
+    const w0 = outcome.r.rows.find((r) => r.host === 'w0.example.com');
+    expect(w0?.search_ok).toBe(false);
+    expect(w0?.search_verdict).toBe('conn_fail');
+    expect(w0?.error).toBe('terminated');
+    expect(outcome.r.rows.find((r) => r.host === 'w1.example.com')?.search_verdict).toBe('no_result');
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(outcome.r.verdicts.conn_fail).toBe(1);
+  });
+
   it('c>1 时调用方中止 ⇒ 被 host 挡住的 worker 不再发孤儿请求', async () => {
     // 5f3b506 实测:批次 reject 后,被同 host 挡住的 worker 被唤醒仍发出
     // fetch#3(callerAborted=true)。逐探判 signal 后该请求必须消失。

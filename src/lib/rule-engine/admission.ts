@@ -1982,6 +1982,23 @@ export async function runAdmissionBatch(input: AdmissionBatchInput): Promise<Adm
             }
             continue;
           }
+          // probeworker1114：预算级中止（input.signal）仍向上抛；其余未分类异常（如 undici
+          // 'terminated'——响应流中途被掐，发生在 searchAdmissionOnce 分类不到的路径上）不再炸
+          // 整批：该源落 conn_fail 行（探测端网络抖动，不是规则结论但值得留痕），同批已探完的
+          // 十几个结论照常写库。2026-11-14 08:00 confirm 轮同款错误形态即从此处炸批（那次的
+          // 'terminated' 发生在轮首 DB 读——已由 dbretry1114 的读重试接住）。
+          if (!input.signal.aborted) {
+            verdicts.conn_fail = (verdicts.conn_fail ?? 0) + 1;
+            probedVerdicts.set(pick, 'conn_fail');
+            results[item.index] = {
+              source_url: item.candidate.url, tier: 'M1', compile_ok: true, core_field_mask: item.compile.coreFieldMask,
+              search_ok: false, search_verdict: 'conn_fail',
+              search_checked_at: now().toISOString(), rules_hash: item.hash,
+              engine_semantics_version: semanticsVersionOf(item.hash), host: item.host,
+              error: errorMessage(error), compile_diagnostics: [],
+            };
+            continue;
+          }
           throw error;
         }        verdicts[result.verdict] = (verdicts[result.verdict] ?? 0) + 1;
         probedVerdicts.set(pick, result.verdict);

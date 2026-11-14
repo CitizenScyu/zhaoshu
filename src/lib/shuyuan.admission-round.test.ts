@@ -599,6 +599,63 @@ describe('runAdmissionRound：独立预算', () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(console.error).toHaveBeenCalledWith('shuyuan admission lease failed', { trigger: 'round', reason: expect.any(String) });
   });
+
+  it('dbretry1114: 源表读首次 terminated ⇒ 隔 3s 重读一次成功, 轮照常完成', async () => {
+    vi.useFakeTimers();
+    try {
+      stored = [{ source_url: 'https://dead0.example/', source: deadSource(0) }];
+      vi.stubEnv('ADMISSION_MAX_PROBES', '1');
+      fetchMock.mockImplementation((_input, options) => new Promise<Response>((_resolve, reject) => {
+        options!.signal!.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
+      }));
+      const original = execute.getMockImplementation()!;
+      let sourceReads = 0;
+      execute.mockImplementation(async (query) => {
+        if (query.text.startsWith('SELECT source_url, source FROM shuyuan_sources ORDER BY id')) {
+          sourceReads += 1;
+          if (sourceReads === 1) throw new Error('terminated');
+        }
+        return original(query);
+      });
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const settled = runAdmissionRound();
+      const drain = async () => { for (let i = 0; i < 60; i += 1) await vi.advanceTimersByTimeAsync(ADMISSION_ROUND_BUDGET_MS + 60_000); };
+      const summary = await Promise.race([settled, drain().then(() => settled)]);
+      expect('skipped' in summary).toBe(false);
+      expect(summary).toMatchObject({ sources: 1, candidates: 1 });
+      // 源表读发了两次（首败 + 重试成功）；重试日志带脱敏 reason。
+      expect(sourceReads).toBe(2);
+      expect(errorLog).toHaveBeenCalledWith('shuyuan admission source read failed, retrying once', { reason: 'terminated' });
+      expect(log).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it('dbretry1114: 源表读两次都失败 ⇒ 原样上抛（轮失败, 不伪装成功）', async () => {
+    vi.useFakeTimers();
+    try {
+      const original = execute.getMockImplementation()!;
+      let sourceReads = 0;
+      execute.mockImplementation(async (query) => {
+        if (query.text.startsWith('SELECT source_url, source FROM shuyuan_sources ORDER BY id')) {
+          sourceReads += 1;
+          throw new Error('terminated');
+        }
+        return original(query);
+      });
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const pending = runAdmissionRound().then(() => 'resolved', (e: unknown) => `rejected: ${String(e)}`);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const outcome = await pending;
+      expect(outcome).toBe('rejected: Error: terminated');
+      expect(sourceReads).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
 });
 
 describe('刷新尾部准入与租约', () => {

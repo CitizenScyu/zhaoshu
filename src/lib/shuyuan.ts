@@ -2013,9 +2013,7 @@ export async function runAdmissionRound(parentSignal?: AbortSignal): Promise<Adm
     const s = getSql();
     const lease = await claimAdmissionLease(s, 'round');
     if (!lease) return { skipped: 'lease' };
-    const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
-      SELECT source_url, source FROM shuyuan_sources ORDER BY id`, signal);
-    const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
+    const rows = await readAdmissionSources(s, signal);
     const summary = await admitRows(s, rows, budget, signal, {}, lease);
     if (signal.aborted) return { skipped: 'failed' };
     const artifact = 'written' in summary && summary.written > 0 ? await publishPoolArtifact(signal) : 'skipped';
@@ -2044,9 +2042,7 @@ export async function runAdmissionRunnerRound(budgetMs: number): Promise<Admissi
     const s = getSql();
     const lease = await claimAdmissionLease(s, 'runner');
     if (!lease) return { skipped: 'lease' };
-    const stored = await readRows<{ source_url: string; source: Record<string, unknown> }>(s, s`
-      SELECT source_url, source FROM shuyuan_sources ORDER BY id`, budget.signal);
-    const rows = stored.map((row) => ({ url: row.source_url, source: row.source }));
+    const rows = await readAdmissionSources(s, budget.signal);
     const okPrefix = admissionRunnerPhoenixOkPrefix() ? { okPrefix: ADMISSION_PHOENIX_OK_PREFIX } : {};
     const summary = await admitRows(s, rows, budget, budget.signal, okPrefix, lease);
     if (budget.signal.aborted) return { skipped: 'failed' };
@@ -2204,8 +2200,31 @@ async function admitRows(
   return summary;
 }
 
-async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): Promise<Map<string, AdmissionSourceRow>> {
-  const rows = await readRows<AdmissionSourceRow>(s, s`
+// dbretry1114：轮首源表读重试。2026-11-14 08:00 confirm 轮实证：5656 行 source 大列的
+// 单次 SELECT 走 Neon HTTP fetch 被中途掐流（undici 'terminated'，1 秒内 502）——探针未起、
+// 整轮报废，hourly 重试要多等 1h。该读是全轮最大单次 DB payload，秒级抖动重试一次即可接住
+// 绝大多数瞬时故障。同款先例 idxretry1031（上游拉取重试，env 开关缺省关）。判定条件：
+// 非预算/调用方中止（signal.aborted 不重试）才重试；隔 3s 重试一次，仍失败原样上抛。
+// readAdmissionRows 之后的读都是小 payload（只回已有准入行、不带 source 大列），不套重试。
+async function readAdmissionSources(s: Sql, signal: AbortSignal): Promise<AdmissionInputRow[]> {
+  // 每次重试重新构造 query：neon 的 sql 标签是惰性单次 Promise，复用同一对象二次 await 只会
+  // 拿到同一结果（不会重新执行）。
+  const load = () => {
+    const query = s`SELECT source_url, source FROM shuyuan_sources ORDER BY id`;
+    return readRows<{ source_url: string; source: Record<string, unknown> }>(s, query, signal)
+      .then((stored) => stored.map((row) => ({ url: row.source_url, source: row.source })));
+  };
+  try {
+    return await load();
+  } catch (error) {
+    if (signal.aborted) throw error;
+    console.error('shuyuan admission source read failed, retrying once', { reason: safeReason(error) });
+    await raceDeadline(signal, () => new Promise((resolve) => setTimeout(resolve, 3_000)));
+    return load();
+  }
+}
+
+async function readAdmissionRows(s: Sql, urls: string[], signal: AbortSignal): Promise<Map<string, AdmissionSourceRow>> {  const rows = await readRows<AdmissionSourceRow>(s, s`
     SELECT source_url, tier, compile_ok, core_field_mask, search_ok,
            search_verdict, search_checked_at::text AS search_checked_at, rules_hash,
            engine_semantics_version, host, error, compile_diagnostics
